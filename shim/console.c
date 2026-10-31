@@ -73,6 +73,18 @@ void con_str(const char *label, const char *s)
 	row++;
 }
 
+/* Overwrite the bottom text row: the current step stays visible if we hang. */
+void con_status(const char *label, const char *s)
+{
+	int saved = row;
+	row = (FB_H - 2 * MARGIN) / CH_H - 1;
+	for (int col = 0; col < (FB_W - 2 * MARGIN) / CH_W; col++)
+		put_char(col, ' ', WHITE);
+	put_str(0, label, GREEN);
+	put_str(LABEL_COLS, s, GREEN);
+	row = saved;
+}
+
 void con_hex(const char *label, uint64_t v)
 {
 	char buf[17];
