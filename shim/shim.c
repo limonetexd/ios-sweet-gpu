@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "gpuprobe.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -382,6 +383,15 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+
+#ifdef SHIM_GPUPROBE
+	/* GPU bring-up image: no payload, no UFS; keep the result on screen. */
+	gpuprobe_run(&stage);
+	con_skip();
+	con_str("GPU", "probe done, reset in ~3 min");
+	delay_ms(180000);
+	reset(20);
+#endif
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
