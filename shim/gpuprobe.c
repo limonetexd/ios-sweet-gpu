@@ -44,6 +44,8 @@
 
 #define GPUCC_GX_GDSCR		0x100c
 #define GPUCC_CX_GDSCR		0x106c
+#define GPUCC_CRC_AHB		0x107c
+#define GPUCC_CX_SNOC_DVM	0x108c
 #define GPUCC_CX_GMU		0x1098
 #define GPUCC_CXO		0x109c
 #define GPUCC_GMU_RCG		0x1120
@@ -161,10 +163,11 @@ static int wait_bit(uintptr_t reg, uint32_t mask, int set, unsigned ms)
 
 static const char **stage_p;
 
+/* Phone run 2: the bottom-row status was not visible; print each step as a line. */
 static void stage(const char *s)
 {
 	*stage_p = s;
-	con_status("AT", s);
+	con_str("AT", s);
 }
 
 static int branch_on(uintptr_t reg)
@@ -199,6 +202,12 @@ static int cx_on(void)
 	wait_bit(rcg, 1, 0, 10);
 	branch_on(GPUCC + GPUCC_CXO);
 	branch_on(GPUCC + GPUCC_CX_GMU);
+	/*
+	 * Phone run 2b hung on the first SMMU register read without these two;
+	 * run 1 (which wrote them) read the SMMU fine.
+	 */
+	branch_on(GPUCC + GPUCC_CRC_AHB);
+	branch_on(GPUCC + GPUCC_CX_SNOC_DVM);
 	con_hex2("GMUCLK", "cx_gmu=", rd32(GPUCC + GPUCC_CX_GMU), "cxo=", rd32(GPUCC + GPUCC_CXO));
 	return 0;
 }
@@ -224,6 +233,7 @@ static int smmu_setup(void)
 {
 	int smr = -1, cb = -1;
 	uint32_t used_cb = 0, nsmr = rd32(SMMU + 0x20) & 0xff, ncb = rd32(SMMU + 0x24) & 0xff;
+	con_hex2("SMMU", "nsmr=", nsmr, "ncb=", ncb);
 	for (uint32_t i = 0; i < nsmr && i < 16; i++) {
 		uint32_t m = rd32(SMR(i)), c = rd32(S2CR(i));
 		if ((m >> 31) && ((c >> 16) & 3) == 0)
@@ -231,13 +241,22 @@ static int smmu_setup(void)
 		if (smr < 0 && !(m >> 31))
 			smr = (int)i;
 	}
-	for (uint32_t i = 0; i < ncb && i < 16; i++)
-		if (cb < 0 && !(used_cb & (1u << i)) && !(rd32(SMMU_CB(i) + CB_SCTLR) & 1))
+	con_hex2("SMMU", "free smr=", (uint32_t)smr, "used cbs=", used_cb);
+	/* Phone run 2 hung right here: read one context bank at a time. */
+	for (uint32_t i = 0; i < ncb && i < 16; i++) {
+		char l[] = "CB0 read";
+		l[2] = '0' + i;
+		stage(l);
+		uint32_t s = rd32(SMMU_CB(i) + CB_SCTLR);
+		con_hex2("  cb", "sctlr=", s, "cbar=", rd32(CBAR(i)));
+		if (cb < 0 && !(used_cb & (1u << i)) && !(s & 1))
 			cb = (int)i;
+	}
 	con_hex2("SMMU", "free smr=", (uint32_t)smr, "cb=", (uint32_t)cb);
 	if (smr < 0 || cb < 0)
 		return -1;
 
+	stage("page tables at 0x1f0000000");
 	zero32(GMEM, GMEM_SIZE);
 	wr64(GMEM_L1 + 8, GMEM_L2 | 3);				/* 1G block 1: 0x40000000 */
 	wr64(GMEM_L2 + 8 * ((VA_DUMMY >> 21) & 0x1ff), GMEM_L3 | 3);
@@ -246,6 +265,7 @@ static int smmu_setup(void)
 	map_pages(GMEM_L3, VA_LOG, GMEM_LOG, BUF_SIZE);
 	map_pages(GMEM_L3, VA_HFI, GMEM_HFI, BUF_SIZE);
 
+	stage("program context bank");
 	uintptr_t c = SMMU_CB(cb);
 	wr32(c + CB_SCTLR, 0);
 	wr32(CBA2R(cb), 1);					/* AArch64 descriptors */
@@ -489,19 +509,30 @@ static void gmu_boot(void)
 	static uint32_t msg[256];
 	uint32_t gx[NGPU], cx[2];
 
-	stage("arc votes (cmd-db)");
-	int rv = arc_votes(gx, gpu_lvl, NGPU, "gfx.lvl", "mx.lvl");
-	if (!rv)
-		rv = arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl");
-	con_hex2("VOTES", "gx2=", rv ? (uint32_t)rv : gx[2], "cx1=", rv ? 0 : cx[1]);
-	if (rv)
-		return;
+	/*
+	 * Runs 2b/2c hung on the first SMMU read after the cmd-db walk; run 1
+	 * read the SMMU right after the GMU/TCM accesses. Same order as run 1
+	 * now, with each bus touched in turn so a hang names its block.
+	 */
+	stage("gdsc + gmu read");
+	con_hex2("CHECK", "cx gdsc=", rd32(GPUCC + GPUCC_CX_GDSCR), "gmu rpmh=", rd32(GMU_REG(GMU_RPMH_STATE)));
+	stage("smmu idr read");
+	con_hex2("CHECK", "smmu idr0=", rd32(SMMU + 0x20), "idr1=", rd32(SMMU + 0x24));
 
 	stage("smmu setup");
 	int cb = smmu_setup();
 	if (cb < 0)
 		return;
 	uintptr_t c = SMMU_CB(cb);
+
+	stage("arc votes (cmd-db)");
+	int rv = arc_votes(gx, gpu_lvl, NGPU, "gfx.lvl", "mx.lvl");
+	if (!rv)
+		rv = arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl");
+	con_hex2("VOTES", "gx2=", rv ? (uint32_t)rv : gx[2], "cx1=", rv ? 0 : cx[1]);
+	con_hex2("CHECK", "cx gdsc=", rd32(GPUCC + GPUCC_CX_GDSCR), "smmu cr0=", rd32(SMMU));
+	if (rv)
+		return;
 
 	stage("rsc/pdc init");
 	rpmh_init();
@@ -568,6 +599,11 @@ static void gmu_boot(void)
 		con_hex2("  log", "w0=", rd32(GMEM_LOG), "w1=", rd32(GMEM_LOG + 4));
 		return;
 	}
+	/* Run 2d filled the screen here: start a new page for the rest. */
+	delay_ms(3000);
+	con_clear(RED);
+	con_hex2("GMU UP", "init=", r, "cb fsr=", rd32(c + CB_FSR));
+	con_hex2("  (rsc)", "ack=", rd32(GMU_REG(GMU_RSCC_ACK)), "seq busy=", rd32(RSCC_REG(0x0101)));
 
 	stage("gfx rail on (oob slumber)");
 	wr32(GMU_REG(GMU_BOOT_SLUMBER_OPT), 0);
