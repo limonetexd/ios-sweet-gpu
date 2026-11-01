@@ -1,0 +1,127 @@
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -915,6 +915,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		if (b == NULL) {
+ 			continue;
+ 		}
++		if (b->surface != NULL && b->surface->gpuPool) {
++			continue;               /* GPU pool memory is write-combined: nothing in the cache (ios-topaz 0929) */
++		}
+ 		if (b->surface != NULL) {
+ 			uint32_t seed = *(volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc);
+ 
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -44,6 +44,7 @@
+ #include <libkern/c++/OSUnserialize.h>
+ #include <libkern/c++/OSSerialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -109,6 +110,9 @@ SweetSurface::free()
+ 		memory->complete();
+ 	}
+ 	OSSafeReleaseNULL(memory);
++	if (gpuPool) {
++		sweet_gpu_pool_surface_free(poolPhys);
++	}
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+ }
+@@ -287,8 +291,63 @@ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
+ 	return n != NULL ? n->unsigned32BitValue() : def;
+ }
+ 
++extern "C" uint64_t sweet_gpu_pool_surface(uint64_t size);       /* SweetAdreno.cpp */
++extern "C" void sweet_gpu_pool_surface_free(uint64_t pa);
+ static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, uint64_t size);
+ 
++/*
++ * (ios-topaz 0924/0927/0929) backboardd's screen-sized surfaces come from the GPU pool
++ * (SweetAdreno.cpp): RAM XNU does not manage, mapped write-combined everywhere, so the GPU
++ * draws into them with no cache maintenance (an 11 MB dc civac per submission was ~45 ms).
++ * Boot-arg sweetgpu>=2 (the GPU is ours); sweet_fbpool=0 turns it off.
++ */
++static bool
++sweet_gpu_pool_eligible(const SweetSurface *s)
++{
++	static int on = -1;
++	if (on < 0) {
++		int gpu = 0, pool = 1;
++		(void)PE_parse_boot_argn("sweetgpu", &gpu, sizeof(gpu));
++		(void)PE_parse_boot_argn("sweet_fbpool", &pool, sizeof(pool));
++		on = gpu >= 2 && pool != 0;
++	}
++	if (!on || s->pixelFormat != 0x42475241u || s->bytesPerElement != 4 || s->planeCount > 1 ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || s->width < 1000 || s->height < 2000) {
++		return false;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	return strcmp(name, "backboardd") == 0;
++}
++
++/* Memory for s from the GPU pool, zeroed; false when there is none (ordinary memory then). */
++static bool
++sweet_surface_use_gpu_pool(SweetSurface *s)
++{
++	uint64_t pa = sweet_gpu_pool_surface(s->allocSize);
++	if (pa == 0) {
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, round_page_64(s->allocSize), kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	if (map == NULL) {
++		OSSafeReleaseNULL(md);
++		sweet_gpu_pool_surface_free(pa);
++		return false;
++	}
++	volatile uint64_t *p = (volatile uint64_t *)map->getVirtualAddress();
++	for (uint64_t i = 0; i < round_page_64(s->allocSize) / 8; i++) {
++		p[i] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	s->memory = md;
++	s->kernelMap = map;
++	s->gpuPool = true;
++	s->poolPhys = pa;
++	s->mapCache = kIOMapWriteCombineCache;
++	return true;
++}
++
+ static uint32_t
+ sweet_div_up(uint32_t a, uint32_t b)
+ {
+@@ -771,6 +830,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			    client_address->unsigned64BitValue(), used, s->width, s->height, s->pixelFormat, ret);
+ 		}
+ 	}
++	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_gpu_pool_eligible(s) && sweet_surface_use_gpu_pool(s)) {
++		static uint32_t told;
++		if (told++ < 8) {
++			IOLog("SWEET SURF: %ux%u surface in the GPU pool at %#llx (%u bytes)\n", s->width, s->height,
++			    s->poolPhys, s->allocSize);
++		}
++		if (!sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -44,8 +44,10 @@ public:
+ 	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state */
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
++	bool                      gpuPool;      /* memory is a slot of the GPU pool at poolPhys (write-combined) */
++	uint64_t                  poolPhys;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { drawn = 0; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { drawn = 0; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuPool = false; poolPhys = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

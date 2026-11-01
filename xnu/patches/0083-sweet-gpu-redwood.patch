@@ -45,7 +45,7 @@
  		sg_reboot_fastboot();
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,507 @@
+@@ -0,0 +1,547 @@
 +/*
 + * SWEET: the Adreno 618 for programs to draw with, behind the hardware
 + * interface (redwood_gpu_*) that RedwoodGPU.cpp's msm DRM user client speaks
@@ -258,6 +258,46 @@
 +		memmove(&va_free[at + 1], &va_free[at], (va_free_count++ - at) * sizeof(va_free[0]));
 +		va_free[at].start = address;
 +		va_free[at].size = size;
++	}
++}
++
++/*
++ * Screen-sized surfaces from the pool (SweetSurface.cpp, ios-topaz 0924): 15
++ * slots of 16 MiB at pool +16 MiB. The pool is not XNU's RAM, so it has no
++ * cacheable kernel mapping: mapped write-combined, it needs no cache
++ * maintenance before the GPU draws into it (RedwoodGPU.cpp skips those).
++ */
++#define OFF_SURFACES    0x01000000ull
++#define SURFACE_SLOT    0x01000000ull
++#define SURFACE_SLOTS   15
++static volatile uint32_t surface_slots;
++
++extern "C" uint64_t sweet_gpu_pool_surface(uint64_t size);
++extern "C" void sweet_gpu_pool_surface_free(uint64_t pa);
++
++uint64_t
++sweet_gpu_pool_surface(uint64_t size)
++{
++	if (!ready || size == 0 || size > SURFACE_SLOT) {
++		return 0;
++	}
++	for (int i = 0; i < SURFACE_SLOTS; i++) {
++		uint32_t old = surface_slots;
++		if (!(old & (1u << i)) && OSCompareAndSwap(old, old | (1u << i), &surface_slots)) {
++			return POOL_PA + OFF_SURFACES + (uint64_t)i * SURFACE_SLOT;
++		} else if (!(old & (1u << i))) {
++			i--;            /* lost a race: look at this slot again */
++		}
++	}
++	return 0;
++}
++
++void
++sweet_gpu_pool_surface_free(uint64_t pa)
++{
++	uint64_t i = (pa - POOL_PA - OFF_SURFACES) / SURFACE_SLOT;
++	if (pa >= POOL_PA + OFF_SURFACES && i < SURFACE_SLOTS) {
++		OSBitAndAtomic(~(1u << i), &surface_slots);
 +	}
 +}
 +
