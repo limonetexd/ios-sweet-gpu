@@ -12,15 +12,18 @@
  
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -44,6 +44,7 @@
+@@ -44,6 +44,10 @@
  #include <libkern/c++/OSUnserialize.h>
  #include <libkern/c++/OSSerialize.h>
  #include <sys/proc.h>
 +#include <pexpert/pexpert.h>
++
++extern "C" uint64_t sweet_gpu_pool_surface(uint64_t size);       /* SweetAdreno.cpp */
++extern "C" void sweet_gpu_pool_surface_free(uint64_t pa);
  
  enum {
  	kSweetSurfaceCreate             = 0,
-@@ -109,6 +110,9 @@ SweetSurface::free()
+@@ -109,6 +113,9 @@ SweetSurface::free()
  		memory->complete();
  	}
  	OSSafeReleaseNULL(memory);
@@ -30,12 +33,8 @@
  	OSSafeReleaseNULL(state);
  	OSObject::free();
  }
-@@ -287,8 +291,63 @@ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
- 	return n != NULL ? n->unsigned32BitValue() : def;
- }
+@@ -289,6 +296,59 @@ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
  
-+extern "C" uint64_t sweet_gpu_pool_surface(uint64_t size);       /* SweetAdreno.cpp */
-+extern "C" void sweet_gpu_pool_surface_free(uint64_t pa);
  static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, uint64_t size);
  
 +/*
@@ -94,7 +93,7 @@
  static uint32_t
  sweet_div_up(uint32_t a, uint32_t b)
  {
-@@ -771,6 +830,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -771,6 +831,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  			    client_address->unsigned64BitValue(), used, s->width, s->height, s->pixelFormat, ret);
  		}
  	}
