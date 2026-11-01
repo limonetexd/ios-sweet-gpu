@@ -55,6 +55,10 @@
 #define GMU_SPTPRAC_PWR_CTRL	0x1a881
 #define GMU_ITCM		0x1b400
 #define GMU_DTCM		0x1c400
+#define GMU_DCVS_ACK_OPTION	0x1cbc0
+#define GMU_DCVS_PERF_SETTING	0x1cbc1
+#define GMU_DCVS_BW_SETTING	0x1cbc2
+#define GMU_DCVS_RETURN		0x1cbc3
 #define GMU_BOOT_SLUMBER_OPT	0x1cbf8
 #define GMU_GX_VOTE_IDX		0x1cbf9
 #define GMU_MX_VOTE_IDX		0x1cbfa
@@ -651,10 +655,13 @@ static int arc_votes(uint32_t *votes, const uint32_t *lvl, int n, const char *pr
 #define LVL_LOW_SVS	64
 #define LVL_SVS		128
 
-/* sweet's lowest GPU OPPs (180 MHz LOW_SVS, 267 MHz SVS), "off" first, like Linux. */
-#define NGPU	3
-static const uint32_t gpu_khz[NGPU] = { 0, 180000, 267000 };
-static const uint32_t gpu_lvl[NGPU] = { 0, LVL_LOW_SVS, LVL_SVS };
+#define LVL_SVS_L1	192
+#define LVL_NOM		256
+
+/* sweet's lower GPU OPPs (180 LOW_SVS ... 430 MHz NOM), "off" first, like Linux. */
+#define NGPU	5
+static const uint32_t gpu_khz[NGPU] = { 0, 180000, 267000, 355000, 430000 };
+static const uint32_t gpu_lvl[NGPU] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_NOM };
 static const uint32_t gmu_khz[2] = { 0, 200000 };
 static const uint32_t gmu_lvl[2] = { 0, LVL_MIN_SVS };
 
@@ -1157,6 +1164,27 @@ static void gmu_boot(void)
 		con_str("GX", "not powered; not touching GPU regs");
 		return;
 	}
+
+	/*
+	 * GPU clock: the GMU owns gx_gfx3d and leaves it at XO until asked (Linux
+	 * a6xx_gmu_set_freq, legacy GMU): perf index, then OOB DCVS_SET 23/31.
+	 * At 19.2 MHz a full-screen CoreAnimation frame took ~250 ms.
+	 */
+	stage("dcvs (gpu clock)");
+	uint32_t rcg0 = rd32(GPUCC + 0x1020);
+	int lvl = NGPU - 1;
+	for (; lvl >= 2; lvl--) {
+		wr32(GMU_REG(GMU_DCVS_ACK_OPTION), 0);
+		wr32(GMU_REG(GMU_DCVS_PERF_SETTING), (3u << 28) | (uint32_t)lvl);
+		wr32(GMU_REG(GMU_DCVS_BW_SETTING), 0xff);
+		rc = oob(23, 31);
+		wr32(GMU_REG(GMU_H2G_SET), 1u << 31);	/* clear DCVS_SET */
+		if (!rc && rd32(GMU_REG(GMU_DCVS_RETURN)) == 0)
+			break;
+		con_hex2("DCVS", "failed lvl=", (uint32_t)lvl, "ret=", rd32(GMU_REG(GMU_DCVS_RETURN)));
+	}
+	con_hex2("DCVS", "lvl=", (uint32_t)lvl, "khz=", lvl >= 2 ? gpu_khz[lvl] : 0);
+	con_hex2("DCVS", "gfx3d cfg was=", rcg0, "now=", rd32(GPUCC + 0x1020));
 
 	stage("gpu register test");
 	/* RBBM_STATUS (0x210) and CP_SCRATCH_REG0 (0x883) write/read test. */

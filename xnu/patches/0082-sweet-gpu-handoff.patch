@@ -28,7 +28,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,265 @@
 +/*
 + * SWEET Adreno 618 handoff check (boot-arg sweetgpu=1).
 + *
@@ -83,6 +83,9 @@
 +#define CP_RB_WPTR	0x807
 +#define CP_SQE_BASE	0x830
 +#define GMU_INIT_RESULT	0x1f81c
++#define GPUCC_GFX3D_CFG	(0x90000u + 0x1020)
++#define GMU_DCVS_PERF	0x1cbc1
++#define GMU_DCVS_RETURN	0x1cbc3
 +
 +static vm_offset_t sg_gpu, sg_pool;
 +static int sg_sleep_chan;
@@ -238,6 +241,9 @@
 +		printf("SWEET GPU: GPU not powered (shim without SHIM_GPUBOOT?)\n");
 +		goto out;
 +	}
++	/* the shim asks the GMU for the GPU clock (DCVS); gx_gfx3d RCG cfg, DCVS perf/return */
++	printf("SWEET GPU: gfx3d cfg %#x dcvs perf %#x return %#x\n", sg_rd(sg_gpu, GPUCC_GFX3D_CFG),
++	    sg_rd(sg_gpu, GREG(GMU_DCVS_PERF)), sg_rd(sg_gpu, GREG(GMU_DCVS_RETURN)));
 +	printf("SWEET GPU: gmu init %#x rbbm %#x sqe base %#x rptr %#x wptr %#x\n",
 +	    sg_rd(sg_gpu, GREG(GMU_INIT_RESULT)), sg_rd(sg_gpu, GREG(RBBM_STATUS)),
 +	    sg_rd(sg_gpu, GREG(CP_SQE_BASE)), sg_rd(sg_gpu, GREG(CP_RB_RPTR)),

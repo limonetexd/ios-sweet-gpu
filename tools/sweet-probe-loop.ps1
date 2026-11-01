@@ -80,6 +80,17 @@ if ($Xnu) {
 	$skip = $blocks - $XNU_LOG_TAIL
 	$bin = [System.IO.Path]::GetTempFileName()
 	& cmd /c "`"$adb`" exec-out dd if=$dev bs=4096 skip=$skip count=$XNU_LOG_TAIL 2>NUL > `"$bin`""
+	# the shim's own log (SHIM_GPUBOOT stages) sits just below the ring
+	$sbin = [System.IO.Path]::GetTempFileName()
+	& cmd /c "`"$adb`" exec-out dd if=$dev bs=4096 skip=$($skip - $PLOG_BLOCKS) count=$PLOG_BLOCKS 2>NUL > `"$sbin`""
+	$sraw = [System.IO.File]::ReadAllBytes($sbin)
+	Remove-Item $sbin
+	if ($Out -and $sraw.Length -ge 8192 -and [BitConverter]::ToUInt32($sraw, 0) -eq 0x52505753) {
+		$slen = [BitConverter]::ToUInt32($sraw, 12)
+		$stext = [System.Text.Encoding]::ASCII.GetString($sraw, 4096, [Math]::Min($slen, $sraw.Length - 4096))
+		Set-Content -Path "$Out.shim.txt" -Value $stext -Encoding ascii
+		Log "shim log saved $Out.shim.txt"
+	}
 	& $adb reboot bootloader | Out-Null
 	Log "XNU ring read ($((Get-Item $bin).Length) bytes), sent adb reboot bootloader"
 	$wbin = (& wsl -d Ubuntu -- wslpath -a ($bin -replace '\\', '/')).Trim()
