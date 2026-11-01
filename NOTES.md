@@ -4,6 +4,19 @@
 
 ### >>> GPU 2026-11-01 (limonetexd/ios-sweet-gpu, another M2101K6G; read first) <<<
 
+**Latest (evening):** CoreAnimation is composited on the GPU. xnu 0086 (topaz 0131-0139 SweetSurface:
+values, bulk attachments at state page +0x30, IOSurfaceAddress/wrap-client surfaces, detach/zombie views,
+empty IOAcceleratorES; RedwoodGPU maps wrapped surfaces from their first page) fixed backboardd's
+SIGSEGV in IOSurfaceClientGetBulkAttachments. xnu 0087 (topaz 0900 hunk) makes 'b3a8'/10-bit surfaces
+one-plane BGRA, so -attachImage takes backboardd's display surface (glDrawElements 0x506 gone).
+Run 0088r (CI 41331031297, log `logs/xnu-0088r.txt`): frames 1-3 drawn by Mesa/FD618 and swapped to
+AppleCLCD, ~250 ms each in glFinish, then no more frames in ~4 min (backboardd/SpringBoard threads idle
+in mach_msg; screen content not yet seen). Guess (not verified): the GMU left gx_gfx3d at XO 19.2 MHz,
+nobody sent a DCVS request. Commit fb5ab89: shim sends DCVS (perf idx, OOB 23/31, OPPs 180-430 MHz),
+xnu 0082 logs gfx3d cfg + DCVS regs; CI 41332643524 -> image `shim/out/shim-boot-0089r.img`, untested.
+Next: run the loop with 0089r, check "SWEET GPU: gfx3d cfg" and frame times; then cut the 11 MB
+IOSurface->texture refill per frame (display surface "copied into its memory by the GPU").
+
 **The Adreno 618 runs our command streams from the shim** (`SHIM_CFLAGS=-DSHIM_GPUPROBE shim/build.sh`,
 `shim/gpuprobe.c`, probe 4a, commit e38e668): CX GDSC + GPUCC clocks, RPMh BCM DDR vote (MC0/SH0/ACV,
 A619 level-1 values; turns gcc gpu_memnoc_gfx on), Adreno SMMU CB0 for the GMU, PDC/RSC from cmd-db
