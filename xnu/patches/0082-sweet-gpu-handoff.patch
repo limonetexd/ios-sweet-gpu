@@ -28,7 +28,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,271 @@
 +/*
 + * SWEET Adreno 618 handoff check (boot-arg sweetgpu=1).
 + *
@@ -84,8 +84,8 @@
 +#define CP_SQE_BASE	0x830
 +#define GMU_INIT_RESULT	0x1f81c
 +#define GPUCC_GFX3D_CFG	(0x90000u + 0x1020)
-+#define GMU_DCVS_PERF	0x1cbc1
-+#define GMU_DCVS_RETURN	0x1cbc3
++#define GMU_DCVS_PERF	0x1cbfd
++#define GMU_DCVS_RETURN	0x1cbff
 +
 +static vm_offset_t sg_gpu, sg_pool;
 +static int sg_sleep_chan;
@@ -233,7 +233,13 @@
 +	(void)result;
 +	int reboot = 0;
 +	(void)PE_parse_boot_argn("sweetgpu_reboot", &reboot, sizeof(reboot));
-+	sg_sleep_ms(20000);
++	/*
++	 * sweetgpu>=2: RedwoodGPU must be up before backboardd stops looking for it
++	 * (about 50 lookups; run 0089r lost that race with the 20 s wait).
++	 */
++	int mode = 0;
++	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
++	sg_sleep_ms(mode >= 2 ? 1000 : 20000);
 +
 +	uint32_t cx = sg_rd(sg_gpu, GPUCC_CX_GDSCR), gx = sg_rd(sg_gpu, GPUCC_GX_GDSCR);
 +	printf("SWEET GPU: cx gdsc %#x gx gdsc %#x\n", cx, gx);

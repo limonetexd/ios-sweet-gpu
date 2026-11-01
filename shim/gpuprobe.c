@@ -55,13 +55,13 @@
 #define GMU_SPTPRAC_PWR_CTRL	0x1a881
 #define GMU_ITCM		0x1b400
 #define GMU_DTCM		0x1c400
-#define GMU_DCVS_ACK_OPTION	0x1cbc0
-#define GMU_DCVS_PERF_SETTING	0x1cbc1
-#define GMU_DCVS_BW_SETTING	0x1cbc2
-#define GMU_DCVS_RETURN		0x1cbc3
 #define GMU_BOOT_SLUMBER_OPT	0x1cbf8
 #define GMU_GX_VOTE_IDX		0x1cbf9
 #define GMU_MX_VOTE_IDX		0x1cbfa
+#define GMU_DCVS_ACK_OPTION	0x1cbfc
+#define GMU_DCVS_PERF_SETTING	0x1cbfd
+#define GMU_DCVS_BW_SETTING	0x1cbfe
+#define GMU_DCVS_RETURN		0x1cbff
 #define GMU_ICACHE_CFG		0x1f400
 #define GMU_DCACHE_CFG		0x1f401
 #define GMU_SYS_BUS		0x1f40f
