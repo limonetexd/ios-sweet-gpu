@@ -33,7 +33,16 @@ CP_MEM_WRITE 0xcafef00d, and a 500-row gradient painted into the ABL framebuffer
   Shim state handed over (GMEM = 0x1f0000000): GMU CB0 tables +0x0, HFI +0x19000; GPU CB1: L1 +0x200000,
   L2 (VA 0-1G) +0x201000, L3 (0x10000000-0x101fffff) +0x202000; SQE +0x300000 (GVA 0x10000000), ring
   +0x310000 (GVA 0x10010000, 32 KiB, CP_RB_CNTL 0x0800020c), target/fence page +0x320000 (GVA 0x10020000).
-- **Next (phase 3.2):** userland GPU service = ios-topaz 0901 `RedwoodGPU.cpp` (msm DRM ioctls as
+- **RedwoodGPU published (2026-11-01 13:28 UTC, kernel 0083 CI 41310748229, image shim-boot-0083g.img,
+  sweetgpu=2):** `iokit/Kernel/arm/SweetAdreno.cpp` (redwood_gpu_* over the handed-over GPU) + topaz's
+  `RedwoodGPU.cpp`. Self-test: IB in XNU memory at 0x1468d0000 (GPU VA 0x40000000) wrote 0xadee0618 into
+  another buffer, fence 1 done. Lessons: XNU's I/O map space is tiny (20 MiB and 4 MiB ml_io_map of the
+  pool panicked in kmem_alloc; now ~1.2 MiB total, shared via sweet_gpu_regs()/sweet_gpu_shared());
+  write-combined IOBufferMemoryDescriptors assert in flush_dcache -> ml_static_vtop, so GPU buffers are
+  cached memory (RedwoodGPU gpu_cached defaults to 1 here) with dc civac done by hand.
+- **Next (phase 3.2 rest / phase 4):** IOAcceleratorES stub (topaz 0138), then userland built on a macOS
+  GitHub runner: Mesa freedreno + redwood-drm + eagl.c/topaz_inject.c/bbd_wrap.c (topaz `userland/`),
+  a freedreno test first, then backboardd. Earlier plan text: userland GPU service = ios-topaz 0901 `RedwoodGPU.cpp` (msm DRM ioctls as
   user-client selectors; extracted to WSL `/home/pablo/research/RedwoodGPU-0901.cpp`) over a new
   backend implementing `redwood_gpu_*` on the handed-over GPU (page tables from the pool, 4K PTEs,
   buffers above 4 GiB -> physical mask 40 bits, IBs + CP_EVENT_WRITE CACHE_FLUSH_TS fence into the
