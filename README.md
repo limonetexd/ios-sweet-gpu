@@ -1,4 +1,5 @@
 # ios-sweet
+## This is a fork with the objective of making the GPU work. Everything or 99% of the updates are vibe coded (AI generated) with Claude Opus 5.5
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 
