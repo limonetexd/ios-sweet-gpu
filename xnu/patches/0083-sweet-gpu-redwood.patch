@@ -45,7 +45,7 @@
  		sg_reboot_fastboot();
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,507 @@
 +/*
 + * SWEET: the Adreno 618 for programs to draw with, behind the hardware
 + * interface (redwood_gpu_*) that RedwoodGPU.cpp's msm DRM user client speaks
@@ -354,11 +354,31 @@
 +	tlb_flush();
 +}
 +
++/*
++ * Clean and invalidate to the point of coherency by hand: the GPU reads and
++ * writes DRAM behind the CPU caches, and this kernel's own dcache helpers do
++ * not help (flush_dcache asserted in ml_static_vtop when a buffer was made
++ * write-combined: 0083 run 3). Buffers are therefore ordinary cached memory.
++ */
++static void
++dcache_civac(vm_offset_t addr, uint64_t length)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	vm_offset_t line = 4UL << ((ctr >> 16) & 0xf);
++	vm_offset_t end = addr + length;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (vm_offset_t va = addr & ~(line - 1); va < end; va += line) {
++		__asm__ volatile ("dc civac, %0" :: "r"(va) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
 +void
 +redwood_gpu_to_memory(void *start, uint64_t size)
 +{
 +	if (start != NULL && size != 0) {
-+		CleanPoC_DcacheRegion((vm_offset_t)start, (size_t)size);
++		dcache_civac((vm_offset_t)start, size);
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
@@ -454,9 +474,9 @@
 +selftest(void)
 +{
 +	IOBufferMemoryDescriptor *ib = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-+	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, 4096, 0xfffffff000ull);
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 4096, 0xfffffff000ull);
 +	IOBufferMemoryDescriptor *dst = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-+	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, 4096, 0xfffffff000ull);
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 4096, 0xfffffff000ull);
 +	if (ib == NULL || dst == NULL) {
 +		IOLog("SWEET GPU: selftest: no memory\n");
 +		OSSafeReleaseNULL(ib);
@@ -475,13 +495,15 @@
 +	p[1] = (uint32_t)dst_va;
 +	p[2] = (uint32_t)(dst_va >> 32);
 +	p[3] = 0xadee0618;
-+	__asm__ volatile ("dsb sy" ::: "memory");
++	redwood_gpu_to_memory((void *)p, 16);
++	redwood_gpu_to_memory((void *)d, 4);
 +	uint64_t a = ib_va;
 +	uint32_t w = 4;
 +	uint32_t fence = ok ? redwood_gpu_submit(&a, &w, 1) : 0;
 +	for (int i = 0; fence != 0 && i < 1000 && !redwood_gpu_done(fence); i++) {
 +		IODelay(100);
 +	}
++	redwood_gpu_to_memory((void *)d, 4);   /* drop any stale line before reading the GPU's write */
 +	IOLog("SWEET GPU: selftest: ib %llx@%llx dst %llx@%llx fence %u done %d dst %08x%s\n", ib_pa, ib_va, dst_pa, dst_va,
 +	    fence, fence ? redwood_gpu_done(fence) : 0, d[0], d[0] == 0xadee0618 ? " *** IB FROM XNU MEMORY RAN ***" : "");
 +	if (d[0] != 0xadee0618) {
@@ -533,7 +555,7 @@
 +#endif /* SWEET */
 --- /dev/null
 +++ b/iokit/Kernel/arm/RedwoodGPU.cpp
-@@ -0,0 +1,1200 @@
+@@ -0,0 +1,1202 @@
 +#include <pexpert/arm64/board_config.h>
 +#if defined(SWEET)
 +/*
@@ -859,7 +881,9 @@
 +	RedwoodGPU * gpu;
 +	uint32_t cached = 0;
 +
-+	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
++	/* sweet: cached by default (making memory write-combined asserts in this kernel's
++	 * flush_dcache); gpu_cached=0 asks for write-combined buffers */
++	gGPUCached = !PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) || cached != 0;
 +	gGPULock = IOLockAlloc();
 +	gpu = OSTypeAlloc(RedwoodGPU);
 +	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
