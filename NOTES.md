@@ -24,8 +24,22 @@ CP_MEM_WRITE 0xcafef00d, and a 500-row gradient painted into the ABL framebuffer
   `shim/plog.c`) at every step, sets the PM6150 PON soft-reboot reason to bootloader (+ PS_HOLD hard
   reset), arms the APSS watchdog, and resets; the script then boots OrangeFox R12.0_2
   (`recovery/recovery.img`, not in git), reads the log with adb and returns to fastboot. No buttons.
-- Next: port this into XNU (SweetGPU service, after ios-flame 0095/0096/0097/0115 + ios-topaz's msm-style
-  user client), then Mesa freedreno GLES in userland for CoreAnimation (ios-topaz path).
+- **GPU under XNU (2026-11-01 13:20 UTC, kernel 0082, image `shim/out/shim-boot-0082g.img`):** the shim
+  built with `SHIM_CFLAGS="-DSHIM_GPUPROBE -DSHIM_GPUBOOT"` brings the GPU up and jumps to XNU; ADT from
+  `tools/mkadt.py --highmem --gpupool` (XNU RAM ends 0x1ecb00000, GPU pool 0x1ecb00000-0x1fcb00000);
+  `bsd/dev/sweet_gpu.c` (boot-arg `sweetgpu=1`) finds CX/GX on, GMU 0xbabeface, RBBM 1, and a
+  CP_MEM_WRITE it appends to the shim's ring executes (0x5ee7c0de). `sweetgpu_reboot=1` returns to fastboot;
+  `tools/sweet-probe-loop.ps1 -Image ... -Xnu -ProbeSeconds 600` reads the XNU ring. CI run 41305449404.
+  Shim state handed over (GMEM = 0x1f0000000): GMU CB0 tables +0x0, HFI +0x19000; GPU CB1: L1 +0x200000,
+  L2 (VA 0-1G) +0x201000, L3 (0x10000000-0x101fffff) +0x202000; SQE +0x300000 (GVA 0x10000000), ring
+  +0x310000 (GVA 0x10010000, 32 KiB, CP_RB_CNTL 0x0800020c), target/fence page +0x320000 (GVA 0x10020000).
+- **Next (phase 3.2):** userland GPU service = ios-topaz 0901 `RedwoodGPU.cpp` (msm DRM ioctls as
+  user-client selectors; extracted to WSL `/home/pablo/research/RedwoodGPU-0901.cpp`) over a new
+  backend implementing `redwood_gpu_*` on the handed-over GPU (page tables from the pool, 4K PTEs,
+  buffers above 4 GiB -> physical mask 40 bits, IBs + CP_EVENT_WRITE CACHE_FLUSH_TS fence into the
+  target page; A618 params: GPU_ID 618, CHIP_ID 0x06010800, GMEM 512K, HIGHEST_BANK_BIT 14), plus the
+  SweetSurface/IOAcceleratorES patches (topaz 0131-0139). Userland (Mesa freedreno + redwood-drm +
+  eagl.c injection, topaz `userland/`) must be built on a macOS GitHub runner (add a workflow).
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
