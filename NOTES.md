@@ -2,6 +2,31 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> GPU 2026-11-01 (limonetexd/ios-sweet-gpu, another M2101K6G; read first) <<<
+
+**The Adreno 618 runs our command streams from the shim** (`SHIM_CFLAGS=-DSHIM_GPUPROBE shim/build.sh`,
+`shim/gpuprobe.c`, probe 4a, commit e38e668): CX GDSC + GPUCC clocks, RPMh BCM DDR vote (MC0/SH0/ACV,
+A619 level-1 values; turns gcc gpu_memnoc_gfx on), Adreno SMMU CB0 for the GMU, PDC/RSC from cmd-db
+(sweet `gfx.lvl` = 0x30050, not Linux's 0x30090), raw `a618_gmu.bin` in ITCM -> INIT_RESULT 0xBABEFACE,
+BOOT_SLUMBER OOB, SPTPRAC 0x28, HFI v1 (INIT, FW_VERSION 0x10110000, PERF_TABLE v1, BW_TABLE a618, TEST)
+all acked, GPU_SET OOB -> GX on, RBBM_STATUS 1; GPU SMMU CB1, A618 hw_init subset, `a630_sqe.fw`,
+CP_ME_INIT idle, zap `a615_zap` via SCM PAS 13 (region 0x97715000), CP_SET_SECURE_MODE 0,
+CP_MEM_WRITE 0xcafef00d, and a 500-row gradient painted into the ABL framebuffer by the GPU.
+- **Hypervisor rule (important for the kernel port):** the Adreno SMMU only accepts SMRs for the exact
+  DT stream IDs with mask 0 (GMU 5, GPU 0). A masked SMR reads back 0 (the GMU then never reaches DDR and
+  the SoC resets at HFI init); test writes of a fault-type S2CR reset the SoC. CB registers are free.
+- The GPU RSC wake (GMU_RSCC_CONTROL_ACK) never acks; harmless (same on the A640/ios-flame).
+- Reading the SMMU right after a long cmd-db walk hung once (2b/2c); SMMU setup runs before cmd-db now.
+- Firmware (Xiaomi/Qualcomm, NOT in git): `research/gpu-sweet/fw/` from LineageOS 23.2 20261029
+  vendor.img; DT facts in `research/gpu-sweet/FACTS.md` (LineageOS boot.img dtb).
+- **Unattended probe loop (Windows):** `tools/sweet-probe-loop.ps1 -Image shim/out/X.img -Out logs/X.txt`:
+  the probe saves its console text to a userdata scratch area (32 blocks below the 1025-block XNU ring,
+  `shim/plog.c`) at every step, sets the PM6150 PON soft-reboot reason to bootloader (+ PS_HOLD hard
+  reset), arms the APSS watchdog, and resets; the script then boots OrangeFox R12.0_2
+  (`recovery/recovery.img`, not in git), reads the log with adb and returns to fastboot. No buttons.
+- Next: port this into XNU (SweetGPU service, after ios-flame 0095/0096/0097/0115 + ios-topaz's msm-style
+  user client), then Mesa freedreno GLES in userland for CoreAnimation (ios-topaz path).
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**
