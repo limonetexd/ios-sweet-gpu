@@ -15,6 +15,16 @@ volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
 static int row;
 
+/* Text copy of every console line, for probes that save it to UFS (plog.c). */
+char con_text[CON_TEXT_SIZE] __attribute__((aligned(4096)));
+uint32_t con_text_len;
+
+static void text_put(const char *s)
+{
+	while (*s && con_text_len < CON_TEXT_SIZE - 1)
+		con_text[con_text_len++] = *s++;
+}
+
 void con_clear(uint32_t bg)
 {
 	for (int y = 0; y < FB_H; y++) {
@@ -71,6 +81,10 @@ void con_str(const char *label, const char *s)
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
+	text_put(label);
+	text_put(" ");
+	text_put(s);
+	text_put("\n");
 }
 
 /* Overwrite the bottom text row: the current step stays visible if we hang. */
@@ -100,10 +114,18 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	col = put_str(col, a, YELLOW);
 	fmt_hex(buf, va, 8);
 	col = put_str(col, buf, WHITE);
+	text_put(label);
+	text_put(" ");
+	text_put(a);
+	text_put(buf);
 	if (b) {
 		col = put_str(col + 1, b, YELLOW);
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, WHITE);
+		text_put(" ");
+		text_put(b);
+		text_put(buf);
 	}
+	text_put("\n");
 	row++;
 }

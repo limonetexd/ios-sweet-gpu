@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "ufs.h"
 #include "gpuprobe.h"
+#include "plog.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -385,12 +386,19 @@ void shim_main(uint64_t dtb)
 	con_skip();
 
 #ifdef SHIM_GPUPROBE
-	/* GPU bring-up image: no payload, no UFS; keep the result on screen. */
+	/*
+	 * GPU bring-up image, unattended: the log goes to a userdata scratch area
+	 * at every step, the watchdog resets a hung probe, and every reset comes
+	 * back to fastboot (tools/sweet-probe-loop.ps1 reads the log via recovery).
+	 */
+	con_hex2("PLOG", "ufs=", (uint32_t)plog_init(), 0, 0);
+	plog_set_fastboot_reason();
+	plog_wdog_arm(30);
 	gpuprobe_run(&stage);
-	con_skip();
-	con_str("GPU", "probe done, reset in ~3 min");
-	delay_ms(180000);
-	reset(20);
+	con_str("GPU", "probe done, back to fastboot in 10 s");
+	plog_save("done");
+	delay_ms(10000);
+	plog_reboot();
 #endif
 
 	/* No payload: probe the internal UFS while the MMU is still off. */

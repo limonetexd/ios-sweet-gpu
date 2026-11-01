@@ -14,6 +14,10 @@
 
 extern volatile uint32_t *con_fb;
 
+#define CON_TEXT_SIZE	0x10000
+extern char con_text[CON_TEXT_SIZE];	/* every printed line, as text */
+extern uint32_t con_text_len;
+
 void con_clear(uint32_t bg);
 void con_skip(void);
 void con_str(const char *label, const char *s);

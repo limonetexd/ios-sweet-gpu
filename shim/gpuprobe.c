@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "gpuprobe.h"
+#include "plog.h"
 
 #define GCC		0x00100000UL
 #define GPUCC		0x05090000UL
@@ -163,11 +164,16 @@ static int wait_bit(uintptr_t reg, uint32_t mask, int set, unsigned ms)
 
 static const char **stage_p;
 
-/* Phone run 2: the bottom-row status was not visible; print each step as a line. */
+/*
+ * Phone run 2: the bottom-row status was not visible; print each step as a
+ * line, and save the log to UFS before it so a reset still leaves it there.
+ */
 static void stage(const char *s)
 {
 	*stage_p = s;
 	con_str("AT", s);
+	plog_wdog_pet();
+	plog_save(s);
 }
 
 static int branch_on(uintptr_t reg)
@@ -710,7 +716,7 @@ static void gmu_boot(void)
 		return;
 	}
 	/* Run 2d filled the screen here: start a new page for the rest. */
-	delay_ms(3000);
+	delay_ms(1000);
 	con_clear(RED);
 	con_hex2("GMU UP", "init=", r, "cb fsr=", rd32(c + CB_FSR));
 	con_hex2("  (rsc)", "ack=", rd32(GMU_REG(GMU_RSCC_ACK)), "seq busy=", rd32(RSCC_REG(0x0101)));
@@ -733,7 +739,6 @@ static void gmu_boot(void)
 	con_hex2("GMU LOG", "w0=", rd32(GMEM_LOG), "w1=", rd32(GMEM_LOG + 4));
 	con_hex2("CB", "fsr=", rd32(c + CB_FSR), "far=", rd32(c + CB_FAR));
 	stage("hfi start");
-	delay_ms(2000);		/* for the camera, in case the next step resets */
 	wr32(GMU_REG(GMU_HFI_INIT), 1);
 	rc = wait_bit(GMU_REG(GMU_HFI_STATUS), 1, 1, 10);
 	con_hex2("HFI", rc ? "INIT TIMEOUT=" : "status=", rd32(GMU_REG(GMU_HFI_STATUS)), 0, 0);
@@ -811,12 +816,7 @@ static void gmu_boot(void)
 void gpuprobe_run(const char **stage_var)
 {
 	stage_p = stage_var;
-	/* APSS watchdog (msm-watchdog): WDT_EN at +0x8, RST (pet) at +0x4. */
-	uint32_t wd = rd32(WDOG + 0x8);
-	wr32(WDOG + 0x4, 1);
-	wr32(WDOG + 0x8, 0);
 	con_str("GPUPROBE", "adreno 618 stage 2 (gmu boot)");
-	con_hex2("WDOG", "en was=", wd, "now=", rd32(WDOG + 0x8));
 	if (cx_on())
 		return;
 	gmu_boot();
