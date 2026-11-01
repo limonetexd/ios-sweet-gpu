@@ -1,0 +1,185 @@
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -51,6 +51,8 @@
+ 
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
++extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);   /* SweetAdreno.cpp */
++extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
+ 
+ extern "C" {
+ /* bsd/dev/redwood_adreno.c ("the GPU kept on"; declared in bsd/sys/redwood_input.h, which is not seen from here) */
+@@ -175,6 +177,7 @@ struct redwood_show {
+ #define GPU_BUFFER_MAX          (256u << 20)
+ #define GPU_SUBMIT_CMDS         128
+ #define GPU_SUBMIT_BOS          8192
++#define GPU_POOL_FROM           (256 * 1024)    /* buffers this big and bigger come from the GPU pool */
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+ #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
+@@ -361,6 +364,7 @@ struct gpu_buffer {
+ 	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
+ 	uint64_t                        pushed;         /* ... and when that was */
+ 	bool                            seen;           /* by the program: mapped, and from then on written by it */
++	bool                            pool;           /* memory from the GPU pool (write-combined, given back to it) */
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+ };
+ 
+@@ -376,6 +380,7 @@ struct gpu_left {
+ 	SweetSurface *                  surface;
+ 	uint64_t                        address, size;
+ 	uint32_t                        fence, flags;
++	bool                            pool;
+ };
+ #define GPU_LEFT                64
+ 
+@@ -486,6 +491,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		left->size = b->size;
+ 		left->fence = b->fence;
+ 		left->flags = b->flags;
++		left->pool = b->pool;
+ 	} else {
+ 		if (busy) {
+ 			static uint32_t said;
+@@ -498,19 +504,23 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 			if (said++ < 8) {
+ 				IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
+ 			}
+-		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
++		} else if (b->surface == NULL && !b->pool && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
+ 			b->memory = NULL;               /* (now the kept one's) */
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(b->address, b->size);
+ 			redwood_gpu_address_free(b->address, b->size);
+ 		}
+ 		if (b->memory != NULL) {
++			if (b->pool && !busy) {
++				sweet_gpu_pool_range_free(b->memory->getPhysicalSegment(0, NULL, kIOMemoryMapperNone), b->size);
++			}
+ 			b->memory->release();
+ 		}
+ 		if (b->surface != NULL) {
+ 			b->surface->release();
+ 		}
+ 	}
++	b->pool = false;
+ 	b->memory = NULL;
+ 	b->surface = NULL;
+ 	fBufferCount--;
+@@ -528,7 +538,7 @@ RedwoodGPUUserClient::reap(void)
+ 			i++;
+ 			continue;
+ 		}
+-		if (left->surface == NULL && redwood_gpu_ready() &&
++		if (left->surface == NULL && !left->pool && redwood_gpu_ready() &&
+ 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
+ 			left->memory = NULL;
+ 		} else if (redwood_gpu_ready()) {
+@@ -536,6 +546,9 @@ RedwoodGPUUserClient::reap(void)
+ 			redwood_gpu_address_free(left->address, left->size);
+ 		}
+ 		if (left->memory != NULL) {
++			if (left->pool) {
++				sweet_gpu_pool_range_free(left->memory->getPhysicalSegment(0, NULL, kIOMemoryMapperNone), left->size);
++			}
+ 			left->memory->release();
+ 		}
+ 		if (left->surface != NULL) {
+@@ -751,6 +764,39 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		}
+ 	}
+ 	IOLockUnlock(gGPULock);
++	/*
++	 * Big buffers (textures, the frame's own) from the GPU pool: write-combined, so never
++	 * cleaned out of the cache at a submission (the cached ones were ~15 MB a submission).
++	 */
++	uint8_t * pool_kva = NULL;
++	uint64_t pool_pa = size >= GPU_POOL_FROM ? sweet_gpu_pool_range(size, &pool_kva) : 0;
++	if (pool_pa != 0) {
++		IOMemoryDescriptor * md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) pool_pa, size, kIODirectionInOut);
++		if (md == NULL) {
++			sweet_gpu_pool_range_free(pool_pa, size);
++		} else {
++			for (uint64_t i = 0; i < size / 8; i++) {
++				((volatile uint64_t *) pool_kva)[i] = 0;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			IOLockLock(gGPULock);
++			b = newBuffer(md, 0, size, request->flags, &request->handle);
++			if (b != NULL) {
++				b->memory = md;
++				b->kernel = pool_kva;
++				b->pool = true;
++				gGPUStat.made++;
++				gGPUStat.making += mach_absolute_time() - began;
++			}
++			IOLockUnlock(gGPULock);
++			if (b == NULL) {
++				md->release();
++				sweet_gpu_pool_range_free(pool_pa, size);
++				return kIOReturnNoMemory;
++			}
++			return kIOReturnSuccess;
++		}
++	}
+ 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+ 	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+ 	    kIOMemoryPhysicallyContiguous | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, 0x000000fffffff000ull);
+@@ -932,7 +978,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			}
+ 			b->seed = seed;
+ 			b->pushed = began;
+-		} else if (!b->seen || !gGPUCached) {
++		} else if (!b->seen || !gGPUCached || b->pool) {
+ 			continue;
+ 		}
+ 		redwood_gpu_to_memory(b->kernel, b->size);
+@@ -1083,7 +1129,7 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ 		b->memory->retain();
+ 		b->seen = true;
+ 		*memory = b->memory;
+-		*options = 0;
++		*options = b->pool || (b->surface != NULL && b->surface->gpuPool) ? kIOMapWriteCombineCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gGPULock);
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -46,8 +46,8 @@
+ #include <sys/proc.h>
+ #include <pexpert/pexpert.h>
+ 
+-extern "C" uint64_t sweet_gpu_pool_surface(uint64_t size);       /* SweetAdreno.cpp */
+-extern "C" void sweet_gpu_pool_surface_free(uint64_t pa);
++extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);   /* SweetAdreno.cpp */
++extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -114,7 +114,7 @@ SweetSurface::free()
+ 	}
+ 	OSSafeReleaseNULL(memory);
+ 	if (gpuPool) {
+-		sweet_gpu_pool_surface_free(poolPhys);
++		sweet_gpu_pool_range_free(poolPhys, allocSize);
+ 	}
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -325,7 +325,7 @@ sweet_gpu_pool_eligible(const SweetSurface *s)
+ static bool
+ sweet_surface_use_gpu_pool(SweetSurface *s)
+ {
+-	uint64_t pa = sweet_gpu_pool_surface(s->allocSize);
++	uint64_t pa = sweet_gpu_pool_range(s->allocSize, NULL);
+ 	if (pa == 0) {
+ 		return false;
+ 	}
+@@ -333,7 +333,7 @@ sweet_surface_use_gpu_pool(SweetSurface *s)
+ 	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+ 	if (map == NULL) {
+ 		OSSafeReleaseNULL(md);
+-		sweet_gpu_pool_surface_free(pa);
++		sweet_gpu_pool_range_free(pa, s->allocSize);
+ 		return false;
+ 	}
+ 	volatile uint64_t *p = (volatile uint64_t *)map->getVirtualAddress();

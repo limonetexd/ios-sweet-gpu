@@ -45,7 +45,7 @@
  		sg_reboot_fastboot();
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,608 @@
 +/*
 + * SWEET: the Adreno 618 for programs to draw with, behind the hardware
 + * interface (redwood_gpu_*) that RedwoodGPU.cpp's msm DRM user client speaks
@@ -262,43 +262,103 @@
 +}
 +
 +/*
-+ * Screen-sized surfaces from the pool (SweetSurface.cpp, ios-topaz 0924): 15
-+ * slots of 16 MiB at pool +16 MiB. The pool is not XNU's RAM, so it has no
-+ * cacheable kernel mapping: mapped write-combined, it needs no cache
-+ * maintenance before the GPU draws into it (RedwoodGPU.cpp skips those).
++ * Memory from the pool for screen-sized surfaces (SweetSurface.cpp, ios-topaz
++ * 0924) and programs' big buffers (RedwoodGPU.cpp, topaz 0910): pool +16 MiB
++ * to its end, 15 slots of 16 MiB handed out in 64 KiB units, no range across
++ * two slots. The pool is not XNU's RAM and is only ever mapped write-combined
++ * (each slot once in the kernel, on first use), so the GPU's view of it
++ * needs no cache maintenance (RedwoodGPU.cpp skips it).
 + */
-+#define OFF_SURFACES    0x01000000ull
-+#define SURFACE_SLOT    0x01000000ull
-+#define SURFACE_SLOTS   15
-+static volatile uint32_t surface_slots;
++#define OFF_RANGES      0x01000000ull
++#define RANGE_SLOT      0x01000000ull
++#define RANGE_SLOTS     15
++#define RANGE_UNIT      0x10000ull
++#define SLOT_UNITS      (RANGE_SLOT / RANGE_UNIT)
++static uint64_t range_used[RANGE_SLOTS][SLOT_UNITS / 64];
++static uint8_t *range_kva[RANGE_SLOTS];
++static IOLock *range_lock;
 +
-+extern "C" uint64_t sweet_gpu_pool_surface(uint64_t size);
-+extern "C" void sweet_gpu_pool_surface_free(uint64_t pa);
++extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);
++extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
++extern "C" bool sweet_gpu_pool_has(uint64_t pa);
 +
-+uint64_t
-+sweet_gpu_pool_surface(uint64_t size)
++static bool
++unit_used(int s, uint64_t u)
 +{
-+	if (!ready || size == 0 || size > SURFACE_SLOT) {
-+		return 0;
-+	}
-+	for (int i = 0; i < SURFACE_SLOTS; i++) {
-+		uint32_t old = surface_slots;
-+		if (!(old & (1u << i)) && OSCompareAndSwap(old, old | (1u << i), &surface_slots)) {
-+			return POOL_PA + OFF_SURFACES + (uint64_t)i * SURFACE_SLOT;
-+		} else if (!(old & (1u << i))) {
-+			i--;            /* lost a race: look at this slot again */
++	return (range_used[s][u / 64] >> (u % 64)) & 1;
++}
++
++static void
++units_mark(int s, uint64_t u, uint64_t n, bool used)
++{
++	for (uint64_t i = u; i < u + n; i++) {
++		if (used) {
++			range_used[s][i / 64] |= 1ull << (i % 64);
++		} else {
++			range_used[s][i / 64] &= ~(1ull << (i % 64));
 +		}
 +	}
++}
++
++/* Physical address of `size` bytes of the pool and where the kernel sees them (write-combined), or 0. */
++uint64_t
++sweet_gpu_pool_range(uint64_t size, uint8_t **kernel)
++{
++	uint64_t n = (size + RANGE_UNIT - 1) / RANGE_UNIT;
++
++	if (!ready || range_lock == NULL || n == 0 || n > SLOT_UNITS) {
++		return 0;
++	}
++	IOLockLock(range_lock);
++	for (int s = 0; s < RANGE_SLOTS; s++) {
++		for (uint64_t u = 0; u + n <= SLOT_UNITS; u++) {
++			uint64_t run = 0;
++			while (run < n && !unit_used(s, u + run)) {
++				run++;
++			}
++			if (run < n) {
++				u += run;       /* (past the used unit that ended the run) */
++				continue;
++			}
++			if (range_kva[s] == NULL) {
++				IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(
++				    (IOPhysicalAddress)(POOL_PA + OFF_RANGES + s * RANGE_SLOT), RANGE_SLOT, kIODirectionInOut);
++				IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++				OSSafeReleaseNULL(md);  /* (the map holds it, for good) */
++				if (map == NULL) {
++					IOLockUnlock(range_lock);
++					return 0;
++				}
++				range_kva[s] = (uint8_t *)map->getVirtualAddress();
++			}
++			units_mark(s, u, n, true);
++			IOLockUnlock(range_lock);
++			if (kernel != NULL) {
++				*kernel = range_kva[s] + u * RANGE_UNIT;
++			}
++			return POOL_PA + OFF_RANGES + s * RANGE_SLOT + u * RANGE_UNIT;
++		}
++	}
++	IOLockUnlock(range_lock);
 +	return 0;
 +}
 +
-+void
-+sweet_gpu_pool_surface_free(uint64_t pa)
++bool
++sweet_gpu_pool_has(uint64_t pa)
 +{
-+	uint64_t i = (pa - POOL_PA - OFF_SURFACES) / SURFACE_SLOT;
-+	if (pa >= POOL_PA + OFF_SURFACES && i < SURFACE_SLOTS) {
-+		OSBitAndAtomic(~(1u << i), &surface_slots);
++	return pa >= POOL_PA + OFF_RANGES && pa < POOL_PA + OFF_RANGES + RANGE_SLOTS * RANGE_SLOT;
++}
++
++void
++sweet_gpu_pool_range_free(uint64_t pa, uint64_t size)
++{
++	if (!sweet_gpu_pool_has(pa) || range_lock == NULL) {
++		return;
 +	}
++	uint64_t off = pa - POOL_PA - OFF_RANGES;
++	IOLockLock(range_lock);
++	units_mark((int)(off / RANGE_SLOT), (off % RANGE_SLOT) / RANGE_UNIT, (size + RANGE_UNIT - 1) / RANGE_UNIT, false);
++	IOLockUnlock(range_lock);
 +}
 +
 +/* ---- CP ---- */
@@ -579,6 +639,7 @@
 +		return -2;
 +	}
 +	hw_lock = IOLockAlloc();
++	range_lock = IOLockAlloc();
 +	table_next = 0;
 +	va_free_count = 0;
 +	redwood_gpu_address_free(VA_USER_START, VA_USER_END - VA_USER_START);
