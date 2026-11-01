@@ -1,0 +1,52 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -365,14 +366,28 @@ touch_checksum(const uint8_t *buf, unsigned len)
+ 	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+ }
+ 
++/*
++ * (ios-sailfish 0182) Moves go to iOS at most sweettouchhz (default 60, 0 = every report)
++ * times a second, the newest position; downs and ups at once. Every touch event costs
++ * backboardd's HID pipeline and SpringBoard CPU, more than the panel's report rate is worth.
++ */
++static uint64_t touch_move_gap, touch_move_last;
++static int touch_sent_x[TOUCH_MAX], touch_sent_y[TOUCH_MAX];
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
++	uint64_t now = mach_absolute_time();
++	bool move_ok = now - touch_move_last >= touch_move_gap;
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+-			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++			bool down = !(st.active & bit);
++			if (down || ((x[id] != touch_sent_x[id] || y[id] != touch_sent_y[id]) && move_ok)) {
+ 				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				touch_sent_x[id] = x[id];
++				touch_sent_y[id] = y[id];
++				touch_move_last = now;
+ 			}
+ 			st.x[id] = x[id];
+ 			st.y[id] = y[id];
+@@ -646,6 +661,11 @@ sweet_touch_init(void)
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	uint32_t touch_hz = 60;
++	(void)PE_parse_boot_argn("sweettouchhz", &touch_hz, sizeof(touch_hz));
++	if (touch_hz != 0) {
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / touch_hz, &touch_move_gap);
++	}
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;

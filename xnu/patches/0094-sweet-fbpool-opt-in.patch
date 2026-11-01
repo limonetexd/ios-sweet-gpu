@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -301,14 +301,14 @@ static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint
+  * (ios-topaz 0924/0927/0929) backboardd's screen-sized surfaces come from the GPU pool
+  * (SweetAdreno.cpp): RAM XNU does not manage, mapped write-combined everywhere, so the GPU
+  * draws into them with no cache maintenance (an 11 MB dc civac per submission was ~45 ms).
+- * Boot-arg sweetgpu>=2 (the GPU is ours); sweet_fbpool=0 turns it off.
++ * Boot-arg sweetgpu>=2 (the GPU is ours) and sweet_fbpool=1.
+  */
+ static bool
+ sweet_gpu_pool_eligible(const SweetSurface *s)
+ {
+ 	static int on = -1;
+ 	if (on < 0) {
+-		int gpu = 0, pool = 1;
++		int gpu = 0, pool = 0;  /* opt-in: with eagl as it is, pool surfaces froze or crawled (runs 0093c-0094h) */
+ 		(void)PE_parse_boot_argn("sweetgpu", &gpu, sizeof(gpu));
+ 		(void)PE_parse_boot_argn("sweet_fbpool", &pool, sizeof(pool));
+ 		on = gpu >= 2 && pool != 0;
