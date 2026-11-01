@@ -1,0 +1,47 @@
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -939,6 +939,8 @@ static uint64_t
+ toMemoryWritten(struct gpu_buffer * b)
+ {
+ 	uint64_t pushed = 0;
++	/* a surface is a new buffer every time a program takes it again (each frame): its own flag */
++	bool * whole = b->surface != NULL ? &b->surface->cleanOnce : &b->whole;
+ 
+ 	for (uint64_t off = 0; off < b->size; off += PAGE_SIZE) {
+ 		IOByteCount len = 0;
+@@ -947,19 +949,19 @@ toMemoryWritten(struct gpu_buffer * b)
+ 		uint64_t n = b->size - off < PAGE_SIZE ? b->size - off : PAGE_SIZE;
+ 
+ 		if (pa == 0 || !pmap_valid_page(pn)) {
+-			if (!b->whole) {
++			if (!*whole) {
+ 				redwood_gpu_to_memory(b->kernel + off, n);
+ 				pushed += n;
+ 			}
+ 			continue;
+ 		}
+-		if (!b->whole || pmap_is_modified(pn)) {
++		if (!*whole || pmap_is_modified(pn)) {
+ 			pmap_clear_modify(pn);
+ 			redwood_gpu_to_memory(b->kernel + off, n);
+ 			pushed += n;
+ 		}
+ 	}
+-	b->whole = true;
++	*whole = true;
+ 	return pushed;
+ }
+ 
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -46,8 +46,9 @@ public:
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
+ 	bool                      gpuPool;      /* memory is a slot of the GPU pool at poolPhys (write-combined) */
+ 	uint64_t                  poolPhys;
++	bool                      cleanOnce;    /* RedwoodGPU: pushed out of the cache whole once (then written pages only) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { drawn = 0; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuPool = false; poolPhys = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { drawn = 0; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; gpuPool = false; poolPhys = 0; cleanOnce = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
