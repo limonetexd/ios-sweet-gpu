@@ -35,6 +35,26 @@ IOSurface->texture refill per frame (display surface "copied into its memory by 
   that the vote took). Open: why the A618 is this slow (GPU hw_init subset in shim/gpuprobe.c vs Linux
   a6xx_hw_init: UCHE/GBIF/QoS/HWCG; memory attributes of GPU PTEs; GMEM vs sysmem in Mesa).
 
+**Night 2026-11-01 (runs 0094f-0097t, probes 5-6):**
+- **Root cause of the slow A618: the HFI perf table went in MHz, the GMU wants kHz** (Linux
+  gpu_freqs/1000). The GMU then set gpu_cc_pll0 L=0 (unlocked). Fixed in commit 0122a92 (also sets up
+  pll0 with the sdmmagpie Fabia config first): L 0x2c, locked, a submission 60-110 ms -> 3-14 ms.
+- **CPU clocks**: ABL leaves the gold A76s at OSM perf state 0 = 300 MHz (silver at 6 = 1497.6 MHz).
+  Shim now sets gold 10 (1939.2 MHz) and silver 8 (1708.8 MHz) (commit 2a0e734; LUTs in logs/probe6.txt).
+- xnu 0091/0092: RedwoodGPU flushes a cached surface whole once (per surface), then only pages with
+  the pmap modified bit (ios-sailfish 0182); AppleCLCD invalidates a GPU-drawn surface before its CPU
+  copy. Flush per submission 14 MB -> ~3 MB.
+- xnu 0082: boot-arg `sweetgpu_swipe=SECONDS` makes synthetic swipes (unlock, then home-screen swipes
+  every 3 s) for unattended runs.
+- eagl glblit=0 freezes CoreAnimation after ~7 frames in almost every run (0094h, 0095g, 0096g,
+  0097s); not usable. **Best config: `sweetgpu=2 sweet_fbpool=0`** (0097t: stable, ~0.5 s a frame,
+  ~415 ms of it eagl's glTexImage2D refill of the 11 MB target texture from the surface).
+- userland/eagl-sweet.py (commit aeab7e8) patches topaz eagl.c at build time: the target texture is
+  loaded from its surface by a GPU blit. Needs root image ios16-root-gpu2.simg (userdata reflash,
+  approved by the user 2026-11-01 22:21).
+- References: joranv1/ios-sailfish (ios-sweet fork, Pixel 1, 20-40 fps), oosexgang/hakios-xnu-kernel
+  (HackiOS), UniXNU/UniXNU (has a sweet page: zeroninevibedslop/UniXNU-sweet, A618 only to HFI).
+
 **The Adreno 618 runs our command streams from the shim** (`SHIM_CFLAGS=-DSHIM_GPUPROBE shim/build.sh`,
 `shim/gpuprobe.c`, probe 4a, commit e38e668): CX GDSC + GPUCC clocks, RPMh BCM DDR vote (MC0/SH0/ACV,
 A619 level-1 values; turns gcc gpu_memnoc_gfx on), Adreno SMMU CB0 for the GMU, PDC/RSC from cmd-db
