@@ -105,8 +105,13 @@
 #define CB_FSR		0x58
 #define CB_FAR		0x60
 #define CB_FSYNR0	0x68
-#define GMU_SID		5	/* sweet DT: gmu_kernel iommus <&kgsl_smmu 5> */
-#define GMU_SID_MASK	0x400
+/*
+ * sweet DT: gmu_user iommus <&kgsl_smmu 4>, gmu_kernel <&kgsl_smmu 5>. Run 3b
+ * (SID 5 mask 0x400, as on the A640) left the GMU log empty and reset at HFI
+ * init: match both streams (mask bit 0) and report the global fault syndrome.
+ */
+#define GMU_SID		4
+#define GMU_SID_MASK	0x401
 
 /* GMU buffers + page tables: top of the upper DRAM bank, never used by the shim. */
 #define GMEM		0x1f0000000UL
@@ -271,6 +276,29 @@ static int smmu_setup(void)
 	map_pages(GMEM_L3, VA_LOG, GMEM_LOG, BUF_SIZE);
 	map_pages(GMEM_L3, VA_HFI, GMEM_HFI, BUF_SIZE);
 
+	/*
+	 * Runs 3b/3c: SMR0 read back 0 after the write (CB registers did take
+	 * writes). Find out which global registers the hypervisor lets us write.
+	 */
+	/*
+	 * Run 3d (non-valid SMR + fault-type S2CR test writes on all five)
+	 * reset the phone: the hypervisor seems to police these. Try only what
+	 * the DT declares: S2CR translate to our CB, then SMR exact SID 5, mask 0.
+	 */
+	stage("smmu exact sid 5");
+	wr32(S2CR(smr), (uint32_t)cb);
+	wr32(SMR(smr), (1u << 31) | 5u);
+	__asm__ volatile("dsb sy" ::: "memory");
+	con_hex2("SID5", "smr=", rd32(SMR(smr)), "s2cr=", rd32(S2CR(smr)));
+	if (!(rd32(SMR(smr)) >> 31) && smr + 1 < (int)nsmr) {
+		stage("smmu exact sid 4");
+		wr32(S2CR(smr + 1), (uint32_t)cb);
+		wr32(SMR(smr + 1), (1u << 31) | 4u);
+		__asm__ volatile("dsb sy" ::: "memory");
+		con_hex2("SID4", "smr=", rd32(SMR(smr + 1)), "s2cr=", rd32(S2CR(smr + 1)));
+	}
+	con_hex2("SMMU", "scr0=", rd32(SMMU), "smr5=", rd32(SMR(5)));
+
 	stage("program context bank");
 	uintptr_t c = SMMU_CB(cb);
 	wr32(c + CB_SCTLR, 0);
@@ -285,15 +313,34 @@ static int smmu_setup(void)
 	wr32(SMMU + 0x68, 0);					/* TLBIALLNSNH */
 	wr32(SMMU + 0x70, 0);					/* TLBGSYNC */
 	wait_bit(SMMU + 0x74, 1, 0, 10);
-	wr32(S2CR(smr), (uint32_t)cb);				/* translate via cb */
-	wr32(SMR(smr), (1u << 31) | (GMU_SID_MASK << 16) | GMU_SID);
 	con_hex2("SMMU", "smr=", rd32(SMR(smr)), "sctlr=", rd32(c + CB_SCTLR));
+	con_hex2("SMMU", "s2cr=", rd32(S2CR(smr)), "cbar=", rd32(CBAR(cb)));
+	if (!(rd32(SMR(smr)) >> 31) && !(rd32(SMR(smr + 1)) >> 31)) {
+		con_str("SMMU", "SMR NOT TAKEN: stop before the GMU uses DDR");
+		return -1;
+	}
 	return cb;
 }
 
-/* a6xx_gmu_rpmh_init for the A618 (pdc_address_offset 0x30090, TCS3 data+4 = 2). */
+/*
+ * a6xx_gmu_rpmh_init for the A618 (TCS3 data+4 = 2). Linux hardcodes the PDC
+ * TCS resource addresses for sc7180 (0x30010, 0x30000, pdc_address_offset
+ * 0x30090); run 3a's GPU RSC wake was never acked, so these come from sweet's
+ * own cmd-db now (mx.lvl, cx.lvl, gfx.lvl), shown on the log.
+ */
+static uint32_t cmddb_addr(const char *id);
+
 static void rpmh_init(void)
 {
+	uint32_t a_mx = cmddb_addr("mx.lvl"), a_cx = cmddb_addr("cx.lvl"), a_gfx = cmddb_addr("gfx.lvl");
+	con_hex2("ARC", "mx=", a_mx, "cx=", a_cx);
+	con_hex2("ARC", "gfx=", a_gfx, "linux=", 0x30090);
+	if (!a_mx)
+		a_mx = 0x30010;
+	if (!a_cx)
+		a_cx = 0x30000;
+	if (!a_gfx)
+		a_gfx = 0x30090;
 	wr32(RSCC_REG(0x0004), 1u << 24);
 	wr32(RSCC_REG(0x000b), 1);
 	wr32(RSCC_REG(0x000e), 0);
@@ -322,26 +369,26 @@ static void rpmh_init(void)
 	wr32(PDC_REG(0x1574), 0);
 	wr32(PDC_REG(0x1572), 0);
 	wr32(PDC_REG(0x1575), 0x10108);
-	wr32(PDC_REG(0x1576), 0x30010);
+	wr32(PDC_REG(0x1576), a_mx);
 	wr32(PDC_REG(0x1577), 1);
 	wr32(PDC_REG(0x1575 + 4), 0x10108);
-	wr32(PDC_REG(0x1576 + 4), 0x30000);
+	wr32(PDC_REG(0x1576 + 4), a_cx);
 	wr32(PDC_REG(0x1577 + 4), 0);
 	wr32(PDC_REG(0x1575 + 8), 0x10108);
-	wr32(PDC_REG(0x1576 + 8), 0x30090);
+	wr32(PDC_REG(0x1576 + 8), a_gfx);
 	wr32(PDC_REG(0x1577 + 8), 0);
 
 	wr32(PDC_REG(0x15d7), 7);
 	wr32(PDC_REG(0x15d8), 0);
 	wr32(PDC_REG(0x15d6), 0);
 	wr32(PDC_REG(0x15d9), 0x10108);
-	wr32(PDC_REG(0x15da), 0x30010);
+	wr32(PDC_REG(0x15da), a_mx);
 	wr32(PDC_REG(0x15db), 2);
 	wr32(PDC_REG(0x15d9 + 4), 0x10108);
-	wr32(PDC_REG(0x15da + 4), 0x30000);
+	wr32(PDC_REG(0x15da + 4), a_cx);
 	wr32(PDC_REG(0x15db + 4), 2);
 	wr32(PDC_REG(0x15d9 + 8), 0x10108);
-	wr32(PDC_REG(0x15da + 8), 0x30090);
+	wr32(PDC_REG(0x15da + 8), a_gfx);
 	wr32(PDC_REG(0x15db + 8), 3);
 
 	wr32(PDC_REG(0x1148), 0);
@@ -662,6 +709,9 @@ static void gmu_boot(void)
 	wr32(GMU_REG(GMU_RSCC_REQ), 0);
 	con_hex2("RSC", rc ? "ACK TIMEOUT=" : "ack=", rd32(GMU_REG(GMU_RSCC_ACK)),
 		 rc2 ? "SEQ BUSY=" : "pdc=", rc2 ? rd32(RSCC_REG(0x0101)) : rd32(PDC_REG(0x1140)));
+	con_hex2("RSC", "status0=", rd32(RSCC_REG(0x0004)), "seq busy=", rd32(RSCC_REG(0x0101)));
+	con_hex2("RSC TCS", "0=", rd32(RSCC_REG(0x0346)), "1=", rd32(RSCC_REG(0x03ee)));
+	con_hex2("RSC TCS", "2=", rd32(RSCC_REG(0x0496)), "3=", rd32(RSCC_REG(0x053e)));
 
 	stage("fw load (itcm)");
 	uint32_t fwlen = (uint32_t)(gmu_fw_end - gmu_fw);
@@ -738,6 +788,9 @@ static void gmu_boot(void)
 
 	con_hex2("GMU LOG", "w0=", rd32(GMEM_LOG), "w1=", rd32(GMEM_LOG + 4));
 	con_hex2("CB", "fsr=", rd32(c + CB_FSR), "far=", rd32(c + CB_FAR));
+	con_hex2("SMMU G", "gfsr=", rd32(SMMU + 0x48), "gfsynr0=", rd32(SMMU + 0x50));
+	con_hex2("SMMU G", "gfsynr1=", rd32(SMMU + 0x54), "gfsynr2=", rd32(SMMU + 0x58));
+	con_hex2("HFI", "ctrl status=", rd32(GMU_REG(GMU_HFI_STATUS)), "g2h=", rd32(GMU_REG(GMU_G2H_INFO)));
 	stage("hfi start");
 	wr32(GMU_REG(GMU_HFI_INIT), 1);
 	rc = wait_bit(GMU_REG(GMU_HFI_STATUS), 1, 1, 10);

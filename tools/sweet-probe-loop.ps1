@@ -63,9 +63,14 @@ while ((Get-Date) -lt $end) {
 	Start-Sleep -Seconds 2
 }
 if (-not $ok) { throw "adb did not come up in recovery" }
-Start-Sleep -Seconds 3
-
-$dev = (& $adb shell "readlink -f /dev/block/by-name/userdata").Trim()
+# Run 3a: adb answers before ueventd has made the by-name links.
+$dev = $null
+for ($i = 0; $i -lt 30 -and -not $dev; $i++) {
+	Start-Sleep -Seconds 2
+	$r = & $adb shell "readlink -f /dev/block/by-name/userdata 2>/dev/null" 2>$null
+	if ($r -and $r.Trim() -match "^/dev/block/sd") { $dev = $r.Trim() }
+}
+if (-not $dev) { throw "userdata block device not found in recovery" }
 $bytes = [int64](& $adb shell "blockdev --getsize64 $dev").Trim()
 $blocks = [int64]($bytes / 4096)
 $skip = $blocks - $XNU_LOG_TAIL - $PLOG_BLOCKS
