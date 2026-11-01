@@ -1,11 +1,11 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -301,8 +301,45 @@
+@@ -301,10 +301,47 @@
  	default:
  		return 0;
  	}
  }
-
+ 
 +/*
 + * Policy "AMFI" (was "SWEET AMFI"): dyld asks it by name (__mac_syscall
 + * "AMFI", 0x5a) what it may do for the process it starts. Without an answer
@@ -46,11 +46,11 @@
  	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
 +	.mpo_policy_syscall = sweet_amfi_syscall,
  };
-
+ 
  /*
-@@ -362,6 +397,6 @@
+@@ -362,7 +397,7 @@
  static mac_policy_handle_t sweet_sandbox_mac_handle;
-
+ 
  static struct mac_policy_conf sweet_amfi_mac_conf = {
 -	.mpc_name = "SWEET AMFI",
 +	.mpc_name = "AMFI",                     /* the name dyld's and libamfi's __mac_syscall use */
