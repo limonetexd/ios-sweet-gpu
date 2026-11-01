@@ -1,0 +1,261 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,230 @@
++/*
++ * SWEET Adreno 618 handoff check (boot-arg sweetgpu=1).
++ *
++ * The boot shim (built with SHIM_GPUBOOT, shim/gpuprobe.c) brings the GPU up
++ * before XNU starts: GMU firmware, HFI, GX power, the GMU and GPU SMMU
++ * context banks, SQE microcode and the CP ring, all in the GPU pool, RAM
++ * that XNU never manages (tools/mkadt.py --gpupool lowers dram-size). This
++ * thread checks from XNU that the GPU survived the handoff and still runs
++ * a command (CP_MEM_WRITE into the pool), and logs it.
++ *
++ * sweetgpu_reboot=1: afterwards, wait for the persistent console log to be
++ * flushed and reset into fastboot (PMIC PON soft-reboot reason, as the
++ * shim's plog.c does), for tools/sweet-probe-loop.ps1 -Xnu.
++ *
++ * Layout shared with shim/gpuprobe.c (GMEM = SG_POOL_PA): ring at +0x310000
++ * (GPU VA 0x10010000, 32 KiB), CP_MEM_WRITE target at +0x320000 (GPU VA
++ * 0x10020000).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_init(void);
++
++#define SG_GPU_PA	0x05000000u	/* kgsl-3d0, GMU, Adreno SMMU and GPUCC */
++#define SG_GPU_SIZE	0x000a0000u
++#define SG_POOL_PA	0x1f0000000ull
++#define SG_POOL_SIZE	0x00400000u
++#define SG_RING_OFF	0x310000u
++#define SG_TARGET_OFF	0x320000u
++#define SG_GVA_TARGET	0x10020000u
++#define SG_RING_DW	(0x8000u / 4u)
++
++#define GREG(o)		(4u * (o))
++#define GPUCC_GX_GDSCR	(0x90000u + 0x100c)
++#define GPUCC_CX_GDSCR	(0x90000u + 0x106c)
++#define RBBM_STATUS	0x210
++#define CP_RB_RPTR	0x806
++#define CP_RB_WPTR	0x807
++#define CP_SQE_BASE	0x830
++#define GMU_INIT_RESULT	0x1f81c
++
++static vm_offset_t sg_gpu, sg_pool;
++static int sg_sleep_chan;
++
++static uint32_t
++sg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++sg_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++sg_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sg_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++sg_parity(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	       (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1;
++}
++
++static uint32_t sg_wptr;
++
++static void
++sg_ring(uint32_t v)
++{
++	sg_wr(sg_pool, SG_RING_OFF + 4 * sg_wptr, v);
++	sg_wptr = (sg_wptr + 1) % SG_RING_DW;
++}
++
++static void
++sg_pkt7(uint32_t op, uint32_t cnt)
++{
++	sg_ring(0x70000000u | cnt | (sg_parity(cnt) << 15) | ((op & 0x7f) << 16) | (sg_parity(op) << 23));
++}
++
++/* ---- back to fastboot (PM6150 PON soft-reboot reason, SPMI arbiter v5, EE 0) ---- */
++
++#define SP_CORE_PA	0x0c440000u
++#define SP_CHNLS_PA	0x0c600000u
++#define SP_CNFG_PA	0x0c40a000u
++#define SP_NO_APID	0xffffu
++#define PON_SOFT_RB_SPARE	0x88fu
++#define PON_PS_HOLD_RESET_CTL	0x85au
++#define PON_PS_HOLD_RESET_CTL2	0x85bu
++#define IMEM_RESTART_REASON	0x146aa65cu
++
++static uint32_t
++sg_find_apid(vm_offset_t core, vm_offset_t cnfg, uint32_t ppid)
++{
++	uint32_t n = sg_rd(core, 4) & 0x7ffu, found = SP_NO_APID;
++	for (uint32_t i = 0; i < n && i < 512; i++) {
++		uint32_t map = sg_rd(core, 0x900 + 4 * i);
++		if (map && ((map >> 8) & 0xfffu) == ppid && (sg_rd(cnfg, 0x700 + 4 * i) & 7u) == 0) {
++			found = i;
++		}
++	}
++	return found;
++}
++
++static int
++sg_spmi_write(uint32_t addr, uint8_t val)
++{
++	vm_offset_t core = ml_io_map(SP_CORE_PA, 0x2000), cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
++	if (!core || !cnfg) {
++		return -1;
++	}
++	uint32_t apid = sg_find_apid(core, cnfg, (addr >> 8) & 0xffu);
++	if (apid == SP_NO_APID) {
++		return -2;
++	}
++	vm_offset_t ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (!ch) {
++		return -3;
++	}
++	sg_wr(ch, 0x10, val);
++	sg_wr(ch, 0x00, (addr & 0xffu) << 4);
++	for (int i = 0; i < 100000; i++) {
++		uint32_t st = sg_rd(ch, 0x08);
++		if (st & 1) {
++			return (st & 0x0e) ? -4 : 0;
++		}
++	}
++	return -5;
++}
++
++static void __attribute__((noreturn))
++sg_reboot_fastboot(void)
++{
++	int rc = sg_spmi_write(PON_SOFT_RB_SPARE, 0x02 << 1);
++	vm_offset_t imem = ml_io_map(IMEM_RESTART_REASON & ~0xfffu, 0x1000);
++	if (imem) {
++		sg_wr(imem, IMEM_RESTART_REASON & 0xfffu, 0x77665500u);
++	}
++	printf("SWEET GPU: rebooting to fastboot (pon rc %d)\n", rc);
++	sg_sleep_ms(12000);	/* the console ring is flushed to UFS every 10 s (patch 0069) */
++	register uint64_t x0 __asm__("x0") = 0x84000009ull;	/* PSCI SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
++static void
++sg_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	int reboot = 0;
++	(void)PE_parse_boot_argn("sweetgpu_reboot", &reboot, sizeof(reboot));
++	sg_sleep_ms(20000);
++
++	uint32_t cx = sg_rd(sg_gpu, GPUCC_CX_GDSCR), gx = sg_rd(sg_gpu, GPUCC_GX_GDSCR);
++	printf("SWEET GPU: cx gdsc %#x gx gdsc %#x\n", cx, gx);
++	if (!(cx >> 31) || !(gx >> 31)) {
++		printf("SWEET GPU: GPU not powered (shim without SHIM_GPUBOOT?)\n");
++		goto out;
++	}
++	printf("SWEET GPU: gmu init %#x rbbm %#x sqe base %#x rptr %#x wptr %#x\n",
++	    sg_rd(sg_gpu, GREG(GMU_INIT_RESULT)), sg_rd(sg_gpu, GREG(RBBM_STATUS)),
++	    sg_rd(sg_gpu, GREG(CP_SQE_BASE)), sg_rd(sg_gpu, GREG(CP_RB_RPTR)),
++	    sg_rd(sg_gpu, GREG(CP_RB_WPTR)));
++
++	sg_wptr = sg_rd(sg_gpu, GREG(CP_RB_WPTR)) % SG_RING_DW;
++	sg_wr(sg_pool, SG_TARGET_OFF, 0x11111111u);
++	sg_pkt7(0x3d, 3);		/* CP_MEM_WRITE */
++	sg_ring(SG_GVA_TARGET);
++	sg_ring(0);
++	sg_ring(0x5ee7c0deu);
++	sg_pkt7(0x26, 0);		/* CP_WAIT_FOR_IDLE */
++	sg_wr(sg_gpu, GREG(CP_RB_WPTR), sg_wptr);
++	uint32_t got = 0;
++	for (int i = 0; i < 100; i++) {
++		got = sg_rd(sg_pool, SG_TARGET_OFF);
++		if (got == 0x5ee7c0deu) {
++			break;
++		}
++		sg_sleep_ms(1);
++	}
++	printf("SWEET GPU: CP_MEM_WRITE from XNU -> %#x rptr %#x status %#x%s\n", got,
++	    sg_rd(sg_gpu, GREG(CP_RB_RPTR)), sg_rd(sg_gpu, GREG(RBBM_STATUS)),
++	    got == 0x5ee7c0deu ? " *** GPU ALIVE UNDER XNU ***" : "");
++out:
++	if (reboot) {
++		sg_reboot_fastboot();
++	}
++}
++
++void
++sweet_gpu_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	sg_gpu = ml_io_map(SG_GPU_PA, SG_GPU_SIZE);
++	sg_pool = ml_io_map((vm_offset_t)SG_POOL_PA, SG_POOL_SIZE);
++	if (!sg_gpu || !sg_pool) {
++		printf("SWEET GPU: MMIO/pool mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(sg_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
