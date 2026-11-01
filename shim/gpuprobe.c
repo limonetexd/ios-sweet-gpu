@@ -240,6 +240,8 @@ static void map_pages(uintptr_t l3, uint32_t va, uintptr_t pa, uint32_t size)
 	}
 }
 
+static int smr_used;
+
 static int smmu_setup(void)
 {
 	int smr = -1, cb = -1;
@@ -315,6 +317,7 @@ static int smmu_setup(void)
 	wait_bit(SMMU + 0x74, 1, 0, 10);
 	con_hex2("SMMU", "smr=", rd32(SMR(smr)), "sctlr=", rd32(c + CB_SCTLR));
 	con_hex2("SMMU", "s2cr=", rd32(S2CR(smr)), "cbar=", rd32(CBAR(cb)));
+	smr_used = (rd32(SMR(smr + 1)) >> 31) ? smr + 1 : smr;
 	if (!(rd32(SMR(smr)) >> 31) && !(rd32(SMR(smr + 1)) >> 31)) {
 		con_str("SMMU", "SMR NOT TAKEN: stop before the GMU uses DDR");
 		return -1;
@@ -663,6 +666,301 @@ static int oob(int set_bit, int ack_bit)
 	return rc;
 }
 
+/* ---- stage 3: zap shader through TrustZone PAS (qcom_scm + mdt_loader) ---- */
+
+#define PAS_GPU		13
+#define ZAP_REGION	0x97715000UL	/* sweet DT: gpu_region (pil_gpu_mem), 8K */
+#define ZAP_SIZE	0x2000UL
+#define ZAP_META	(GMEM + 0xa0000)	/* metadata buffer TZ reads */
+#define SCM_PIL(cmd)	(0x42000000UL | (2u << 8) | (cmd))	/* SMC64 std call, SIP, svc PIL */
+
+extern const uint8_t zap_mdt[], zap_mdt_end[], zap_b02[], zap_b02_end[];
+extern const uint8_t sqe_fw[], sqe_fw_end[];
+
+static int64_t scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
+{
+	register uint64_t x0 __asm__("x0") = SCM_PIL(cmd);
+	register uint64_t x1 __asm__("x1") = arginfo;
+	register uint64_t x2 __asm__("x2") = a;
+	register uint64_t x3 __asm__("x3") = b;
+	register uint64_t x4 __asm__("x4") = c;
+	register uint64_t x5 __asm__("x5") = 0;
+	register uint64_t x6 __asm__("x6") = 0;
+	__asm__ volatile("smc #0"
+			 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
+			 :
+			 : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+			   "memory");
+	if (r1)
+		*r1 = x1;
+	return (int64_t)x0;
+}
+
+static void copy_in(uintptr_t dst, const uint8_t *src, uint32_t len)
+{
+	for (uint32_t o = 0; o < len; o += 4) {
+		uint32_t w = 0;
+		for (uint32_t i = 0; i < 4 && o + i < len; i++)
+			w |= (uint32_t)src[o + i] << (8 * i);
+		wr32(dst + o, w);
+	}
+}
+
+static int zap_load(void)
+{
+	uint64_t r1 = 0;
+	int64_t rc = scm(7, 1, PAS_GPU, 0, 0, &r1);		/* PAS_IS_SUPPORTED */
+	con_hex2("ZAP", "supported rc=", (uint32_t)rc, "r1=", (uint32_t)r1);
+
+	uint32_t mlen = (uint32_t)(zap_mdt_end - zap_mdt);
+	copy_in(ZAP_META, zap_mdt, mlen);
+	__asm__ volatile("dsb sy" ::: "memory");
+	stage("zap init image");
+	rc = scm(1, 2 | (2u << 6), PAS_GPU, ZAP_META, 0, &r1);	/* INIT_IMAGE */
+	con_hex2("ZAP", "init rc=", (uint32_t)rc, "r1=", (uint32_t)r1);
+	if (rc || r1)
+		return -1;
+
+	stage("zap mem setup");
+	rc = scm(2, 3, PAS_GPU, ZAP_REGION, ZAP_SIZE, &r1);	/* MEM_SETUP */
+	con_hex2("ZAP", "mem rc=", (uint32_t)rc, "r1=", (uint32_t)r1);
+	if (rc || r1)
+		return -2;
+
+	/* Relocatable: the one LOAD segment (paddr 0x5000, the lowest) at the region base. */
+	for (uint32_t o = 0; o < ZAP_SIZE; o += 4)
+		wr32(ZAP_REGION + o, 0);
+	copy_in(ZAP_REGION, zap_b02, (uint32_t)(zap_b02_end - zap_b02));
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	stage("zap auth and reset");
+	rc = scm(5, 1, PAS_GPU, 0, 0, &r1);			/* AUTH_AND_RESET */
+	con_hex2("ZAP", "auth rc=", (uint32_t)rc, "r1=", (uint32_t)r1);
+	return rc || r1 ? -3 : 0;
+}
+
+/* ---- stage 3: SQE, ringbuffer, first commands (a6xx hw_init subset, A618) ---- */
+
+#define GREG(o)		(GPU + 4UL * (o))
+#define GPU_SID		0	/* sweet DT: kgsl user context iommus <&kgsl_smmu 0>, exact */
+#define GT_L1		(GMEM + 0x200000)
+#define GT_L2		(GMEM + 0x201000)
+#define GT_L3		(GMEM + 0x202000)	/* VA 0x10000000-0x101fffff */
+#define G_SQE		(GMEM + 0x300000)
+#define G_RING		(GMEM + 0x310000)
+#define G_TARGET	(GMEM + 0x320000)
+#define GVA_SQE		0x10000000u
+#define GVA_RING	0x10010000u
+#define GVA_TARGET	0x10020000u
+#define RING_DW		(0x8000 / 4)
+
+static uint32_t wptr;
+
+static uint32_t pm4_parity(uint32_t v)
+{
+	return (0x9669 >> (0xf & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
+				   (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1;
+}
+
+static void ring(uint32_t v)
+{
+	wr32(G_RING + 4 * wptr, v);
+	wptr = (wptr + 1) % RING_DW;
+}
+
+static void pkt7(uint32_t op, uint32_t cnt)
+{
+	ring(0x70000000 | cnt | (pm4_parity(cnt) << 15) | ((op & 0x7f) << 16) | (pm4_parity(op) << 23));
+}
+
+static int flush_wait(const char *what)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(GREG(0x807), wptr);			/* CP_RB_WPTR */
+	int i;
+	for (i = 0; i < 1000; i++) {
+		if (rd32(GREG(0x806)) == wptr && !(rd32(GREG(0x210)) & (1u << 23)))
+			break;
+		delay_ms(1);
+	}
+	con_hex2(what, i < 1000 ? "idle rptr=" : "TIMEOUT rptr=", rd32(GREG(0x806)), "status=", rd32(GREG(0x210)));
+	if (i >= 1000)
+		con_hex2("  cp", "int=", rd32(GREG(0x201)), "hwfault=", rd32(GREG(0x821)));
+	return i < 1000 ? 0 : -1;
+}
+
+/* AArch64 4K pages, AP=01 (unprivileged), NC: as Linux maps GPU buffers. */
+static void map_user(uintptr_t l3, uint32_t va, uintptr_t pa, uint32_t size)
+{
+	for (uint32_t o = 0; o < size; o += 0x1000) {
+		uint32_t idx = ((va + o) >> 12) & 0x1ff;
+		wr64(l3 + 8 * idx, (pa + o) | (1u << 10) | (3u << 8) | (1u << 6) | 3u);
+	}
+}
+
+#define GVA_FB		0x20000000u
+#define FB_STRIDE_B	(FB_W * 4)
+#define BAND_Y		1500
+#define BAND_H		500
+
+/*
+ * Visible proof: map the panel framebuffer into the GPU and let the GPU paint
+ * a band (one gradient row by CP_MEM_WRITE, then CP_MEMCPY down the rows).
+ * The CPU never touches those framebuffer pixels.
+ */
+static void gpu_paint(uintptr_t c)
+{
+	for (int i = 0; i < 6; i++)	/* 12 MB as 2 MB blocks, AP=01, NC */
+		wr64(GT_L2 + 8 * (((GVA_FB >> 21) & 0x1ff) + i),
+		     (FB_BASE + 0x200000UL * i) | (1u << 10) | (3u << 8) | (1u << 6) | 1u);
+	wr32(c + 0x618, 0);		/* CB TLBIALL */
+	wr32(c + 0x7f0, 0);		/* CB TLBSYNC */
+	wait_bit(c + 0x7f4, 1, 0, 10);
+
+	uint32_t row = GVA_FB + BAND_Y * FB_STRIDE_B;
+	pkt7(0x3d, 2 + FB_W);		/* CP_MEM_WRITE one row */
+	ring(row);
+	ring(0);
+	for (uint32_t x = 0; x < FB_W; x++) {
+		uint32_t r = x * 255 / (FB_W - 1), b = 255 - r, g = (x / 60) % 2 ? 200 : 40;
+		ring(0xff000000 | (r << 16) | (g << 8) | b);
+	}
+	pkt7(0x26, 0);
+	flush_wait("PAINT1");
+	for (uint32_t y = 1; y < BAND_H; y++) {
+		pkt7(0x75, 5);		/* CP_MEMCPY dwords, src, dst */
+		ring(FB_W);
+		ring(row);
+		ring(0);
+		ring(row + y * FB_STRIDE_B);
+		ring(0);
+		if ((y % 100) == 0)
+			flush_wait("PAINT");
+	}
+	pkt7(0x26, 0);
+	flush_wait("PAINTED");
+	con_hex2("FB", "band word=", rd32(FB_BASE + (BAND_Y + BAND_H / 2) * FB_STRIDE_B + 540 * 4), 0, 0);
+}
+
+static void gpu_run(int smr, int gmu_cb)
+{
+	int cb = gmu_cb + 1;
+	stage("gpu smmu (sid 0)");
+	zero32(GT_L1, 0x3000);
+	zero32(G_SQE, 0x21000);
+	wr64(GT_L1 + 0, GT_L2 | 3);
+	wr64(GT_L2 + 8 * ((GVA_SQE >> 21) & 0x1ff), GT_L3 | 3);
+	map_user(GT_L3, GVA_SQE, G_SQE, 0x10000);
+	map_user(GT_L3, GVA_RING, G_RING, 0x8000);
+	map_user(GT_L3, GVA_TARGET, G_TARGET, 0x1000);
+	wr32(G_TARGET, 0x11111111);
+
+	uintptr_t c = SMMU_CB(cb);
+	wr32(c + CB_SCTLR, 0);
+	wr32(CBA2R(cb), 1);
+	wr32(CBAR(cb), (1u << 16) | (0xfu << 12) | (3u << 8) | (uint32_t)(cb + 1));
+	wr32(c + CB_TCR2, 2);
+	wr64(c + CB_TTBR0, GT_L1);
+	wr32(c + CB_TCR, 32 | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23));
+	wr32(c + CB_MAIR0, 0x0000ff44);
+	wr32(c + CB_FSR, 0xffffffff);
+	wr32(c + CB_SCTLR, 1 | 2 | 4 | 0x20 | 0x40);
+	wr32(SMMU + 0x68, 0);
+	wr32(SMMU + 0x70, 0);
+	wait_bit(SMMU + 0x74, 1, 0, 10);
+	wr32(S2CR(smr), (uint32_t)cb);
+	wr32(SMR(smr), (1u << 31) | GPU_SID);
+	con_hex2("GPU SMMU", "smr=", rd32(SMR(smr)), "cb=", (uint32_t)cb);
+	if (!(rd32(SMR(smr)) >> 31))
+		return;
+
+	stage("gpu hw init");
+	wr32(GREG(0x3c45), 0);			/* GBIF_HALT */
+	(void)rd32(GREG(0x3c45));
+	wr32(GREG(0x16), 0);			/* RBBM_GBIF_HALT */
+	(void)rd32(GREG(0x16));
+	wr32(GREG(0xf803), 0);			/* RBBM_SECVID_TSB_CNTL */
+	wr32(GREG(0xf800), 0);
+	wr32(GREG(0xf801), 0);
+	wr32(GREG(0xf802), 0);
+	static const uint16_t addr_mode[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05,
+					      0xa601, 0x9601, 0x0e00, 0xae01, 0xb601, 0xf810 };
+	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++)
+		wr32(GREG(addr_mode[i]), 1);
+	wr32(GREG(0x10), 3);			/* RBBM_VBIF_CLIENT_QOS_CNTL (A618: not a640 family) */
+	wr32(GREG(0x50b), 0xffffffff);		/* RBBM_PERFCTR_GPU_BUSY_MASKED */
+	uint64_t trap = 0x1fffffffff000ull;
+	wr32(GREG(0xe05), (uint32_t)(trap + 0xfc0));
+	wr32(GREG(0xe06), (uint32_t)((trap + 0xfc0) >> 32));
+	wr32(GREG(0xe09), (uint32_t)trap);
+	wr32(GREG(0xe0a), (uint32_t)(trap >> 32));
+	wr32(GREG(0xe07), (uint32_t)trap);
+	wr32(GREG(0xe08), (uint32_t)(trap >> 32));
+	wr32(GREG(0xe0b), 0x100000);		/* GMEM range 1M .. 1M + 512K - 1 */
+	wr32(GREG(0xe0c), 0);
+	wr32(GREG(0xe0d), 0x17ffff);
+	wr32(GREG(0xe0e), 0);
+	wr32(GREG(0xe18), 0x804);		/* UCHE_FILTER_CNTL */
+	wr32(GREG(0xe17), 0x4);			/* UCHE_CACHE_WAYS */
+	wr32(GREG(0x8c2), 0x010000c0);		/* CP_ROQ_THRESHOLDS_2 */
+	wr32(GREG(0x8c1), 0x8040362c);		/* CP_ROQ_THRESHOLDS_1 */
+	wr32(GREG(0x8c3), 128);			/* CP_MEM_POOL_SIZE */
+	wr32(GREG(0x98d), 1);			/* CP_AHB_CNTL */
+	wr32(GREG(0x500), 1);			/* RBBM_PERFCTR_CNTL */
+	wr32(GREG(0x1f), (1u << 30) | 0x1fffff);	/* RBBM_INTERFACE_HANG_INT_CNTL */
+	wr32(GREG(0xe19), (1u << 7) | 1);	/* UCHE_CLIENT_PF */
+
+	/* SQE microcode: the file minus its first dword. */
+	uint32_t sqe_len = (uint32_t)(sqe_fw_end - sqe_fw) - 4;
+	copy_in(G_SQE, sqe_fw + 4, sqe_len);
+	wr32(GREG(0x830), GVA_SQE);		/* CP_SQE_INSTR_BASE */
+	wr32(GREG(0x831), 0);
+	wr32(GREG(0x800), GVA_RING);		/* CP_RB_BASE */
+	wr32(GREG(0x801), 0);
+	wr32(GREG(0x802), 0x0800020c);		/* 32K ring, 32-byte blocks, no rptr update */
+	wptr = 0;
+	stage("cp start");
+	wr32(GREG(0x808), 1);			/* CP_SQE_CNTL */
+	con_hex2("CP", "started status=", rd32(GREG(0x210)), "sqe bytes=", sqe_len);
+
+	pkt7(0x48, 8);				/* CP_ME_INIT */
+	ring(0x2f);
+	ring(3);
+	ring(0x20000000);
+	for (int i = 0; i < 5; i++)
+		ring(0);
+	if (flush_wait("ME_INIT"))
+		goto out;
+
+	stage("zap shader");
+	int zr = zap_load();
+	con_hex2("ZAP", "result=", (uint32_t)zr, 0, 0);
+
+	stage("secure mode off");
+	pkt7(0x66, 1);				/* CP_SET_SECURE_MODE 0 */
+	ring(0);
+	if (flush_wait("SECURE0"))
+		goto out;
+
+	stage("cp mem write");
+	pkt7(0x3d, 3);				/* CP_MEM_WRITE */
+	ring(GVA_TARGET);
+	ring(0);
+	ring(0xcafef00d);
+	pkt7(0x26, 0);				/* CP_WAIT_FOR_IDLE */
+	flush_wait("MEMWRITE");
+	for (int i = 0; i < 100 && rd32(G_TARGET) != 0xcafef00d; i++)
+		delay_ms(1);
+	con_hex2("TARGET", "mem=", rd32(G_TARGET), 0, 0);
+	if (rd32(G_TARGET) == 0xcafef00d) {
+		con_str("GPU", "*** GPU EXECUTED OUR COMMANDS ***");
+		stage("gpu paint");
+		gpu_paint(c);
+	}
+out:
+	con_hex2("GPU CB", "fsr=", rd32(c + CB_FSR), "far=", rd32(c + CB_FAR));
+}
+
 static void gmu_boot(void)
 {
 	static uint32_t msg[256];
@@ -864,6 +1162,8 @@ static void gmu_boot(void)
 	wr32(GPU + 4 * 0x883, 0x41445245);
 	con_hex2("GPU", "rbbm=", st, "scratch=", rd32(GPU + 4 * 0x883));
 	con_str("GPU", rd32(GPU + 4 * 0x883) == 0x41445245 ? "*** GX REGISTERS ALIVE ***" : "scratch mismatch");
+	if (rd32(GPU + 4 * 0x883) == 0x41445245)
+		gpu_run(smr_used + 1, cb);
 }
 
 void gpuprobe_run(const char **stage_var)
