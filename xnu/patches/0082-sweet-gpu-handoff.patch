@@ -28,7 +28,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,252 @@
 +/*
 + * SWEET Adreno 618 handoff check (boot-arg sweetgpu=1).
 + *
@@ -62,9 +62,16 @@
 +#define SG_GPU_PA	0x05000000u	/* kgsl-3d0, GMU, Adreno SMMU and GPUCC */
 +#define SG_GPU_SIZE	0x000a0000u
 +#define SG_POOL_PA	0x1f0000000ull
-+#define SG_POOL_SIZE	0x00400000u
-+#define SG_RING_OFF	0x310000u
-+#define SG_TARGET_OFF	0x320000u
++/*
++ * Only the ring and the fence page are mapped (pool +0x310000, 0x11000
++ * bytes): XNU's room for I/O mappings is small, and larger maps of the
++ * pool panicked in kmem_alloc (patch 0083 runs 1-2). SweetAdreno.cpp uses
++ * these mappings too (sweet_gpu_regs(), sweet_gpu_shared()).
++ */
++#define SG_SHARED_PA	(SG_POOL_PA + 0x310000u)
++#define SG_SHARED_SIZE	0x00011000u
++#define SG_RING_OFF	0x0u
++#define SG_TARGET_OFF	0x10000u
 +#define SG_GVA_TARGET	0x10020000u
 +#define SG_RING_DW	(0x8000u / 4u)
 +
@@ -79,6 +86,21 @@
 +
 +static vm_offset_t sg_gpu, sg_pool;
 +static int sg_sleep_chan;
++
++vm_offset_t sweet_gpu_regs(void);
++vm_offset_t sweet_gpu_shared(void);
++
++vm_offset_t
++sweet_gpu_regs(void)
++{
++	return sg_gpu;
++}
++
++vm_offset_t
++sweet_gpu_shared(void)
++{
++	return sg_pool;
++}
 +
 +static uint32_t
 +sg_rd(vm_offset_t base, uint32_t off)
@@ -249,7 +271,7 @@
 +		return;
 +	}
 +	sg_gpu = ml_io_map(SG_GPU_PA, SG_GPU_SIZE);
-+	sg_pool = ml_io_map((vm_offset_t)SG_POOL_PA, SG_POOL_SIZE);
++	sg_pool = ml_io_map((vm_offset_t)SG_SHARED_PA, SG_SHARED_SIZE);
 +	if (!sg_gpu || !sg_pool) {
 +		printf("SWEET GPU: MMIO/pool mapping failed\n");
 +		return;

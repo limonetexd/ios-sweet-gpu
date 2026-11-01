@@ -45,7 +45,7 @@
  		sg_reboot_fastboot();
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,485 @@
 +/*
 + * SWEET: the Adreno 618 for programs to draw with, behind the hardware
 + * interface (redwood_gpu_*) that RedwoodGPU.cpp's msm DRM user client speaks
@@ -80,6 +80,8 @@
 +extern "C" {
 +vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
++vm_offset_t sweet_gpu_regs(void);       /* bsd/dev/sweet_gpu.c */
++vm_offset_t sweet_gpu_shared(void);
 +void RedwoodGPUStart(void);
 +int sweet_adreno_start(void);
 +
@@ -107,16 +109,17 @@
 +#define SMMU_CB1        (SMMU_OFF + 0x8000 + 0x1000)
 +#define POOL_PA         0x1f0000000ull
 +/*
-+ * Two small windows of the pool: one 20 MiB ml_io_map() panicked
-+ * (kmem_alloc ... failed with 3: no room for I/O mappings that size).
++ * XNU has little room for I/O mappings (20 MiB and then 4 MiB maps of the
++ * pool panicked in kmem_alloc): the GPU registers, ring and fence page come
++ * from bsd/dev/sweet_gpu.c's mappings; here only the shim's L1 table page
++ * and 512 KiB of new tables are mapped.
 + */
-+#define POOL_LOW_SIZE   0x00400000      /* shim state: L1, SQE, ring, fence page */
 +#define OFF_L1          0x200000
-+#define OFF_RING        0x310000
-+#define OFF_FENCE       0x320000
++#define SHARED_RING     0x0             /* in sweet_gpu_shared(): pool +0x310000 */
++#define SHARED_FENCE    0x10000         /* pool +0x320000 */
 +#define GVA_FENCE       0x10020000ull
 +#define OFF_TABLES      0x400000
-+#define TABLES_SIZE     0x00200000      /* 512 tables: up to 1 GiB of GPU VA mapped */
++#define TABLES_SIZE     0x00080000      /* 128 tables: up to 256 MiB of GPU VA mapped */
 +#define RB_DWORDS       (0x8000 / 4)
 +#define VA_USER_START   0x40000000ull
 +#define VA_USER_END     0x100000000ull
@@ -129,7 +132,7 @@
 +#define PTE_RO          (1ull << 7)
 +#define PTE_TABLE       3ull
 +
-+static volatile uint8_t *gpu, *pool, *tables;
++static volatile uint8_t *gpu, *shared, *l1page, *tables;
 +static bool ready;
 +static uint32_t wptr, seqno;
 +static IOLock *hw_lock;
@@ -144,7 +147,14 @@
 +static inline volatile uint64_t *
 +pool64(uint32_t off)
 +{
-+	return (volatile uint64_t *)(off >= OFF_TABLES ? tables + (off - OFF_TABLES) : pool + off);
++	/* only the L1 page and the table area are ever addressed through here */
++	return (volatile uint64_t *)(off >= OFF_TABLES ? tables + (off - OFF_TABLES) : l1page + (off - OFF_L1));
++}
++
++static inline volatile uint32_t *
++fence_word(void)
++{
++	return (volatile uint32_t *)(shared + SHARED_FENCE);
 +}
 +
 +/* ---- page tables (CB1, 4 KiB granule, walks start at level 1) ---- */
@@ -268,7 +278,7 @@
 +static void
 +emit(uint32_t v)
 +{
-+	*(volatile uint32_t *)(pool + OFF_RING + 4 * (wptr % RB_DWORDS)) = v;
++	*(volatile uint32_t *)(shared + SHARED_RING + 4 * (wptr % RB_DWORDS)) = v;
 +	wptr++;
 +}
 +
@@ -356,7 +366,7 @@
 +bool
 +redwood_gpu_done(uint32_t fence)
 +{
-+	return pool != NULL && (int32_t)(*(volatile uint32_t *)(pool + OFF_FENCE) - fence) >= 0;
++	return shared != NULL && (int32_t)(*fence_word() - fence) >= 0;
 +}
 +
 +uint32_t
@@ -417,7 +427,7 @@
 +{
 +	uint64_t ib1 = gpu_rd(0x928) | ((uint64_t)gpu_rd(0x929) << 32);
 +	IOLog("SWEET GPU: %s: fence %u done %u rptr %u wptr %u RBBM_STATUS %08x CP_HW_FAULT %08x IB1 %llx rem %u\n", why,
-+	    seqno, *(volatile uint32_t *)(pool + OFF_FENCE), gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x210),
++	    seqno, *fence_word(), gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x210),
 +	    gpu_rd(0x821), ib1, gpu_rd(0x92a));
 +	IOLog("SWEET GPU: %s: SMMU gfsr %08x CB1 FSR %08x FAR %08x%08x FSYNR0 %08x\n", why, rd(SMMU_OFF + 0x48),
 +	    rd(SMMU_CB1 + 0x58), rd(SMMU_CB1 + 0x64), rd(SMMU_CB1 + 0x60), rd(SMMU_CB1 + 0x68));
@@ -493,10 +503,11 @@
 +	if (hw_lock != NULL) {
 +		return 0;
 +	}
-+	gpu = (volatile uint8_t *)ml_io_map(GPU_PA, GPU_SIZE);
-+	pool = (volatile uint8_t *)ml_io_map((vm_offset_t)POOL_PA, POOL_LOW_SIZE);
++	gpu = (volatile uint8_t *)sweet_gpu_regs();
++	shared = (volatile uint8_t *)sweet_gpu_shared();
++	l1page = (volatile uint8_t *)ml_io_map((vm_offset_t)(POOL_PA + OFF_L1), 0x1000);
 +	tables = (volatile uint8_t *)ml_io_map((vm_offset_t)(POOL_PA + OFF_TABLES), TABLES_SIZE);
-+	if (gpu == NULL || pool == NULL || tables == NULL) {
++	if (gpu == NULL || shared == NULL || l1page == NULL || tables == NULL) {
 +		IOLog("SWEET GPU: map failed\n");
 +		return -1;
 +	}
@@ -509,7 +520,7 @@
 +	table_next = 0;
 +	va_free_count = 0;
 +	redwood_gpu_address_free(VA_USER_START, VA_USER_END - VA_USER_START);
-+	*(volatile uint32_t *)(pool + OFF_FENCE) = 0;
++	*fence_word() = 0;
 +	seqno = 0;
 +	wptr = gpu_rd(0x807) % RB_DWORDS;
 +	ready = true;
