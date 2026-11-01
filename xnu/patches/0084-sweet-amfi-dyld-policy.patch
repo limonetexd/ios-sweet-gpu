@@ -1,0 +1,59 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -301,8 +301,45 @@
+ 	default:
+ 		return 0;
+ 	}
+ }
+
++/*
++ * Policy "AMFI" (was "SWEET AMFI"): dyld asks it by name (__mac_syscall
++ * "AMFI", 0x5a) what it may do for the process it starts. Without an answer
++ * it runs restricted and ignores DYLD_* variables; allowing them lets the
++ * GPU's OpenGL ES library into backboardd (DYLD_INSERT_LIBRARIES, ios-topaz
++ * 0902). Argument: { u64 flags in, user pointer to u64 flags out }. Other
++ * libamfi calls succeed and leave the caller's output alone; the first use of
++ * each is logged.
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
++
++static int
++sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	uint64_t in_out[2] = { 0, 0 };
++	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
++	int error;
++
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
++		static uint64_t seen;
++		if (call >= 0 && call < 64 && !(seen & (1ULL << call))) {
++			seen |= 1ULL << call;
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			printf("SWEET AMFI: syscall %d from %s\n", call, name);
++		}
++		return 0;
++	}
++	error = copyin(arg, in_out, sizeof(in_out));
++	if (error == 0) {
++		error = copyout(&allow, (user_addr_t)in_out[1], sizeof(allow));
++	}
++	return error;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+
+ /*
+@@ -362,6 +397,6 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",                     /* the name dyld's and libamfi's __mac_syscall use */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };

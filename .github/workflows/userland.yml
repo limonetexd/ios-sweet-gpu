@@ -1,0 +1,31 @@
+name: userland
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/**"
+      - ".github/workflows/userland.yml"
+
+jobs:
+  gpu:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Donor sources (pinned)
+        run: |
+          git clone -q https://github.com/MakrSas/ios-topaz donor/topaz
+          git -C donor/topaz checkout -q e4772911e116ab4ab6c4ac1f38e6106fefe8b483
+          git clone -q https://github.com/oosexgang/hackios-xnu-kernel donor/hackios
+          git -C donor/hackios checkout -q a3384e031eb1e605cf37adaefc19991f04f6274b
+      - name: Tools
+        run: brew install meson ninja bison
+      - name: Build
+        run: bash userland/build-gpu.sh donor out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-userland
+          path: out
+          retention-days: 90
