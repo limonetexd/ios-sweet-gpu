@@ -28,7 +28,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,259 @@
 +/*
 + * SWEET Adreno 618 handoff check (boot-arg sweetgpu=1).
 + *
@@ -202,6 +202,13 @@
 +static void __attribute__((noreturn))
 +sg_reboot_fastboot(void)
 +{
++	/* sweetgpu_reboot=SECONDS (> 20): that long after boot, to log a whole boot */
++	int when = 0;
++	(void)PE_parse_boot_argn("sweetgpu_reboot", &when, sizeof(when));
++	if (when > 20) {
++		printf("SWEET GPU: back to fastboot in %d s\n", when - 20);
++		sg_sleep_ms((unsigned)(when - 20) * 1000);
++	}
 +	int rc = sg_spmi_write(PON_SOFT_RB_SPARE, 0x02 << 1);
 +	vm_offset_t imem = ml_io_map(IMEM_RESTART_REASON & ~0xfffu, 0x1000);
 +	if (imem) {
