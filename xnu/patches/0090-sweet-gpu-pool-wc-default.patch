@@ -1,0 +1,38 @@
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -53,6 +53,7 @@ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
+ extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);   /* SweetAdreno.cpp */
+ extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
++IOMemoryDescriptor * sweet_gpu_pool_md(uint64_t pa, uint64_t size);     /* write-combined wherever mapped */
+ 
+ extern "C" {
+ /* bsd/dev/redwood_adreno.c ("the GPU kept on"; declared in bsd/sys/redwood_input.h, which is not seen from here) */
+@@ -771,7 +772,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	uint8_t * pool_kva = NULL;
+ 	uint64_t pool_pa = size >= GPU_POOL_FROM ? sweet_gpu_pool_range(size, &pool_kva) : 0;
+ 	if (pool_pa != 0) {
+-		IOMemoryDescriptor * md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) pool_pa, size, kIODirectionInOut);
++		IOMemoryDescriptor * md = sweet_gpu_pool_md(pool_pa, size);
+ 		if (md == NULL) {
+ 			sweet_gpu_pool_range_free(pool_pa, size);
+ 		} else {
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -48,6 +48,7 @@
+ 
+ extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);   /* SweetAdreno.cpp */
+ extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
++IOMemoryDescriptor *sweet_gpu_pool_md(uint64_t pa, uint64_t size);
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -329,7 +330,7 @@ sweet_surface_use_gpu_pool(SweetSurface *s)
+ 	if (pa == 0) {
+ 		return false;
+ 	}
+-	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, round_page_64(s->allocSize), kIODirectionInOut);
++	IOMemoryDescriptor *md = sweet_gpu_pool_md(pa, round_page_64(s->allocSize));
+ 	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+ 	if (map == NULL) {
+ 		OSSafeReleaseNULL(md);
