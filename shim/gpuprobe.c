@@ -191,6 +191,52 @@ static int branch_on(uintptr_t reg)
 	return wait_bit(reg, 1u << 31, 0, 10);
 }
 
+/*
+ * gpu_cc_pll0 (Fabia), the GPU core clock's source: gx_gfx3d_clk_src parent 1
+ * is crc_div = pll0_out_even. Nobody had set it up, so after DCVS the RCG
+ * pointed at a PLL that was off and the A618 ran no faster at "430 MHz" than
+ * at XO (runs 0090r-0094e: 60-110 ms a CoreAnimation submission). Values
+ * from the downstream sdmmagpie gpucc driver (clk_fabia_pll_configure +
+ * clk_fabia_pll_enable), L/alpha for 430 MHz (22.396 x 19.2 MHz).
+ */
+#define PLL0		(GPUCC + 0x0)
+#define PLL_MODE	0x00
+#define PLL_L_VAL	0x04
+#define PLL_USER_CTL	0x0c
+#define PLL_USER_CTL_U	0x10
+#define PLL_CONFIG_CTL	0x14
+#define PLL_CONFIG_CTL_U 0x18
+#define PLL_TEST_CTL_U	0x20
+#define PLL_OPMODE	0x2c
+#define PLL_FRAC	0x38
+
+static int pll0_on(void)
+{
+	uint32_t mode = rd32(PLL0 + PLL_MODE);
+	if ((rd32(PLL0 + PLL_OPMODE) & 1) && (mode & 1)) {
+		con_hex2("PLL0", "already on mode=", mode, "l=", rd32(PLL0 + PLL_L_VAL));
+		return 0;
+	}
+	wr32(PLL0 + PLL_L_VAL, 0x16);
+	wr32(PLL0 + PLL_FRAC, 0x6555);
+	wr32(PLL0 + PLL_CONFIG_CTL, 0x20485699);
+	wr32(PLL0 + PLL_CONFIG_CTL_U, 0x00002067);
+	wr32(PLL0 + PLL_USER_CTL, 0x00000001);
+	wr32(PLL0 + PLL_USER_CTL_U, 0x00004805);
+	wr32(PLL0 + PLL_TEST_CTL_U, 0x40000000);
+	wr32(PLL0 + PLL_MODE, rd32(PLL0 + PLL_MODE) | (1u << 23));	/* UPDATE_BYPASS */
+	/* enable: output off, standby, out of reset, run, lock, outputs on */
+	wr32(PLL0 + PLL_MODE, rd32(PLL0 + PLL_MODE) & ~1u);
+	wr32(PLL0 + PLL_OPMODE, 0);
+	wr32(PLL0 + PLL_MODE, rd32(PLL0 + PLL_MODE) | (1u << 2));
+	wr32(PLL0 + PLL_OPMODE, 1);
+	int rc = wait_bit(PLL0 + PLL_MODE, 1u << 31, 1, 10);
+	wr32(PLL0 + PLL_USER_CTL, rd32(PLL0 + PLL_USER_CTL) | 7u);
+	wr32(PLL0 + PLL_MODE, rd32(PLL0 + PLL_MODE) | 1u);
+	con_hex2("PLL0", rc ? "NO LOCK mode=" : "locked mode=", rd32(PLL0 + PLL_MODE), "user=", rd32(PLL0 + PLL_USER_CTL));
+	return rc;
+}
+
 /* ---- stage 1: CX power ---- */
 
 static int cx_on(void)
@@ -224,6 +270,7 @@ static int cx_on(void)
 	branch_on(GPUCC + GPUCC_CRC_AHB);
 	branch_on(GPUCC + GPUCC_CX_SNOC_DVM);
 	con_hex2("GMUCLK", "cx_gmu=", rd32(GPUCC + GPUCC_CX_GMU), "cxo=", rd32(GPUCC + GPUCC_CXO));
+	pll0_on();
 	return 0;
 }
 
@@ -1127,13 +1174,18 @@ static void gmu_boot(void)
 		msg[i] = 0;
 	msg[1] = NGPU;
 	msg[2] = 2;
+	/*
+	 * Frequencies in kHz (Linux: gpu_freqs[i] / 1000, freqs in Hz). They were
+	 * sent in MHz: the GMU then programmed gpu_cc_pll0 for "430 kHz" (L 0,
+	 * PLL unlocked, probe 5) and the GPU crawled at every DCVS level.
+	 */
 	for (int i = 0; i < NGPU; i++) {
 		msg[3 + 2 * i] = gx[i];
-		msg[4 + 2 * i] = gpu_khz[i] / 1000;
+		msg[4 + 2 * i] = gpu_khz[i];
 	}
 	for (int i = 0; i < 2; i++) {
 		msg[3 + 32 + 2 * i] = cx[i];
-		msg[4 + 32 + 2 * i] = gmu_khz[i] / 1000;
+		msg[4 + 32 + 2 * i] = gmu_khz[i];
 	}
 	int e_perf = hfi_send(4, msg, 3 + 32 + 8, 0);
 
@@ -1189,6 +1241,8 @@ static void gmu_boot(void)
 	}
 	con_hex2("DCVS", "lvl=", (uint32_t)lvl, "khz=", lvl >= 2 ? gpu_khz[lvl] : 0);
 	con_hex2("DCVS", "gfx3d cfg was=", rcg0, "now=", rd32(GPUCC + 0x1020));
+	con_hex2("DCVS", "gfx3d cmd=", rd32(GPUCC + 0x101c), "pll0 mode=", rd32(PLL0 + PLL_MODE));
+	con_hex2("DCVS", "pll0 l=", rd32(PLL0 + PLL_L_VAL), "frac=", rd32(PLL0 + PLL_FRAC));
 
 	stage("gpu register test");
 	/* RBBM_STATUS (0x210) and CP_SCRATCH_REG0 (0x883) write/read test. */
