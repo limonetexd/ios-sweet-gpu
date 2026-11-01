@@ -74,12 +74,20 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+GPU_POOL_SIZE = 0x10000000
+
+
+def build(seed=None, qemu=False, highmem=False, gpupool=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
+    # --gpupool (phone, with --highmem): the top 256 MiB below the panic log is
+    # the Adreno pool the shim (SHIM_GPUBOOT) and bsd/dev/sweet_gpu.c share
+    # (GMU/GPU page tables, HFI, SQE, ring at 0x1f0000000); XNU must not own it.
+    if gpupool:
+        mem_size -= GPU_POOL_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -242,7 +250,8 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 gpupool='--gpupool' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

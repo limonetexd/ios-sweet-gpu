@@ -381,6 +381,16 @@ void shim_main(uint64_t dtb)
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();
+#ifdef SHIM_GPUBOOT
+	/*
+	 * Bring the Adreno 618 up before XNU (bsd/dev/sweet_gpu.c takes it over):
+	 * the ADT must come from tools/mkadt.py --gpupool so the GPU pool at
+	 * 0x1f0000000 is not XNU's RAM.
+	 */
+	stage = "gpu boot";
+	gpuprobe_run(&stage);
+	con_skip();
+#endif
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();

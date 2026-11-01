@@ -12,7 +12,10 @@ param(
 	[string]$Out = "",
 	[string]$Tools = "$PSScriptRoot\..\..\tools-win\platform-tools",
 	[string]$Recovery = "$PSScriptRoot\..\recovery\recovery.img",
-	[int]$ProbeSeconds = 150
+	[int]$ProbeSeconds = 150,
+	# -Xnu: the image boots iOS (sweetgpu_reboot=1 returns to fastboot); read
+	# the XNU console ring (last 1025 blocks, patch 0047) instead of the probe log.
+	[switch]$Xnu
 )
 $ErrorActionPreference = "Stop"
 $fastboot = Join-Path $Tools "fastboot.exe"
@@ -73,6 +76,22 @@ for ($i = 0; $i -lt 30 -and -not $dev; $i++) {
 if (-not $dev) { throw "userdata block device not found in recovery" }
 $bytes = [int64](& $adb shell "blockdev --getsize64 $dev").Trim()
 $blocks = [int64]($bytes / 4096)
+if ($Xnu) {
+	$skip = $blocks - $XNU_LOG_TAIL
+	$bin = [System.IO.Path]::GetTempFileName()
+	& cmd /c "`"$adb`" exec-out dd if=$dev bs=4096 skip=$skip count=$XNU_LOG_TAIL 2>NUL > `"$bin`""
+	& $adb reboot bootloader | Out-Null
+	Log "XNU ring read ($((Get-Item $bin).Length) bytes), sent adb reboot bootloader"
+	$wbin = (& wsl -d Ubuntu -- wslpath -a ($bin -replace '\\', '/')).Trim()
+	$txt = if ($Out) { $Out } else { [System.IO.Path]::GetTempFileName() }
+	$wtxt = (& wsl -d Ubuntu -- wslpath -a ((Resolve-Path -LiteralPath (Split-Path $txt -Parent)).Path -replace '\\', '/')).Trim() + "/" + (Split-Path $txt -Leaf)
+	$wtool = (& wsl -d Ubuntu -- wslpath -a ("$PSScriptRoot\sweet-log.py" -replace '\\', '/')).Trim()
+	& wsl -d Ubuntu -- python3 -I $wtool $wbin $wtxt
+	Remove-Item $bin
+	Select-String -Path $txt -Pattern "SWEET GPU" | ForEach-Object { $_.Line }
+	if (-not (Wait-Fastboot 90)) { Log "warning: phone not back in fastboot yet" }
+	exit 0
+}
 $skip = $blocks - $XNU_LOG_TAIL - $PLOG_BLOCKS
 Log "userdata $dev, $blocks blocks, scratch at block $skip"
 $tmp = [System.IO.Path]::GetTempFileName()

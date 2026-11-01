@@ -954,8 +954,10 @@ static void gpu_run(int smr, int gmu_cb)
 	con_hex2("TARGET", "mem=", rd32(G_TARGET), 0, 0);
 	if (rd32(G_TARGET) == 0xcafef00d) {
 		con_str("GPU", "*** GPU EXECUTED OUR COMMANDS ***");
+#ifndef SHIM_GPUBOOT	/* booting XNU next: leave the ring clean for sweet_gpu.c */
 		stage("gpu paint");
 		gpu_paint(c);
+#endif
 	}
 out:
 	con_hex2("GPU CB", "fsr=", rd32(c + CB_FSR), "far=", rd32(c + CB_FAR));
