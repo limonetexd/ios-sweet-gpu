@@ -37,10 +37,12 @@ rm -rf "$INC/IOKit"
 cp -R "$MACSDK/System/Library/Frameworks/IOKit.framework/Headers" "$INC/IOKit"
 CC=("$CLANG" -target arm64-apple-ios16.0 -isysroot "$SDK" -O1 -I"$INC" -Wno-deprecated-declarations)
 
-python3 "$H/mkeagl.py" "$H/src/eagl_slots.txt" "$M/gl.xml" "$M/exported-gl.txt" "$T/gpu/eagl.c" > "$INC/eagl_gen.h"
+EAGL=$INC/eagl.c         # topaz's eagl.c with sweet's changes (userland/eagl-sweet.py)
+python3 "$(dirname "$0")/eagl-sweet.py" "$T/gpu/eagl.c" "$EAGL"
+python3 "$H/mkeagl.py" "$H/src/eagl_slots.txt" "$M/gl.xml" "$M/exported-gl.txt" "$EAGL" > "$INC/eagl_gen.h"
 "${CC[@]}" -dynamiclib -install_name /topaz/lib/libtopaz-gl.dylib -I"$T/gpu" \
 	-framework CoreFoundation -framework IOKit -framework IOSurface -lobjc "$M/libOSMesa.8.dylib" \
-	-o "$OUT/libtopaz-gl.dylib" "$T/gpu/eagl.c" "$T/gpu/gl_osmesa.c"
+	-o "$OUT/libtopaz-gl.dylib" "$EAGL" "$T/gpu/gl_osmesa.c"
 "${CC[@]}" -dynamiclib -install_name /topaz/lib/libtopaz-inject.dylib \
 	-framework CoreFoundation -framework IOKit -lobjc -o "$OUT/libtopaz-inject.dylib" "$T/gpu/topaz_inject.c"
 "${CC[@]}" -o "$OUT/backboardd" "$T/gpu/bbd_wrap.c"
