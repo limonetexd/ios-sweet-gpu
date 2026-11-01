@@ -45,7 +45,7 @@
  		sg_reboot_fastboot();
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,474 @@
 +/*
 + * SWEET: the Adreno 618 for programs to draw with, behind the hardware
 + * interface (redwood_gpu_*) that RedwoodGPU.cpp's msm DRM user client speaks
@@ -106,13 +106,17 @@
 +#define SMMU_OFF        0x40000
 +#define SMMU_CB1        (SMMU_OFF + 0x8000 + 0x1000)
 +#define POOL_PA         0x1f0000000ull
-+#define POOL_SIZE       0x01400000      /* shim state + 16 MiB of page tables */
++/*
++ * Two small windows of the pool: one 20 MiB ml_io_map() panicked
++ * (kmem_alloc ... failed with 3: no room for I/O mappings that size).
++ */
++#define POOL_LOW_SIZE   0x00400000      /* shim state: L1, SQE, ring, fence page */
 +#define OFF_L1          0x200000
 +#define OFF_RING        0x310000
 +#define OFF_FENCE       0x320000
 +#define GVA_FENCE       0x10020000ull
 +#define OFF_TABLES      0x400000
-+#define TABLES_SIZE     0x1000000
++#define TABLES_SIZE     0x00200000      /* 512 tables: up to 1 GiB of GPU VA mapped */
 +#define RB_DWORDS       (0x8000 / 4)
 +#define VA_USER_START   0x40000000ull
 +#define VA_USER_END     0x100000000ull
@@ -125,7 +129,7 @@
 +#define PTE_RO          (1ull << 7)
 +#define PTE_TABLE       3ull
 +
-+static volatile uint8_t *gpu, *pool;
++static volatile uint8_t *gpu, *pool, *tables;
 +static bool ready;
 +static uint32_t wptr, seqno;
 +static IOLock *hw_lock;
@@ -137,7 +141,11 @@
 +static inline void wr(uint32_t o, uint32_t v) { __asm__ volatile ("dmb oshst" ::: "memory"); *(volatile uint32_t *)(gpu + o) = v; }
 +static inline uint32_t gpu_rd(uint32_t reg) { return rd(4 * reg); }
 +static inline void gpu_wr(uint32_t reg, uint32_t v) { wr(4 * reg, v); }
-+static inline volatile uint64_t *pool64(uint32_t off) { return (volatile uint64_t *)(pool + off); }
++static inline volatile uint64_t *
++pool64(uint32_t off)
++{
++	return (volatile uint64_t *)(off >= OFF_TABLES ? tables + (off - OFF_TABLES) : pool + off);
++}
 +
 +/* ---- page tables (CB1, 4 KiB granule, walks start at level 1) ---- */
 +
@@ -486,8 +494,9 @@
 +		return 0;
 +	}
 +	gpu = (volatile uint8_t *)ml_io_map(GPU_PA, GPU_SIZE);
-+	pool = (volatile uint8_t *)ml_io_map((vm_offset_t)POOL_PA, POOL_SIZE);
-+	if (gpu == NULL || pool == NULL) {
++	pool = (volatile uint8_t *)ml_io_map((vm_offset_t)POOL_PA, POOL_LOW_SIZE);
++	tables = (volatile uint8_t *)ml_io_map((vm_offset_t)(POOL_PA + OFF_TABLES), TABLES_SIZE);
++	if (gpu == NULL || pool == NULL || tables == NULL) {
 +		IOLog("SWEET GPU: map failed\n");
 +		return -1;
 +	}
