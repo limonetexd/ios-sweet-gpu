@@ -45,7 +45,7 @@
  		sg_reboot_fastboot();
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,667 @@
 +/*
 + * SWEET: the Adreno 618 for programs to draw with, behind the hardware
 + * interface (redwood_gpu_*) that RedwoodGPU.cpp's msm DRM user client speaks
@@ -496,10 +496,53 @@
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
++/*
++ * How long submissions take, from the ring write to the first look that finds them done
++ * (looks are 200 us apart while somebody waits), for RedwoodGPU's statistics; and the
++ * GPU's state, logged, when one is not done after 100 ms.
++ */
++#define TIMED           64
++static uint64_t submitted_at[TIMED];
++static uint32_t done_seen, slow_told, slow_logged;
++static uint64_t worked_us, worked_n;
++static uint32_t worked_by[7];
++
++static void
++note_done(uint32_t now_done)
++{
++	uint64_t now = mach_absolute_time();
++	while ((int32_t)(now_done - done_seen) > 0) {
++		uint32_t f = ++done_seen;
++		uint64_t ns, us;
++		absolutetime_to_nanoseconds(now - submitted_at[f % TIMED], &ns);
++		us = ns / 1000;
++		worked_us += us;
++		worked_n++;
++		worked_by[us < 100 ? 0 : us < 250 ? 1 : us < 500 ? 2 : us < 1000 ? 3 : us < 2000 ? 4 : us < 4000 ? 5 : 6]++;
++	}
++}
++
 +bool
 +redwood_gpu_done(uint32_t fence)
 +{
-+	return shared != NULL && (int32_t)(*fence_word() - fence) >= 0;
++	if (shared == NULL) {
++		return false;
++	}
++	uint32_t now_done = *fence_word();
++	if ((int32_t)(now_done - fence) >= 0) {
++		note_done(now_done);
++		return true;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - submitted_at[fence % TIMED], &ns);
++	if (ns > 100 * NSEC_PER_MSEC && slow_told != fence && slow_logged < 40) {
++		slow_told = fence;
++		slow_logged++;
++		IOLog("SweetAdreno: submission %u not done after %llu ms: fence %u, rptr %#x wptr %#x, rbbm %#x, "
++		    "gx gdsc %#x, gfx3d cfg %#x, rpmh %#x\n", fence, ns / NSEC_PER_MSEC, now_done, gpu_rd(0x806), gpu_rd(0x807),
++		    gpu_rd(0x210), rd(0x90000 + 0x100c), rd(0x90000 + 0x1020), rd(4 * 0x1f8ec));
++	}
++	return false;
 +}
 +
 +uint32_t
@@ -511,9 +554,11 @@
 +void
 +redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 +{
-+	*microseconds = 0;
-+	*submissions = (uint32_t)submit_count;
-+	bzero(by, 7 * sizeof(uint32_t));
++	*microseconds = worked_n ? worked_us / worked_n : 0;
++	*submissions = (uint32_t)worked_n;
++	memcpy(by, worked_by, sizeof(worked_by));
++	worked_us = worked_n = 0;
++	bzero(worked_by, sizeof(worked_by));
 +}
 +
 +/* IBs, then CACHE_FLUSH_TS writing the submission's number into the fence page. 0: ring full. */
@@ -543,6 +588,7 @@
 +		seqno = 1;
 +	}
 +	uint32_t fence = seqno;
++	submitted_at[fence % TIMED] = mach_absolute_time();
 +	emit(pkt7(CP_EVENT_WRITE, 4));
 +	emit(CACHE_FLUSH_TS);
 +	emit((uint32_t)GVA_FENCE);
