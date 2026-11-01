@@ -450,6 +450,112 @@ static int cmddb_aux(const char *id, uintptr_t *aux, uint32_t *len)
 	return -1;
 }
 
+/* cmd-db resource address (e.g. a BCM such as "MC0"), 0 if absent. */
+static uint32_t cmddb_addr(const char *id)
+{
+	uintptr_t db = rd32(CMD_DB_PTR);
+	if (rd32(db + 4) != 0x0c0330db)
+		return 0;
+	uintptr_t data = db + 4 + 4 + 8 * 16 + 4 + 4;
+	for (int r = 0; r < 8; r++) {
+		uintptr_t rh = db + 8 + 16 * r;
+		uint32_t w0 = rd32(rh), w1 = rd32(rh + 4);
+		uint32_t hoff = w0 >> 16, cnt = w1 >> 16;
+		for (uint32_t e = 0; e < cnt; e++) {
+			uintptr_t ent = data + hoff + 24 * e;
+			int match = 1;
+			for (int i = 0; i < 8; i++) {
+				char c = (char)(rd32(ent + (i & ~3)) >> (8 * (i & 3)));
+				if (c != id[i]) {
+					match = 0;
+					break;
+				}
+				if (!id[i])
+					break;
+			}
+			if (match)
+				return rd32(ent + 16);
+		}
+	}
+	return 0;
+}
+
+/*
+ * One ACTIVE (AMC) request on the apps RSC, DRV2, after the kernel's
+ * sweet_rpmh.c (patch 0062): TCS bank at 0x18220d00, stride 0x2a0, command
+ * stride 0x14. Returns 0 when every command reports issued + completed.
+ */
+#define RH_TCS		0x18220d00UL
+#define RH_STRIDE	0x2a0u
+#define RH_CSTRIDE	0x14u
+
+static int rpmh_send(const uint32_t *addr, const uint32_t *data, unsigned n)
+{
+	int t = -1;
+	for (unsigned i = 0; i < 2 && t < 0; i++) {
+		uintptr_t b = RH_TCS + i * RH_STRIDE;
+		if (rd32(b + 0x18) && rd32(b + 0x14) == 0 && rd32(b + 0x1c) == 0)
+			t = (int)i;
+	}
+	if (t < 0)
+		return -1;
+	uintptr_t b = RH_TCS + (unsigned)t * RH_STRIDE;
+	uint32_t en = rd32(RH_TCS + 0x00);
+	wr32(RH_TCS + 0x00, en & ~(1u << t));
+	for (unsigned c = 0; c < n; c++) {
+		uintptr_t cmd = b + c * RH_CSTRIDE;
+		wr32(cmd + 0x30, 8 | (1u << 8) | (1u << 16));	/* write, response, len 8 */
+		wr32(cmd + 0x34, addr[c]);
+		wr32(cmd + 0x38, data[c]);
+	}
+	uint32_t mask = (1u << n) - 1;
+	wr32(b + 0x10, mask);			/* wait for completion */
+	wr32(b + 0x1c, mask);			/* enable commands */
+	wr32(b + 0x14, 0);
+	wr32(b + 0x14, 1u << 16);		/* AMC */
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(b + 0x14, (1u << 16) | (1u << 24));	/* trigger */
+	int done = 0;
+	for (int i = 0; i < 100 && !done; i++) {
+		done = rd32(b + 0x18) != 0;
+		for (unsigned c = 0; c < n && done; c++)
+			done = (rd32(b + 0x3c + c * RH_CSTRIDE) & 0x10100) == 0x10100;
+		if (!done)
+			delay_ms(1);
+	}
+	wr32(b + 0x14, 1u << 16);
+	wr32(b + 0x14, 0);
+	wr32(b + 0x1c, 0);
+	wr32(b + 0x10, 0);
+	wr32(RH_TCS + 0x08, 1u << t);
+	wr32(RH_TCS + 0x00, en);
+	return done ? t : -2;
+}
+
+/*
+ * GPU -> DDR bandwidth (what Linux's dev_pm_opp_set_opp does before the GMU
+ * boots). Run 2e: the system reset as soon as the GMU first read DDR (HFI
+ * init) and gcc gpu_memnoc_gfx stays halted. Votes are the Adreno 619's
+ * lowest non-zero level (a619_build_bw_table): MC0 0x30c, SH0 0xdb, ACV 0x8.
+ */
+static int ddr_vote(void)
+{
+	static const uint32_t y[3] = { 0x30c, 0xdb, 0x8 };
+	uint32_t addr[3], data[3];
+	addr[0] = cmddb_addr("MC0");	/* no pointer table: no absolute relocations */
+	addr[1] = cmddb_addr("SH0");
+	addr[2] = cmddb_addr("ACV");
+	for (int i = 0; i < 3; i++)
+		data[i] = (1u << 30) | (1u << 29) | y[i];	/* commit, valid, vote_y */
+	con_hex2("BCM", "mc0=", addr[0], "sh0=", addr[1]);
+	if (!addr[0] || !addr[1] || !addr[2])
+		return -1;
+	int rc = rpmh_send(addr, data, 3);
+	con_hex2("BCM", "acv=", addr[2], "vote tcs=", (uint32_t)rc);
+	con_hex2("BCM", "memnoc=", rd32(GCC + GCC_GPU_MEMNOC_GFX), "dvm=", rd32(GCC + GCC_GPU_SNOC_DVM_GFX));
+	return rc < 0 ? -1 : 0;
+}
+
 static uint32_t aux16(uintptr_t aux, uint32_t i)
 {
 	return (rd32(aux + 2 * (i & ~1u)) >> (16 * (i & 1))) & 0xffff;
@@ -532,6 +638,10 @@ static void gmu_boot(void)
 	con_hex2("VOTES", "gx2=", rv ? (uint32_t)rv : gx[2], "cx1=", rv ? 0 : cx[1]);
 	con_hex2("CHECK", "cx gdsc=", rd32(GPUCC + GPUCC_CX_GDSCR), "smmu cr0=", rd32(SMMU));
 	if (rv)
+		return;
+
+	stage("ddr bandwidth vote (rpmh bcm)");
+	if (ddr_vote())
 		return;
 
 	stage("rsc/pdc init");
@@ -620,7 +730,10 @@ static void gmu_boot(void)
 	con_hex2("SPTPRAC", "status=", rd32(GMU_REG(GMU_SPTPRAC_STATUS)), "gx gdsc=",
 		 rd32(GPUCC + GPUCC_GX_GDSCR));
 
+	con_hex2("GMU LOG", "w0=", rd32(GMEM_LOG), "w1=", rd32(GMEM_LOG + 4));
+	con_hex2("CB", "fsr=", rd32(c + CB_FSR), "far=", rd32(c + CB_FAR));
 	stage("hfi start");
+	delay_ms(2000);		/* for the camera, in case the next step resets */
 	wr32(GMU_REG(GMU_HFI_INIT), 1);
 	rc = wait_bit(GMU_REG(GMU_HFI_STATUS), 1, 1, 10);
 	con_hex2("HFI", rc ? "INIT TIMEOUT=" : "status=", rd32(GMU_REG(GMU_HFI_STATUS)), 0, 0);
