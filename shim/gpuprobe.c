@@ -1254,9 +1254,53 @@ static void gmu_boot(void)
 		gpu_run(smr_used + 1, cb);
 }
 
+/*
+ * CPU clocks (qcom-cpufreq-hw v1 / OSM, sm7150 DT: freq-domain0 0x18323000 =
+ * silver, freq-domain1 0x18325800 = gold). XNU has no cpufreq: the cores
+ * stay at whatever perf state ABL left. LUT rows 32 bytes from +0x110:
+ * src (bits 31:30), core count (18:16), L value (7:0); +0x920 perf state.
+ */
+#define CPUFREQ0	0x18323000UL
+#define CPUFREQ1	0x18325800UL
+
+static void cpufreq_dump(void)
+{
+	static const uintptr_t dom[2] = { CPUFREQ0, CPUFREQ1 };
+	for (int d = 0; d < 2; d++) {
+		uintptr_t b = dom[d];
+		uint32_t last = 0;
+		con_hex2("CPUFREQ", "enable=", rd32(b + 0x0), "perf state=", rd32(b + 0x920));
+		for (int i = 0; i < 40; i++) {
+			uint32_t v = rd32(b + 0x110 + 32 * i);
+			uint32_t khz = ((v >> 30) & 3) ? (v & 0xff) * 19200 : 300000;
+			if (i > 0 && khz == last)
+				break;
+			con_hex2("  lut", "idx=", (uint32_t)i, "khz=", khz);
+			last = khz;
+		}
+	}
+}
+
+/*
+ * Probe 6: ABL leaves the silver cores at perf state 6 (1497.6 MHz, max 9 =
+ * 1804.8) and the gold cores (the two A76s backboardd's frames mostly end on)
+ * at perf state 0: 300 MHz of 2304. Ask the OSM for gold 1939.2 MHz (state
+ * 10) and silver 1708.8 MHz (state 8); the OSM sets the voltage, and the
+ * SoC's own limits-management hardware still throttles when hot.
+ */
+static void cpu_boost(void)
+{
+	wr32(CPUFREQ0 + 0x920, 8);
+	wr32(CPUFREQ1 + 0x920, 10);
+	delay_ms(2);
+	con_hex2("CPUFREQ", "silver state=", rd32(CPUFREQ0 + 0x920), "gold state=", rd32(CPUFREQ1 + 0x920));
+}
+
 void gpuprobe_run(const char **stage_var)
 {
 	stage_p = stage_var;
+	cpufreq_dump();
+	cpu_boost();
 	con_str("GPUPROBE", "adreno 618 stage 2 (gmu boot)");
 	if (cx_on())
 		return;
