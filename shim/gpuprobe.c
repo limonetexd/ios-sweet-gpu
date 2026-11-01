@@ -708,11 +708,17 @@ static int arc_votes(uint32_t *votes, const uint32_t *lvl, int n, const char *pr
 
 #define LVL_SVS_L1	192
 #define LVL_NOM		256
+#define LVL_NOM_L1	320
+#define LVL_TURBO	384
 
-/* sweet's lower GPU OPPs (180 LOW_SVS ... 430 MHz NOM), "off" first, like Linux. */
-#define NGPU	5
-static const uint32_t gpu_khz[NGPU] = { 0, 180000, 267000, 355000, 430000 };
-static const uint32_t gpu_lvl[NGPU] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_NOM };
+/*
+ * sweet's GPU OPPs up to 650 MHz (bin 0 goes to 825), "off" first, like Linux.
+ * Corners one step on the safe side. CoreAnimation's passes over 1125x2436
+ * targets are bandwidth- and clock-bound (7-12 ms a submission at 430 MHz).
+ */
+#define NGPU	7
+static const uint32_t gpu_khz[NGPU] = { 0, 180000, 267000, 355000, 430000, 565000, 650000 };
+static const uint32_t gpu_lvl[NGPU] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_NOM, LVL_NOM_L1, LVL_TURBO };
 static const uint32_t gmu_khz[2] = { 0, 200000 };
 static const uint32_t gmu_lvl[2] = { 0, LVL_MIN_SVS };
 
