@@ -17,6 +17,24 @@ xnu 0082 logs gfx3d cfg + DCVS regs; CI 41332643524 -> image `shim/out/shim-boot
 Next: run the loop with 0089r, check "SWEET GPU: gfx3d cfg" and frame times; then cut the 11 MB
 IOSurface->texture refill per frame (display surface "copied into its memory by the GPU").
 
+**Later the same evening (runs 0089r-0094e, logs/xnu-*.txt):**
+- DCVS works with the right registers (0x1cbfc-0x1cbff; commit 4147a30): `gfx3d cfg 0x101`, perf 4
+  (430 MHz), return 0. sweet_gpu.c now starts RedwoodGPU 1 s after boot with sweetgpu>=2 (with the old
+  20 s wait backboardd gave up looking for it, run 0089r: no GL at all).
+- xnu 0088-0090: GPU pool ranges (SweetAdreno.cpp, pool +16 MiB, 15 x 16 MiB slots, 64 KiB units,
+  write-combined). backboardd's screen surfaces (sweet_fbpool=0 turns off) and Mesa buffers >= 256 KiB
+  come from it and are skipped by the submit-time dc civac (45 ms -> <1 ms a submission). Pool
+  descriptors must carry kIOWriteCombineCache themselves (0090): a physical descriptor's default is the
+  pmap's, Device memory for RAM XNU does not manage, and Mesa's unaligned q stores were SIGBUS (0092b).
+- eagl glblit=0 (draw into the surface) + pool surfaces: frames stop after ~8 (backboardd idle, no
+  swaps; 0093c). glblit=1 + pool surfaces: the CPU re-reads the WC surface every frame, ~7 s a frame
+  (0093r). Best so far: **sweet_fbpool=0, glblit default** (0093d/0094d): no freeze, ~0.5-0.7 s a frame.
+- Instrumented (commit 2474940): each submission takes 60-110 ms on the GPU, ring consumed
+  (rptr == wptr), RBBM_STATUS busy (0xef0dd5). Not the clock (same at 19.2 MHz). A much higher RPMh BCM
+  DDR vote in the shim (MC0 0x4000, SH0 0x2000; run 0094e) changed nothing measurable (not verified
+  that the vote took). Open: why the A618 is this slow (GPU hw_init subset in shim/gpuprobe.c vs Linux
+  a6xx_hw_init: UCHE/GBIF/QoS/HWCG; memory attributes of GPU PTEs; GMEM vs sysmem in Mesa).
+
 **The Adreno 618 runs our command streams from the shim** (`SHIM_CFLAGS=-DSHIM_GPUPROBE shim/build.sh`,
 `shim/gpuprobe.c`, probe 4a, commit e38e668): CX GDSC + GPUCC clocks, RPMh BCM DDR vote (MC0/SH0/ACV,
 A619 level-1 values; turns gcc gpu_memnoc_gfx on), Adreno SMMU CB0 for the GMU, PDC/RSC from cmd-db

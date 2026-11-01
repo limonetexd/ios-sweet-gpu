@@ -595,12 +595,16 @@ static int rpmh_send(const uint32_t *addr, const uint32_t *data, unsigned n)
 /*
  * GPU -> DDR bandwidth (what Linux's dev_pm_opp_set_opp does before the GMU
  * boots). Run 2e: the system reset as soon as the GMU first read DDR (HFI
- * init) and gcc gpu_memnoc_gfx stays halted. Votes are the Adreno 619's
- * lowest non-zero level (a619_build_bw_table): MC0 0x30c, SH0 0xdb, ACV 0x8.
+ * init) and gcc gpu_memnoc_gfx stays halted. Run 2e used the Adreno 619's
+ * lowest non-zero level (a619_build_bw_table: MC0 0x30c, SH0 0xdb, ACV 0x8);
+ * with it a CoreAnimation submission took 60-80 ms at 430 MHz (run 0094d,
+ * RBBM busy, ring consumed): the GPU starved for DDR bandwidth. Linux votes
+ * per OPP through the interconnect; here one high vote (the BCM takes the
+ * highest level it has for anything above it), ACV unchanged.
  */
 static int ddr_vote(void)
 {
-	static const uint32_t y[3] = { 0x30c, 0xdb, 0x8 };
+	static const uint32_t y[3] = { 0x4000, 0x2000, 0x8 };
 	uint32_t addr[3], data[3];
 	addr[0] = cmddb_addr("MC0");	/* no pointer table: no absolute relocations */
 	addr[1] = cmddb_addr("SH0");
