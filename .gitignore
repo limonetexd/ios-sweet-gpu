@@ -10,3 +10,7 @@ xnu/out-*/
 __pycache__/
 research_notes/
 reports/
+# run logs and local GPU userland builds (device console output / binaries)
+logs/
+userland/out/
+userland/out2/

@@ -40,12 +40,16 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
 0xe00002bd, so the GPU barely draws after that. Plan + 4 research reports: `reports/plan-mejoras-2026-11-02.md`
 (not in git). Next: phase 1 kernel build (zombie fix, non-contiguous gemNew, powergate_latency, sailfish 0180).
 
-**LATEST 2026-11-02 (read this first): run 0099e = ~21 ms a frame (was ~400 ms).**
-- Kernel 0099 (CI 41365060398, image `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
+**LATEST 2026-11-02 (read this first): 0096d on screen = ~25 fps, "super good"; occasional freezes.**
+- **User report (2026-11-02 afternoon):** 0096d (kernel 0096) runs at ~25 fps and feels "super good";
+  used it for a while. Sometimes it freezes and needs a reboot. 0096e probe launched to capture one.
+- Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
+  `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
   `RedwoodWaitsForGPU`, presents a swap only when the GPU is done with its surfaces; publishes
   TimingElements/ColorElements + selector 79 block 0x40 at 60 Hz) and shim `ddr_vote` MC0 0x3fff
-  (BCM VOTE_Y is 14 bits; 0x4000 voted peak 0). Not yet seen by the user on screen: check smoothness.
+  (BCM VOTE_Y is 14 bits; 0x4000 voted peak 0). The user later saw 0099e and it was very laggy
+  (surface leak, fixed by 0096).
 - Also in: CPU gold 1939 / silver 1709 MHz through OSM, `cpus=8`, GPU OPPs to 650 MHz, touch moves
   limited to 60/s (0093), `sweet_fbpool` off by default (0094), eagl GPU blit load (userland, root
   `ipsw/ios16-root-gpu2.simg` flashed 2026-11-01; first boots after a flash take 15-30 min of
