@@ -35,6 +35,32 @@ IOSurface->texture refill per frame (display surface "copied into its memory by 
   that the vote took). Open: why the A618 is this slow (GPU hw_init subset in shim/gpuprobe.c vs Linux
   a6xx_hw_init: UCHE/GBIF/QoS/HWCG; memory attributes of GPU PTEs; GMEM vs sysmem in Mesa).
 
+**LATEST 2026-11-02 (read this first): run 0099e = ~21 ms a frame (was ~400 ms).**
+- Kernel 0099 (CI 41365060398, image `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
+  frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
+  `RedwoodWaitsForGPU`, presents a swap only when the GPU is done with its surfaces; publishes
+  TimingElements/ColorElements + selector 79 block 0x40 at 60 Hz) and shim `ddr_vote` MC0 0x3fff
+  (BCM VOTE_Y is 14 bits; 0x4000 voted peak 0). Not yet seen by the user on screen: check smoothness.
+- Also in: CPU gold 1939 / silver 1709 MHz through OSM, `cpus=8`, GPU OPPs to 650 MHz, touch moves
+  limited to 60/s (0093), `sweet_fbpool` off by default (0094), eagl GPU blit load (userland, root
+  `ipsw/ios16-root-gpu2.simg` flashed 2026-11-01; first boots after a flash take 15-30 min of
+  datamigrator: do not reboot early, use `sweetgpu_reboot=1820`).
+- Unattended loop: `tools/sweet-probe-loop.ps1 -Image shim\out\IMG.img -Out logs\xnu-TAG.txt -ProbeSeconds N -Xnu`
+  (phone in fastboot; "Sending" hangs need Power+Vol-). Scratch scripts (b86.sh build image from CI run,
+  b90c.sh tag/args/kernel/reboot/cpus) are in the session scratchpad, not in git; image recipe =
+  `tools/mkpayload.py` + `SHIM_CFLAGS="-DSHIM_GPUPROBE -DSHIM_GPUBOOT" shim/build.sh` (see bios.sh idea in git history/NOTES).
+- Manual boot without the tool: `tools-win\platform-tools\fastboot.exe boot shim\out\shim-boot-0099e.img`
+  (it reboots to fastboot by itself after `sweetgpu_reboot` s; build a new image with a big value or
+  without the arg for no reboot).
+- Next (report in `reports/Rendimiento GPU iOS en Adreno.md`, not in git): (1) align IOSurface
+  BytesPerRow to 64 so Mesa shares instead of copies (sailfish 0153/0162), log why surface_shared()
+  refuses (HackiOS eagl.c L634); (2) presenter thread + fence at SwapEnd (topaz 0945); (3) MDP direct
+  scanout replaces the CPU copy at sweetfb_hz=30 (topaz 0092/0924/0933; read SM7150 SSPP regs first);
+  (4) single glFlush per frame; (5) vsync period/INTF_1 lock (topaz 0941/0948). glblit=0 and
+  sweet_fbpool=1 still freeze CoreAnimation after ~7 frames.
+- Wallpaper missing: PosterBoard finds no provider (LaunchServices has no app extensions on this root);
+  separate from the GPU. Respring seen sometimes: not investigated.
+
 **Night 2026-11-01 (runs 0094f-0097t, probes 5-6):**
 - **Root cause of the slow A618: the HFI perf table went in MHz, the GMU wants kHz** (Linux
   gpu_freqs/1000). The GMU then set gpu_cc_pll0 L=0 (unlocked). Fixed in commit 0122a92 (also sets up
