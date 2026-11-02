@@ -1,0 +1,92 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 342acdd..a47e638 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -656,3 +656,4 @@ bsd/dev/redwood_apple80211.c	standard
+ bsd/dev/flame_sta.c		standard
+ bsd/dev/flame_wlan.c		standard
+ bsd/dev/sweet_files.c		standard
++bsd/dev/sweet_super_compat.c	standard
+diff --git a/bsd/dev/sweet_super_compat.c b/bsd/dev/sweet_super_compat.c
+new file mode 100644
+index 0000000..e703798
+--- /dev/null
++++ b/bsd/dev/sweet_super_compat.c
+@@ -0,0 +1,37 @@
++/*
++ * Compatibility shims for the 0104 super build.
++ *
++ * The branch's sweet_ufs.c (Wi-Fi/PMEM/battery port) calls its Bluetooth,
++ * haptic and NativeAdreno hooks. Our fast 0101/0102 tree keeps the topaz GPU
++ * and does not build those drivers, so provide no-op entry points instead of
++ * pulling the branch GPU stack back in. sweet_gpu_probe() is forwarded to our
++ * own sweet_gpu_init(), which brings up the fast Redwood/topaz path.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++
++void sweet_gpu_init(void);
++
++void
++sweet_gpu_probe(void)
++{
++	sweet_gpu_init();
++}
++
++void
++sweet_bt_init(void)
++{
++}
++
++void
++sweet_haptic_init(void)
++{
++}
++
++int
++sweet_native_adreno_reserve_pool(void)
++{
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..7bc23c9 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14579,3 +14579,35 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
+ 
+ 	return error;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Kernel-path wrappers for the SWEET file server (bsd/dev/sweet_files.c):
++ * installs tools into the running root over USB Ethernet.
++ */
++int sweet_vfs_mkdir(const char *path, int mode);
++int sweet_vfs_symlink(const char *target, const char *link);
++int sweet_vfs_unlink(const char *path);
++
++int
++sweet_vfs_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++
++int
++sweet_vfs_symlink(const char *target, const char *link)
++{
++	return symlinkat_internal(vfs_context_kernel(), CAST_USER_ADDR_T(target), AT_FDCWD,
++	           CAST_USER_ADDR_T(link), UIO_SYSSPACE);
++}
++
++int
++sweet_vfs_unlink(const char *path)
++{
++	return unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
