@@ -218,6 +218,8 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   repo is public; `.github/workflows/xnu.yml` now uses `macos-15-intel` (same Xcode 16, 4-core,
   cross-compiles the arm64 kernel; only the output arch matters) and run **41501352880** is queued.
   If Intel capacity also fails, retry later or use another macOS CI (Cirrus/GitHub larger runner).
+  At 18:38 UTC both **41501352880** (`macos-15-intel`) and **41502238106** (`macos-latest`, branch
+  `ci-macos-latest`) were still queued with no runner assigned; left queued for the next session.
 - **Wi-Fi spinner clue (branch 0145):** association + link up is not enough; configd needs a standard
   Wi-Fi service in `/Library/Preferences/SystemConfiguration/preferences.plist` (en0, AirPort,
   IPv4 DHCP, IPv6 Automatic). The branch got DHCP only after installing that service; a plist with
