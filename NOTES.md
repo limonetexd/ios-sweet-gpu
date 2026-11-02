@@ -196,6 +196,15 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   patches on the dipa base) and replace its GPU/display files with our fast topaz ones
   (`SweetAdreno.cpp`, `RedwoodGPU.cpp`, `SweetFramebuffer.cpp`, `SweetSurface.*`, `sweet_gpu.c`),
   dropping the branch's `sweet_adreno.c`/clock from the config; keep its Wi-Fi/battery.
+- **Super patch 0104 (CI 41494548855):** copied the branch's Wi-Fi/battery source onto our fast
+  0101/0102 tree: `sweet_pmem.c`, `sweet_rpmh.c` (+922 lines PMEM/ARC/BCM/WLAN SMMU), `sweet_ufs.c`,
+  `sweet_spmi.c`, `SweetBattery.cpp`, `flame_wlan/sta.c`, `redwood_net/sta/Apple80211.c`,
+  `RedwoodWLAN.cpp`, `MiniIONetworkStack.cpp`, `sweet_files.c`, AKS `SweetKeyStore.cpp`, IOKit quiesce,
+  headers, config entries. Excluded the branch's NativeAdreno GPU; kept our topaz GPU/display. The patch
+  applies after 0103; the watcher builds `shim-boot-super.img` with `sweet-wlan.adt` and
+  `sweetgpu=2 sweetpmem=1 sweetsmmuprobe=1 sweetsmmuwlan=1 sweetwifi=1 sweetfiles=1 sweetusb=2`,
+  `sweetfb_hz=60`, serial=0. Root already has wland/netsvc/firmware/launchd. Test pending; if it
+  compiles/boots, this is the GPU+Wi-Fi+battery super image.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
