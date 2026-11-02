@@ -99,9 +99,18 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
 - **DC28088/hackios-sweet:** cloned and read; its README says "No Sweet boot or GPU rendering has
   been established". The wallpaper/apps/Wi-Fi screenshots are HackiOS on **redwood (POCO X5 Pro)**,
   APFS + WCN6750; not reusable for our HFS+ sweet root. Our port remains ahead for sweet.
-- Next: build a 0102 image with `sweetfix=1` (no auto reboot), boot it, check the lock screen; then the
-  0101 image at 60 Hz (`shim/out/shim-boot-0101.img`) for the vsync/fps fix; then the 0099 gesture
-  probe for the App Library / Control Center freeze.
+- **0102 worked (2026-11-02):** booted `shim-boot-0102.img` with `sweetfix=1`; SpringBoard reaches the
+  lock screen, apps open, **no reflash**. The accessibility plist was removed and Bold Text is off.
+  This kernel also contains 0101 (vsync tuple), so the phone is already on the fps fix. The user says
+  it feels "algo más" fluid than 0096d, not clearly 60: measure `SWEET FPS` in the ring.
+- **Images ready:** `shim/out/shim-boot-0102.img` (fix, 60 Hz, no auto reboot),
+  `shim-boot-0101d.img` (0101 daily, 60 Hz, no swipes/reboot), `shim-boot-0101p.img` (0101 probe:
+  `sweetgpu_reboot=600 sweetgpu_gestures=90`, for the App Library/Control Center freeze and fps).
+  Build images **one at a time**: two parallel `sweet-gpu-image.sh` runs overwrite `shim-boot.img` and
+  produce the same file.
+- Next: use 0102 for a few minutes (App Library / Control Center), then force fastboot + OrangeFox and
+  read the ring (`tools/sweet-pull-ring.ps1`), checking `SWEET FPS` swaps/presents and any freeze; then
+  run the 0101p gesture probe 10 min. If it survives, 0101d can be the daily image.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
