@@ -1,0 +1,174 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -63,6 +63,7 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -99,6 +100,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	void publishModes(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -123,6 +125,7 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	bool drawn(const uint8_t *rec);
+ };
+ 
+ /*
+@@ -210,6 +213,13 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
++	publishModes();
++	/*
++	 * (ios-topaz 0902) The GPU is waited for here, not by eagl.c's glFinish: a frame is put on the
++	 * panel only once the GPU is done with every surface it shows (drawn(), from the vsync timer,
++	 * which never blocks: a frame not done yet is tried again at the next tick).
++	 */
++	setProperty("RedwoodWaitsForGPU", true);
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -277,7 +287,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		if (fb->drawn(rec)) {
++			fb->present(rec);
++		} else {
++			IOLockLock(fb->fLock);
++			if (!fb->fDirty) {              /* (no newer frame meanwhile: this one again next tick) */
++				memcpy(fb->fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++				fb->fDirty = true;
++			}
++			IOLockUnlock(fb->fLock);
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -332,6 +351,97 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
++
++/* Whether the GPU is done with every surface the swap shows (looked at once, no waiting). */
++bool
++AppleCLCD::drawn(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	bool done = true;
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && done; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s != NULL && s->drawn != 0) {
++			done = topaz_surface_drawn(s, 0);
++		}
++		OSSafeReleaseNULL(s);
++	}
++	return done;
++}
++
++/*
++ * The display's modes, the way CoreAnimation reads them (properties TimingElements and
++ * ColorElements; the current one is block 0x40 of selector 79): one timing, the presented size
++ * at 60 Hz, one colour mode, 8-bit RGB. Without them CoreAnimation paced its frames 50 ms apart
++ * (ios-topaz 0948, after HackiOS MiniIOMobileFramebuffer publishModes(), APSL 2.0).
++ */
++#define SWEET_FB_TIMING_ID      1
++#define SWEET_FB_COLOR_ID       1
++
++static void
++sweet_set_number(OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++void
++AppleCLCD::publishModes(void)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	const uint32_t rate = 60u << 16;        /* 16.16 */
++
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
++		sweet_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_set_number(color, "PixelEncoding", 0);
++		sweet_set_number(color, "Depth", 8);
++		sweet_set_number(color, "Colorimetry", 1);
++		sweet_set_number(color, "EOTF", 1);
++		sweet_set_number(color, "DynamicRange", 0);
++		sweet_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_set_number(horizontal, "Active", fLogicalW);
++		sweet_set_number(horizontal, "Total", fLogicalW);
++		sweet_set_number(horizontal, "SyncRate", rate);
++		sweet_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_set_number(vertical, "Active", fLogicalH);
++		sweet_set_number(vertical, "Total", fLogicalH);
++		sweet_set_number(vertical, "SyncRate", rate);
++		sweet_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		IOLog("SWEET FB: modes published: %ux%u at 60 Hz\n", fLogicalW, fLogicalH);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -551,6 +661,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
++	case kSweetFBGetBlock:
++		/* block 0x40, the current mode: its colour and timing identifiers (publishModes) */
++		if (args->structureOutput != NULL && args->structureOutputDescriptor == NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			if (args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 && args->structureOutputSize >= 12) {
++				uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++				memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			}
++			return kIOReturnSuccess;
++		}
++		break;
+ 	case kSweetFBNotifications:
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];

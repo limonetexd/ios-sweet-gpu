@@ -651,7 +651,8 @@ static int rpmh_send(const uint32_t *addr, const uint32_t *data, unsigned n)
  */
 static int ddr_vote(void)
 {
-	static const uint32_t y[3] = { 0x4000, 0x2000, 0x8 };
+	/* VOTE_Y is bits 13:0 (Linux tcs.h): 0x4000 was peak 0, average 1 */
+	static const uint32_t y[3] = { 0x3fff, 0x2000, 0x8 };
 	uint32_t addr[3], data[3];
 	addr[0] = cmddb_addr("MC0");	/* no pointer table: no absolute relocations */
 	addr[1] = cmddb_addr("SH0");
