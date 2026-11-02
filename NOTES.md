@@ -35,6 +35,11 @@ IOSurface->texture refill per frame (display surface "copied into its memory by 
   that the vote took). Open: why the A618 is this slow (GPU hw_init subset in shim/gpuprobe.c vs Linux
   a6xx_hw_init: UCHE/GBIF/QoS/HWCG; memory attributes of GPU PTEs; GMEM vs sysmem in Mesa).
 
+**2026-11-02 later: user saw 0099e on screen: very laggy and glitchy.** Cause (verified in the log):
+display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 100) every create fails
+0xe00002bd, so the GPU barely draws after that. Plan + 4 research reports: `reports/plan-mejoras-2026-11-02.md`
+(not in git). Next: phase 1 kernel build (zombie fix, non-contiguous gemNew, powergate_latency, sailfish 0180).
+
 **LATEST 2026-11-02 (read this first): run 0099e = ~21 ms a frame (was ~400 ms).**
 - Kernel 0099 (CI 41365060398, image `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets

@@ -1,0 +1,141 @@
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -803,9 +803,13 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			return kIOReturnSuccess;
+ 		}
+ 	}
+-	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
++	/*
++	 * (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache)
++	 * 0096: not physically contiguous: newBuffer maps it page by page, and 40 MB contiguous
++	 * buffers failed (run 0099e).
++	 */
+ 	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-	    kIOMemoryPhysicallyContiguous | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, 0x000000fffffff000ull);
++	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, 0x000000fffffff000ull);
+ 	if (memory == NULL) {
+ 		IOLog("RedwoodGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
+ 		    fBufferBytes >> 20);
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -98,6 +98,14 @@ SweetCPU::start(IOService *provider)
+ 	info.l2_cache_size = cpu->l2_cache_size;
+ 	info.l3_cache_id = cpu->l3_cache_id;
+ 	info.l3_cache_size = cpu->l3_cache_size;
++	/*
++	 * 0096 (DC28088/ios-sweet 0177): powergate_latency becomes cpu_idle_latency, the
++	 * bound below which delay()/IODelay() spin. At 0 every 1 us register poll from a
++	 * preemptible thread blocked on a timer. sweetdelayspin=<ns>, 0 = off.
++	 */
++	uint32_t spin_ns = 5000;
++	PE_parse_boot_argn("sweetdelayspin", &spin_ns, sizeof(spin_ns));
++	info.powergate_latency = spin_ns;
+ 	perfmon_interrupt_handler_func pmi_handler = NULL;
+ 	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
+ 	if (result != KERN_SUCCESS) {
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -57,7 +57,7 @@ enum {
+  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+  * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
+  */
+-#define SWEET_AKS_LOCK_STATE    0x4
++#define SWEET_AKS_LOCK_STATE    0x6     /* no passcode (bit 1), unlocked since boot (bit 2); ios-sailfish 0180 */
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -150,7 +150,7 @@ sweet_aks_device_state(IOExternalMethodArguments *args)
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 3 }, { "sb", 0 }, { "sfa", 0 },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+@@ -232,10 +232,13 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	static uint32_t logged[128];            /* a few lines a selector: coreduetd asks thousands of times */
++	if (selector >= 128 || logged[selector]++ < 5) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -105,6 +105,12 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ void
+ SweetSurface::free()
+ {
++	static uint32_t told;
++	if (told < 16 && allocSize >= (8u << 20)) {
++		told++;
++		IOLog("SWEET SURF: freed id %u %ux%u (%u bytes, pool %d), %llu MB wired\n", id, width, height,
++		    allocSize, gpuPool, sweet_surface_wired >> 20);
++	}
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -852,6 +858,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
++			static uint32_t told;
++			if (told++ < 8) {
++				IOLog("SWEET SURF: no memory for %u bytes, %llu MB wired\n", s->allocSize, sweet_surface_wired >> 20);
++			}
+ 		} else {
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
+@@ -1421,6 +1431,14 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 		 */
+ 		OSSafeReleaseNULL(ref->data);
+ 		sweet_surface_put(ref->surface);
++		/*
++		 * 0096: the zombie keeps only the state page (its map holds the page's
++		 * descriptor). Holding the surface kept its pixels too: backboardd makes a
++		 * 13.9 MB screen surface a frame, 256 zombies hit SWEET_SURFACE_WIRED_MAX
++		 * after ~100 frames and every create failed with 0xe00002bd (run 0099e).
++		 */
++		ref->surface->release();
++		ref->surface = NULL;
+ 		ref->released = true;
+ 		ref->detached = false;
+ 		if (fZombies != NULL && fZombies->setObject(ref)) {
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,7 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	flush_dcache((vm_offset_t) pp << PAGE_SHIFT, PAGE_SIZE, TRUE);     /* widen first: RAM above 4 GB */
+ }
+ 
+ #if CONFIG_COREDUMP
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -568,7 +568,12 @@ cpu_idle(void)
+ #endif /* MONOTONIC */
+ 
+ 	if (wfi) {
+-#if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !defined(SWEET)
++		/*
++		 * (Not on SWEET, ios-sailfish 0180: the caches stay coherent and powered
++		 * while a core waits; this cleaned the whole D-cache by set/way on every
++		 * idle entry.)
++		 */
+ 		platform_cache_idle_enter();
+ #endif
+ 
