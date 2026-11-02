@@ -103,14 +103,30 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   lock screen, apps open, **no reflash**. The accessibility plist was removed and Bold Text is off.
   This kernel also contains 0101 (vsync tuple), so the phone is already on the fps fix. The user says
   it feels "algo más" fluid than 0096d, not clearly 60: measure `SWEET FPS` in the ring.
-- **Images ready:** `shim/out/shim-boot-0102.img` (fix, 60 Hz, no auto reboot),
-  `shim-boot-0101d.img` (0101 daily, 60 Hz, no swipes/reboot), `shim-boot-0101p.img` (0101 probe:
-  `sweetgpu_reboot=600 sweetgpu_gestures=90`, for the App Library/Control Center freeze and fps).
-  Build images **one at a time**: two parallel `sweet-gpu-image.sh` runs overwrite `shim-boot.img` and
-  produce the same file.
-- Next: use 0102 for a few minutes (App Library / Control Center), then force fastboot + OrangeFox and
-  read the ring (`tools/sweet-pull-ring.ps1`), checking `SWEET FPS` swaps/presents and any freeze; then
-  run the 0101p gesture probe 10 min. If it survives, 0101d can be the daily image.
+- **0102 freeze log (`logs/xnu-0102-freeze.txt`) = userland, not GPU:** during the widget-picker hang the
+  stats thread keeps printing `SWEET FPS: 0 swaps, 0 presents, vsync timer 17 ms, GPU 0 ms pending`
+  for ~8 s; the kernel and vsync timer are alive, backboardd simply stops swapping (no pending swap).
+  The log also shows `CRASH PosterBoard[214] sig 5` and many `xpcproxy`/preferences subscribers
+  launching. The root image has 629 `.appex` under `private/var/staged_system_apps` (WeatherWidget et
+  al.) but they are not registered with LaunchServices; the widget gallery waits for them/PosterBoard.
+  App Library and Control Center worked on 0102 (user). Not 0099/0101/0102; a reflash of the same root
+  will not add the missing registration/wallpaper.
+- **0101d freeze log (`logs/xnu-0101d-freeze.txt`) stops at 406 KB** after the widget touch (last line
+  `SWEET FPS: 2 swaps`), with no `0 swaps` lines; unlike 0102, the stats thread did not keep logging.
+  `PosterBoard` crashes (sig 5) and `assetsd` crash-loops (sig 6) in the same log. Possible causes: the
+  `serial=3` console blocking IOLog once the UART buffer fills (~400 KB), or a kernel log/lock stall.
+  `tools/sweet-gpu-image.sh` now takes `SWEET_SERIAL` (default 3); `shim-boot-0101s0.img` boots with
+  `serial=0` to tell them apart (if `SWEET FPS` continues after the widget hang, it was the serial).
+- **FPS is still ~24-27 swaps/s after 0101:** the vsync tuple is correct now (and 0102 includes 0101),
+  but the bottleneck is userland. The `redwood-gl` profile: 6.5 ms a frame in GL calls + 9.8 ms outside;
+  `glTexImage2D` 10.6 s total, `glDeleteTextures` 6.8 s, 1052 empty textures up to 3088x3088. Next
+  performance work is eagl texture reuse/churn, not the kernel display path.
+- The widget picker itself waits for staged `.appex`/PosterBoard, which are not registered and crash;
+  it is a userland gap, not GPU/kernel. Avoid it for now.
+- **Daily image:** `shim/out/shim-boot-0101d.img` (0099+0101, 60 Hz, no `sweetfix`, no swipes). Avoid the
+  widget picker; if it hangs, Power+Vol- (it may not recover; 2 min was not enough on 0101d). Boot
+  `shim-boot-0102.img` with `sweetfix=1` only if Bold Text is ever enabled again (it deletes the
+  accessibility plist at boot).
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets

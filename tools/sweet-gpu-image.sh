@@ -6,10 +6,10 @@
 # for the 60 Hz experiment). Add e.g. "sweetgpu_reboot=600 sweetgpu_swipe=90" for unattended runs
 # (tools/sweet-probe-loop.ps1).
 set -e
-K=${1:?kernel dir}; T=${2:?tag}; EXTRA=${3:-}; HZ=${SWEETFB_HZ:-30}
+K=${1:?kernel dir}; T=${2:?tag}; EXTRA=${3:-}; HZ=${SWEETFB_HZ:-30}; SER=${SWEET_SERIAL:-3}
 cd "$(dirname "$0")/.."
 python3 -I tools/mkadt.py shim/out/sweet-gpupool.adt --highmem --gpupool
-B="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=$HZ sweetgpu=2 $EXTRA"
+B="debug=0xc serial=$SER cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=$HZ sweetgpu=2 $EXTRA"
 echo "boot-args: $B"
 python3 -I tools/mkpayload.py "$K/kernel.development.sweet" shim/out/sweet-gpupool.adt "shim/out/payload-$T.bin" --cmdline "$B" | tail -2
 (cd shim && SHIM_CFLAGS="-DSHIM_GPUPROBE -DSHIM_GPUBOOT" ./build.sh "../shim/out/payload-$T.bin" 2>&1 | grep -E 'warning|error' || true)
