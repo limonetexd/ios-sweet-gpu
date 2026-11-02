@@ -205,6 +205,19 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   `sweetgpu=2 sweetpmem=1 sweetsmmuprobe=1 sweetsmmuwlan=1 sweetwifi=1 sweetfiles=1 sweetusb=2`,
   `sweetfb_hz=60`, serial=0. Root already has wland/netsvc/firmware/launchd. Test pending; if it
   compiles/boots, this is the GPU+Wi-Fi+battery super image.
+- **Super link fix 0105 (CI 41498675277):** 0104's first link failed with exactly seven undefined
+  symbols: `sweet_bt_init`, `sweet_haptic_init`, `sweet_native_adreno_reserve_pool`, `sweet_gpu_probe`
+  (branch UFS hooks whose drivers we do not build) and `sweet_vfs_mkdir/symlink/unlink` (the branch
+  file server's VFS helpers). 0105 adds `bsd/dev/sweet_super_compat.c` (no-op BT/haptic, NativeAdreno
+  reserve returns 0, `sweet_gpu_probe` forwards to our fast `sweet_gpu_init`) plus the three small VFS
+  wrappers at the end of `bsd/vfs/vfs_syscalls.c`, so the USB file server (`sweetfiles=1`) is kept.
+  Applies clean after 0104. If link passes, the watcher downloads the kernel and builds
+  `shim-boot-super.img`; root already has the Wi-Fi userland.
+- **Wi-Fi spinner clue (branch 0145):** association + link up is not enough; configd needs a standard
+  Wi-Fi service in `/Library/Preferences/SystemConfiguration/preferences.plist` (en0, AirPort,
+  IPv4 DHCP, IPv6 Automatic). The branch got DHCP only after installing that service; a plist with
+  only `HostNames` (configd's rewrite) sends no DHCP. Our root currently has the old plist moved to
+  `.pre-wifi`; if the super build associates but spins, install/make the standard en0 service next.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
