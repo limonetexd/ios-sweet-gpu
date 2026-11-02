@@ -35,8 +35,10 @@ env:
 jobs:
   build:
     # macos-14 (Xcode 15) is retired on 2026-11-02; Xcode 16's iig emits
-    # IORPC.kernelContent, which patch 0085 (from ios-flame 0082) adds to xnu-8796
-    runs-on: macos-15
+    # IORPC.kernelContent, which patch 0085 (from ios-flame 0082) adds to xnu-8796.
+    # macos-15 arm64 capacity is constrained (jobs die before a runner is assigned);
+    # macos-15-intel has the same Xcode 16 and cross-compiles the arm64 kernel.
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
