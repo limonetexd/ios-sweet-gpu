@@ -38,7 +38,7 @@ jobs:
     # IORPC.kernelContent, which patch 0085 (from ios-flame 0082) adds to xnu-8796.
     # macos-15 arm64 capacity is constrained (jobs die before a runner is assigned);
     # macos-15-intel has the same Xcode 16 and cross-compiles the arm64 kernel.
-    runs-on: macos-15-intel
+    runs-on: macos-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
