@@ -1,0 +1,51 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..0a05dd0 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6819,9 +6819,44 @@ load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path)
+ 	/*
+ 	 * Set up argument block for fake call to execve.
+ 	 */
++	user_addr_t argv_addr = scratch_addr;
++
++	/*
++	 * 0103: ca_vbl=1 puts CA_FORCE_TIMER into the environment of launchd (and
++	 * the jobs it starts), so QuartzCore takes the display driver's refresh
++	 * notifications instead of its own CADisplayTimer (30 Hz on iPhone X).
++	 */
++	scratch_addr = USER_ADDR_ALIGN(scratch_addr +
++	    (proc_is64bit(p) ? sizeof(user64_addr_t[3]) : sizeof(user32_addr_t[3])), sizeof(user_addr_t));
++	user_addr_t envp = USER_ADDR_NULL;
++	int ca_vbl = 0;
++	if (PE_parse_boot_argn("ca_vbl", &ca_vbl, sizeof(ca_vbl)) && ca_vbl) {
++		const char *setting = "CA_FORCE_TIMER=1";
++		size_t setting_length = strlen(setting) + 1;
++		user_addr_t setting_addr = scratch_addr;
++
++		error = copyout(setting, setting_addr, setting_length);
++		if (error) {
++			return error;
++		}
++		scratch_addr = USER_ADDR_ALIGN(scratch_addr + setting_length, sizeof(user_addr_t));
++		if (proc_is64bit(p)) {
++			user64_addr_t env64bit[2] = { setting_addr, 0 };
++			envp = scratch_addr;
++			error = copyout(env64bit, envp, sizeof(env64bit));
++		} else {
++			user32_addr_t env32bit[2] = { (user32_addr_t)setting_addr, 0 };
++			envp = scratch_addr;
++			error = copyout(env32bit, envp, sizeof(env32bit));
++		}
++		if (error) {
++			return error;
++		}
++	}
++
+ 	init_exec_args.fname = argv0;
+-	init_exec_args.argp = scratch_addr;
+-	init_exec_args.envp = USER_ADDR_NULL;
++	init_exec_args.argp = argv_addr;
++	init_exec_args.envp = envp;
+ 
+ 	/*
+ 	 * So that init task is set with uid,gid 0 token
