@@ -73,9 +73,17 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   0932/0940 guard rows, sailfish 0153/0162 BPR, sailfish 0155/0156 SMMU non-fatal faults + scratch
   pages, HackiOS GPU review G3 (reject a fence ahead of the last emitted), G13 (wait TLB invalidate),
   G1 (ring/IB privilege). MDP direct scanout needs a pool below 4 GiB; ours is above.
-- Next: read `logs/xnu-0097-60.txt`, then run the 0097b gesture probe (`sweetgpu_reboot=1500
+- **xnu 0099/0100 prepared (not pushed):** 0099 `xnu/patches/0099-sweet-share-bgra-aligned.patch` refuses to
+  share a surface with the GPU unless its elements are 4 bytes, it has one plane and its rows are
+  64-byte aligned (topaz 0938: sharing LA08 text masks with 640/480-byte rows stopped the GPU after a
+  minute); eagl then copies it. 0100 `xnu/patches/0100-sweet-surface-guard-rows.patch` allocates 64
+  rows of guard behind GPU-written surfaces (reusing client slack) and maps them (topaz 0932/0940).
+  0097c `xnu/patches/0097c-sweet-fps-time-units.patch` fixes the 0097 gaps/late-swap counters to
+  convert mach ticks to ns (they were compared/printed as if ticks were ns).
+- Next: read `logs/xnu-0097-60.txt`, then run the 0097b gesture probe (`sweetgpu_reboot=600
   sweetgpu_gestures=90`) and classify the freeze from the last `SWEET FPS` / waiting-swap lines.
-  Then guard rows (0099, topaz 0932/0940), the future-fence check, and BPR/CA sharing.
+  Then build 0099 (with 0097c) and run the same gestures; afterwards 0098+0100 for performance and
+  guard rows.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
