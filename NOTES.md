@@ -126,10 +126,20 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   performance work is eagl texture reuse/churn, not the kernel display path.
 - The widget picker itself waits for staged `.appex`/PosterBoard, which are not registered and crash;
   it is a userland gap, not GPU/kernel. Avoid it for now.
-- **Daily image:** `shim/out/shim-boot-0101d.img` (0099+0101, 60 Hz, no `sweetfix`, no swipes). Avoid the
-  widget picker; if it hangs, Power+Vol- (it may not recover; 2 min was not enough on 0101d). Boot
-  `shim-boot-0102.img` with `sweetfix=1` only if Bold Text is ever enabled again (it deletes the
-  accessibility plist at boot).
+- **Frame clock found (2026-11-02):** iPhone X CoreAnimation does **not** use the display driver's
+  refresh notifications; it runs its own `CADisplayTimer` (~30 Hz) unless `CA_FORCE_TIMER` is in the
+  environment (topaz `inject.c` does this with boot-arg `ca_vbl=1`; our `topaz_inject.c` does not).
+  The eagl trace (`logs/xnu-0101trace.txt`) shows frames 30-32 ms apart, with slow
+  `glFlush` ~6.4 ms + `glDeleteTextures` ~3 ms + `glTexImage2D` ~3.5 ms per frame. xnu **0103**
+  (`xnu/patches/0103-sweet-ca-force-timer.patch`, CI run after 22d4a97) adds boot-arg `ca_vbl=1`:
+  `load_init_program_at_path()` passes `CA_FORCE_TIMER=1` in launchd's environment, so its jobs
+  (backboardd) get it. Test with an image built from the 0103 kernel + `ca_vbl=1`; if launchd does
+  not pass it to backboardd, the next step is setting it in the injected dylib/backboardd job.
+- **0101/0102 do not raise the frame rate** because CA's own timer is 30 Hz; 0101's tuple is only used
+  with `CA_FORCE_TIMER`. The trace shows no 3088x3088 allocations in Settings scroll; the texture
+  churn is small textures (204x204, 180x180, 783x416...), one/two per frame.
+- **Daily image:** `shim/out/shim-boot-0101s0.img` (serial=0, no sweetfix, 60 Hz). Avoid widget picker;
+  it still hangs (userland PosterBoard/widgets, not GPU).
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
