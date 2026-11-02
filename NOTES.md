@@ -188,6 +188,14 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   topaz GPU but no Wi-Fi. Next big project: merge the Wi-Fi kernel patches (`0138`, `0141`,
   `0149`-`0153`, `0166`) into our fast 0101/0102 kernel, or port the topaz GPU to the branch kernel,
   for one super image (GPU + Wi-Fi + battery).
+- **Metal bundle experiment failed (2026-11-02):** installing DC28088's `SweetMetal2.bundle` + setting
+  `CA_FORCE_TIMER=1` in the backboardd launchd job on our root made the UI glitchy (green lines, no
+  blur, not smooth) and the Wi-Fi scan stopped. The branch's Metal stack expects its own root/userland;
+  reverted (bundle files removed, launchd restored without CA_FORCE_TIMER). Branch kernel + our topaz
+  root = Wi-Fi + battery, GPU on CPU. **Super plan:** build the DC28088 full branch tree (all its
+  patches on the dipa base) and replace its GPU/display files with our fast topaz ones
+  (`SweetAdreno.cpp`, `RedwoodGPU.cpp`, `SweetFramebuffer.cpp`, `SweetSurface.*`, `sweet_gpu.c`),
+  dropping the branch's `sweet_adreno.c`/clock from the config; keep its Wi-Fi/battery.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
