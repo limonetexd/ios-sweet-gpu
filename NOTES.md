@@ -213,6 +213,11 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   wrappers at the end of `bsd/vfs/vfs_syscalls.c`, so the USB file server (`sweetfiles=1`) is kept.
   Applies clean after 0104. If link passes, the watcher downloads the kernel and builds
   `shim-boot-super.img`; root already has the Wi-Fi userland.
+- **CI runner outage (2026-11-02 18:29):** run 41498675277 (0105) never got a macOS arm64
+  runner and GitHub cancelled it ("job was not acquired by Runner... capacity constraints"). The
+  repo is public; `.github/workflows/xnu.yml` now uses `macos-15-intel` (same Xcode 16, 4-core,
+  cross-compiles the arm64 kernel; only the output arch matters) and run **41501352880** is queued.
+  If Intel capacity also fails, retry later or use another macOS CI (Cirrus/GitHub larger runner).
 - **Wi-Fi spinner clue (branch 0145):** association + link up is not enough; configd needs a standard
   Wi-Fi service in `/Library/Preferences/SystemConfiguration/preferences.plist` (en0, AirPort,
   IPv4 DHCP, IPv6 Automatic). The branch got DHCP only after installing that service; a plist with
