@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 47e1393..77cb8a9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -295,6 +295,43 @@ sg_swipe_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++/*
++ * Boot-arg sweetgpu_gestures=SECONDS: the gestures the user's phone froze on
++ * (0096d, 2026-11-02): leaving the App Library and leaving Control Center,
++ * both a full-screen blur dismissed. It unlocks, then every cycle swipes left
++ * past the home pages into the App Library, waits, swipes up to leave it;
++ * pulls Control Center down from the top-right, waits, swipes up to close it.
++ * Panel coordinates (1080x2400), as bsd/dev/sweet_touch.c reports them.
++ */
++static void
++sg_gestures_thread(void *arg, wait_result_t result)
++{
++	(void)result;
++	int start = (int)(uintptr_t)arg;
++	sg_sleep_ms((unsigned)start * 1000);
++	printf("SWEET GPU: synthetic gestures start\n");
++	sg_swipe(540, 2380, 540, 1300);         /* lock screen: up */
++	sg_sleep_ms(3000);
++	sg_swipe(540, 2380, 540, 1300);         /* (again, if the first only woke it) */
++	sg_sleep_ms(3000);
++	for (unsigned n = 0;; n++) {
++		/* Into the App Library (past the last home page), then out of it. */
++		for (int i = 0; i < 5; i++) {
++			sg_swipe(930, 1200, 150, 1200);
++			sg_sleep_ms(500);
++		}
++		sg_sleep_ms(2000);
++		sg_swipe(540, 2380, 540, 1200);         /* App Library: leave (up) */
++		sg_sleep_ms(2500);
++		/* Control Center down from the top-right, then up to close it. */
++		sg_swipe(1000, 30, 1000, 900);
++		sg_sleep_ms(2000);
++		sg_swipe(540, 2380, 540, 1200);         /* Control Center: close (up) */
++		sg_sleep_ms(2500);
++		printf("SWEET GPU: gesture cycle %u\n", n + 1);
++	}
++}
++
+ void
+ sweet_gpu_init(void)
+ {
+@@ -318,5 +355,10 @@ sweet_gpu_init(void)
+ 	    kernel_thread_start(sg_swipe_thread, (void *)(uintptr_t)swipe, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	int gestures = 0;
++	if (PE_parse_boot_argn("sweetgpu_gestures", &gestures, sizeof(gestures)) && gestures > 0 &&
++	    kernel_thread_start(sg_gestures_thread, (void *)(uintptr_t)gestures, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
