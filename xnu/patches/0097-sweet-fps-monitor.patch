@@ -1,0 +1,379 @@
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index 42279b7..625cf75 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -48,6 +48,7 @@ void redwood_gpu_to_memory(void *start, uint64_t size);
+ uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+ bool redwood_gpu_done(uint32_t fence);
+ uint32_t redwood_gpu_last(void);
++uint32_t redwood_gpu_pending_ms(void);         /* 0097: ms the last submission has waited, 0 if done */
+ void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
+ void redwood_gpu_report(const char *why);
+ void redwood_gpu_stop(void);
+@@ -503,6 +504,26 @@ redwood_gpu_last(void)
+ 	return seqno;
+ }
+ 
++/*
++ * 0097: how long the newest submission has been waiting, without logging
++ * (redwood_gpu_done() says it once, at 100 ms). The display's once-a-second
++ * line asks this: a number that keeps growing while frames are swapped is a
++ * GPU that has stopped, not an idle one.
++ */
++uint32_t
++redwood_gpu_pending_ms(void)
++{
++	if (shared == NULL || seqno == 0) {
++		return 0;
++	}
++	if ((int32_t)(*fence_word() - seqno) >= 0) {
++		return 0;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - submitted_at[seqno % TIMED], &ns);
++	return (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
+ void
+ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ef68e76..f5cced9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -36,6 +36,9 @@
+  */
+ #include "SweetSurface.h"
+ extern "C" void redwood_gpu_to_memory(void *start, uint64_t size);       /* SweetAdreno.cpp */
++extern "C" uint32_t redwood_gpu_pending_ms(void);                       /* 0097 */
++extern "C" uint32_t redwood_gpu_last(void);
++extern "C" void redwood_gpu_report(const char *why);
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -50,6 +53,8 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -101,6 +106,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	void publishModes(void);
++	static void statsMain(void *self, wait_result_t result);
++	void statsReport(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -119,6 +126,18 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* 0097: one line a second from a thread of ours, even if swaps stop (a freeze shows in it) */
++	IOLock       *fStatLock;
++	uint64_t      fStatWindow;            /* mach time this window began */
++	uint64_t      fStatLastSwap;          /* last SwapEnd */
++	uint64_t      fStatLastVsync;         /* last vsync timer tick */
++	uint64_t      fStatSwapGapMax;        /* longest SwapEnd-to-SwapEnd */
++	uint64_t      fStatVsyncGapMax;       /* longest tick-to-tick (a late or stuck timer) */
++	uint64_t      fStatPresentSum;        /* time in drawn()+present() this window */
++	uint64_t      fStatPresentMax;
++	uint32_t      fStatSwaps, fStatLateSwaps;
++	uint32_t      fStatPresents, fStatStale;      /* presents and those the GPU was not done for */
++	uint32_t      fStatStalls;            /* GPU-not-done reports made */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -213,6 +232,19 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
++	/* 0097: a thread that says what the display and the GPU did, once a second. */
++	fStatWindow = mach_absolute_time();
++	if ((fStatLock = IOLockAlloc()) != NULL) {
++		thread_t thread;
++		if (kernel_thread_start(&AppleCLCD::statsMain, this, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			IOLog("SWEET FB: statistics every second (SWEET FPS)\n");
++		} else {
++			IOLockFree(fStatLock);
++			fStatLock = NULL;
++		}
++	}
++
+ 	publishModes();
+ 	/*
+ 	 * (ios-topaz 0902) The GPU is waited for here, not by eagl.c's glFinish: a frame is put on the
+@@ -246,6 +278,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (fb->fStatLock != NULL) {
++		IOLockLock(fb->fStatLock);
++		if (fb->fStatLastVsync != 0) {
++			uint64_t gap = now - fb->fStatLastVsync;
++			if (gap > fb->fStatVsyncGapMax) {
++				fb->fStatVsyncGapMax = gap;
++			}
++		}
++		fb->fStatLastVsync = now;
++		IOLockUnlock(fb->fStatLock);
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -287,7 +330,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		if (fb->drawn(rec)) {
++		uint64_t began = mach_absolute_time();
++		bool drawn = fb->drawn(rec);
++		if (drawn) {
+ 			fb->present(rec);
+ 		} else {
+ 			IOLockLock(fb->fLock);
+@@ -297,6 +342,21 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ 			IOLockUnlock(fb->fLock);
+ 		}
++		if (fb->fStatLock != NULL) {
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++			IOLockLock(fb->fStatLock);
++			if (drawn) {
++				fb->fStatPresents++;
++				fb->fStatPresentSum += ns;
++				if (ns > fb->fStatPresentMax) {
++					fb->fStatPresentMax = ns;
++				}
++			} else {
++				fb->fStatStale++;
++			}
++			IOLockUnlock(fb->fStatLock);
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -329,6 +389,100 @@ get32(const uint8_t *p, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * 0097: what the last second looked like. This thread runs even when swaps and
++ * vsyncs stop, so the last line before a freeze says whether the kernel was
++ * still scheduling (and how long the GPU had been stuck), or whether the
++ * machine itself stopped.
++ */
++void
++AppleCLCD::statsMain(void *self, wait_result_t result __unused)
++{
++	((AppleCLCD *)self)->statsReport();
++}
++
++void
++AppleCLCD::statsReport(void)
++{
++	for (;;) {
++		IOSleep(1000);
++		uint64_t now = mach_absolute_time();
++		uint64_t window = 0, swapgap, vsyncgap, psum, pmax;
++		uint32_t swaps, late, presents, stale;
++		uint64_t wired = 0;
++		uint32_t live = 0, zombies = 0, failed = 0;
++
++		if (fStatLock == NULL) {
++			continue;
++		}
++		IOLockLock(fStatLock);
++		absolutetime_to_nanoseconds(now - fStatWindow, &window);
++		swapgap = fStatSwapGapMax;
++		vsyncgap = fStatVsyncGapMax;
++		psum = fStatPresentSum;
++		pmax = fStatPresentMax;
++		swaps = fStatSwaps;
++		late = fStatLateSwaps;
++		presents = fStatPresents;
++		stale = fStatStale;
++		stalls = fStatStalls;
++		fStatWindow = now;
++		fStatSwapGapMax = 0;
++		fStatVsyncGapMax = 0;
++		fStatPresentSum = 0;
++		fStatPresentMax = 0;
++		fStatSwaps = 0;
++		fStatLateSwaps = 0;
++		fStatPresents = 0;
++		fStatStale = 0;
++		IOLockUnlock(fStatLock);
++		sweet_surface_stats(&wired, &live, &zombies, &failed);
++		uint32_t pending = redwood_gpu_pending_ms();
++		IOLog("SWEET FPS: %u swaps in %llu ms (%llu ms longest, %u late), %u presents (%llu us average, "
++		    "%llu us longest, %u waited for the GPU), vsync timer %llu ms longest; GPU %u ms pending (fence %u); "
++		    "%u surfaces, %u zombies, %llu MB wired, %u creates failed\n", swaps, window / 1000000,
++		    swapgap / 1000000, late, presents, presents ? psum / 1000 / presents : 0, pmax / 1000, stale,
++		    vsyncgap / 1000000, pending, redwood_gpu_last(), live, zombies, wired >> 20, failed);
++		if (pending > 1000) {
++			IOLockLock(fStatLock);
++			stalls = ++fStatStalls;
++			IOLockUnlock(fStatLock);
++			if (stalls <= 5 || (stalls % 10) == 0) {
++				redwood_gpu_report("no answer (statistics)");
++			}
++		}
++		/*
++		 * Nothing put on the panel this second while a swap waits: say what it
++		 * names and how far the GPU got with it (the freeze, in one line).
++		 */
++		if (presents == 0 && stale != 0) {
++			uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++			bool dirty;
++			IOLockLock(fLock);
++			dirty = fDirty;
++			memcpy(rec, fPending, sizeof(rec));
++			IOLockUnlock(fLock);
++			if (dirty) {
++				uint32_t mask = get32(rec, 0x104);
++				for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++					uint32_t id = get32(rec, 0x54 + 4 * layer);
++					SweetSurface *s;
++					if (!(mask & (1u << layer)) || id == 0) {
++						continue;
++					}
++					s = sweet_surface_copy(id);
++					IOLog("SWEET FB: waiting swap %u layer %u surface %u: GPU fence %u, %s, %ux%u bpr %u\n",
++					    get32(rec, 0x50), layer, id, s != NULL ? s->drawn : 0,
++					    s != NULL && s->gpuPool ? "GPU pool" : "ordinary memory",
++					    s != NULL ? s->width : 0, s != NULL ? s->height : 0,
++					    s != NULL ? s->bytesPerRow : 0);
++					OSSafeReleaseNULL(s);
++				}
++			}
++		}
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -346,6 +500,22 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	if (fStatLock != NULL) {
++		uint64_t now = mach_absolute_time();
++		IOLockLock(fStatLock);
++		if (fStatLastSwap != 0) {
++			uint64_t gap = now - fStatLastSwap;
++			if (gap > fStatSwapGapMax) {
++				fStatSwapGapMax = gap;
++			}
++			if (gap > 20 * NSEC_PER_MSEC) {
++				fStatLateSwaps++;
++			}
++		}
++		fStatLastSwap = now;
++		fStatSwaps++;
++		IOLockUnlock(fStatLock);
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e28eeaa..db50025 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -99,6 +99,32 @@ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++static volatile SInt32 sweet_surface_failed;    /* creates that returned an error (0097) */
++static volatile SInt32 sweet_surface_zombies;   /* released views whose state page stays mapped */
++
++/*
++ * 0097: the line the display prints once a second. The table is small (4096
++ * entries) and this runs on a thread of its own, so the walk is harmless.
++ */
++void
++sweet_surface_stats(uint64_t *wired, uint32_t *live, uint32_t *zombies, uint32_t *failed)
++{
++	uint32_t count = 0;
++
++	if (sweet_surface_lock != NULL) {
++		IOLockLock(sweet_surface_lock);
++		for (uint32_t i = 1; i < SWEET_SURFACE_MAX_ID; i++) {
++			if (sweet_surface_table[i] != NULL) {
++				count++;
++			}
++		}
++		IOLockUnlock(sweet_surface_lock);
++	}
++	*wired = sweet_surface_wired;
++	*live = count;
++	*zombies = (uint32_t)sweet_surface_zombies;
++	*failed = (uint32_t)sweet_surface_failed;
++}
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+@@ -575,7 +601,10 @@ void
+ IOSurfaceRootUserClient::free()
+ {
+ 	OSSafeReleaseNULL(fRefs);
+-	OSSafeReleaseNULL(fZombies);
++	if (fZombies != NULL) {
++		OSAddAtomic(-(SInt32)fZombies->getCount(), &sweet_surface_zombies);
++		OSSafeReleaseNULL(fZombies);
++	}
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
+ 		fLock = NULL;
+@@ -589,6 +618,7 @@ IOSurfaceRootUserClient::clientClose(void)
+ 	IOLockLock(fLock);
+ 	fRefs->flushCollection();
+ 	if (fZombies != NULL) {
++		OSAddAtomic(-(SInt32)fZombies->getCount(), &sweet_surface_zombies);
+ 		fZombies->flushCollection();
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -881,6 +911,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
++		OSIncrementAtomic(&sweet_surface_failed);
+ 		s->release();
+ 		return ret;
+ 	}
+@@ -1442,8 +1473,10 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 		ref->released = true;
+ 		ref->detached = false;
+ 		if (fZombies != NULL && fZombies->setObject(ref)) {
++			OSIncrementAtomic(&sweet_surface_zombies);
+ 			if (fZombies->getCount() > 256) {
+ 				fZombies->removeObject(0);
++				OSDecrementAtomic(&sweet_surface_zombies);
+ 			}
+ 		}
+ 		fRefs->removeObject(index);
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index a163ca4..8b605eb 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -58,6 +58,13 @@ public:
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
++/*
++ * 0097: what the surface table holds now, for the once-a-second SWEET FPS line:
++ * bytes of wired buffer surfaces, surfaces in the id table, released views whose
++ * state page is still mapped, and creates that failed since boot.
++ */
++void sweet_surface_stats(uint64_t *wired, uint32_t *live, uint32_t *zombies, uint32_t *failed);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller

@@ -43,6 +43,21 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
 **LATEST 2026-11-02 (read this first): 0096d on screen = ~25 fps, "super good"; occasional freezes.**
 - **User report (2026-11-02 afternoon):** 0096d (kernel 0096) runs at ~25 fps and feels "super good";
   used it for a while. Sometimes it freezes and needs a reboot. 0096e probe launched to capture one.
+- **Probe 0096e (12:37:14-12:47:46, 632 s): NO freeze.** It ran the full `sweetgpu_reboot=600` with
+  synthetic swipes every 3 s after 90 s, then returned to fastboot by itself. The XNU ring was not read:
+  fastboot/ABL then answered `unknown status code` to every command and the 131 MB recovery upload failed
+  (known ABL hang; Power+Vol- re-enters fastboot; the ring in userdata is not lost). So a freeze takes
+  longer than 10 min of animation, or needs a specific app/gesture.
+- **xnu 0097 (diagnostics only, no behaviour change):** a kernel thread logs one `SWEET FPS` line a
+  second even if swaps/vsync stop: swaps/s + longest gap + late swaps; presents/s + average/longest
+  present time + presents that waited for the GPU; longest vsync-timer gap; ms the last GPU submission
+  has been pending and its fence; live surfaces, zombie views, wired MB, failed creates. After a stall it
+  dumps the waiting swap's layers (surface id, GPU fence, pool/ordinary). If the stats thread itself
+  stops, the last line is the freeze time. Patch `xnu/patches/0097-sweet-fps-monitor.patch`.
+- Next: build 0097 in CI, boot it with a long probe (`sweetgpu_reboot=1800`), and read the last
+  `SWEET FPS` lines to classify the freeze (GPU fence stuck / vsync stopped / swaps stopped / kernel
+  stopped). Also prepare 0098 (`IOSurfaceBytesPerRow` rounded to 64 for CA surfaces) and the larger
+  screen-surface guard-row fix (topaz 0932/0940) if the freezes are SMMU faults.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
