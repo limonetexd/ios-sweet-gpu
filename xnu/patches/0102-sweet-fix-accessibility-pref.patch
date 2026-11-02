@@ -1,0 +1,42 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..2cb13a1 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -87,6 +87,7 @@
+ #include <sys/kauth.h>
+ #include <sys/systm.h>
+ #include <sys/vnode_internal.h>
++#include <sys/uio.h>
+ #include <sys/conf.h>
+ #include <sys/buf_internal.h>
+ #include <sys/user.h>
+@@ -916,6 +917,29 @@ bsd_init(void)
+ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0102: a bad user preference can leave SpringBoard respringing before anyone
++	 * can change it (Bold Text did on 2026-11-02: black screen after the boot).
++	 * sweetfix=1 removes the accessibility preferences on this boot, before
++	 * launchd and cfprefsd start; the next boot recreates them with defaults.
++	 */
++	{
++		int fix = 0;
++		if (PE_parse_boot_argn("sweetfix", &fix, sizeof(fix)) && fix != 0) {
++			static const char *paths[] = {
++				"/var/mobile/Library/Preferences/com.apple.Accessibility.plist",
++			};
++			extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++			for (unsigned int i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++				int e = unlink1(vfs_context_kernel(), NULLVP, (user_addr_t)(uintptr_t)paths[i],
++				    UIO_SYSSPACE, 0);
++				printf("SWEET FIX: unlink %s -> %d\n", paths[i], e);
++			}
++		}
++	}
++#endif
++
+ 
+ 	if (!bsd_rooted_ramdisk()) {
+ 		boolean_t require_rootauth = FALSE;
