@@ -80,10 +80,28 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   rows of guard behind GPU-written surfaces (reusing client slack) and maps them (topaz 0932/0940).
   0097c `xnu/patches/0097c-sweet-fps-time-units.patch` fixes the 0097 gaps/late-swap counters to
   convert mach ticks to ns (they were compared/printed as if ticks were ns).
-- Next: read `logs/xnu-0097-60.txt`, then run the 0097b gesture probe (`sweetgpu_reboot=600
-  sweetgpu_gestures=90`) and classify the freeze from the last `SWEET FPS` / waiting-swap lines.
-  Then build 0099 (with 0097c) and run the same gestures; afterwards 0098+0100 for performance and
-  guard rows.
+- **60 Hz probe (0097, log `logs/xnu-0097-60.txt`) result:** 24 swaps in 1001 ms, 23-25 presents,
+  present ~3.3-3.7 ms average / 5.4-6.6 ms longest, 0-3 waited for the GPU, GPU 0 ms pending,
+  vsync timer 0 ms, 87 surfaces, 256 zombies (cap), 106 MB wired, 0 creates failed. So the 60 Hz
+  display copy is not the limit: CoreAnimation swaps only ~24 a second.
+- **Cause found:** the vsync notification sent `(counter, now, 0)`; QuartzCore reads
+  `(time, presented, counter)`. Topaz 0945/HackiOS MiniIOMobileFramebuffer use `(now, now, count)`
+  as six 32-bit halves. xnu **0101** `xnu/patches/0101-sweet-fb-vsync-tuple.patch` (CI 41449252533,
+  success) fixes it; should raise CA's frame clock from ~24 to near 60.
+- **Bold Text made the phone unusable (2026-11-02):** enabling it caused an infinite respring; after a
+  force reboot 0096d boots to a black screen, power button dead. This is userland (the preference),
+  not the kernel: 0096d booted the same kernel before. The iOS root is HFSX, and OrangeFox has no
+  hfsplus module; the local hfsplus 1.0.4 tool rejects HFSX. xnu **0102**
+  `xnu/patches/0102-sweet-fix-accessibility-pref.patch` (CI 41450933568) adds boot-arg `sweetfix=1`:
+  after the root vnode is set in `bsd_init`, `unlink1(vfs_context_kernel(), ...)` removes
+  `/var/mobile/Library/Preferences/com.apple.Accessibility.plist` before launchd. Log line
+  `SWEET FIX: unlink ... -> 0`. No reflash needed if it works.
+- **DC28088/hackios-sweet:** cloned and read; its README says "No Sweet boot or GPU rendering has
+  been established". The wallpaper/apps/Wi-Fi screenshots are HackiOS on **redwood (POCO X5 Pro)**,
+  APFS + WCN6750; not reusable for our HFS+ sweet root. Our port remains ahead for sweet.
+- Next: build a 0102 image with `sweetfix=1` (no auto reboot), boot it, check the lock screen; then the
+  0101 image at 60 Hz (`shim/out/shim-boot-0101.img`) for the vsync/fps fix; then the 0099 gesture
+  probe for the App Library / Control Center freeze.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
