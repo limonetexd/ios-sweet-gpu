@@ -54,10 +54,28 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   has been pending and its fence; live surfaces, zombie views, wired MB, failed creates. After a stall it
   dumps the waiting swap's layers (surface id, GPU fence, pool/ordinary). If the stats thread itself
   stops, the last line is the freeze time. Patch `xnu/patches/0097-sweet-fps-monitor.patch`.
-- Next: build 0097 in CI, boot it with a long probe (`sweetgpu_reboot=1800`), and read the last
-  `SWEET FPS` lines to classify the freeze (GPU fence stuck / vsync stopped / swaps stopped / kernel
-  stopped). Also prepare 0098 (`IOSurfaceBytesPerRow` rounded to 64 for CA surfaces) and the larger
-  screen-surface guard-row fix (topaz 0932/0940) if the freezes are SMMU faults.
+- **Freeze details (asked to the user):** freezes while navigating, the first leaving the **App Library**,
+  the second leaving **Control Center**; screen stays on with the last image (not black); ~2 minutes of
+  use before each. The old horizontal-swipe probe cannot reproduce those blur-dismiss animations.
+- **xnu 0097 built:** first CI 41439943789 failed (`stalls` undeclared after the stats refactor); fixed
+  in `xnu/patches/0097-sweet-fps-monitor.patch`, CI **41443671070** success (8m23s), kernel in
+  `xnu/out-0097`. It applies after 0096; 0097 is diagnostics only.
+- **xnu 0097b gestures:** `xnu/patches/0097b-sweet-gestures.patch` (boot-arg
+  `sweetgpu_gestures=SECONDS`): unlock, swipe left into the App Library, wait, swipe up to leave it;
+  pull Control Center from the top-right, wait, swipe up to close it; repeat. CI **41444949729**.
+- **xnu 0098 prepared (not pushed):** local commit `9e21b2a`, patch
+  `xnu/patches/0098-sweet-row-align-ca.patch`: explicit `IOSurfaceBytesPerRow` rounded to 64 only for
+  CA surfaces (keys > 6); CoreUI (keys <= 6) and `IOSurfaceAddress`/client memory keep exact rows.
+- **60 Hz experiment:** `tools/sweet-gpu-image.sh` takes `SWEETFB_HZ` (default 30);
+  `shim/out/shim-boot-0097-60.img` = 0097 + `sweetfb_hz=60 sweetgpu_reboot=600 sweetgpu_swipe=90`,
+  probe log `logs/xnu-0097-60.txt`. ABL USB uploads are flaky (changed cable/port once).
+- **r/hackios:** no technical content on sweet (0-comment thread). Confirmed references: topaz
+  0932/0940 guard rows, sailfish 0153/0162 BPR, sailfish 0155/0156 SMMU non-fatal faults + scratch
+  pages, HackiOS GPU review G3 (reject a fence ahead of the last emitted), G13 (wait TLB invalidate),
+  G1 (ring/IB privilege). MDP direct scanout needs a pool below 4 GiB; ours is above.
+- Next: read `logs/xnu-0097-60.txt`, then run the 0097b gesture probe (`sweetgpu_reboot=1500
+  sweetgpu_gestures=90`) and classify the freeze from the last `SWEET FPS` / waiting-swap lines.
+  Then guard rows (0099, topaz 0932/0940), the future-fence check, and BPR/CA sharing.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
