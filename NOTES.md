@@ -116,7 +116,10 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   `PosterBoard` crashes (sig 5) and `assetsd` crash-loops (sig 6) in the same log. Possible causes: the
   `serial=3` console blocking IOLog once the UART buffer fills (~400 KB), or a kernel log/lock stall.
   `tools/sweet-gpu-image.sh` now takes `SWEET_SERIAL` (default 3); `shim-boot-0101s0.img` boots with
-  `serial=0` to tell them apart (if `SWEET FPS` continues after the widget hang, it was the serial).
+  `serial=0`. **Tested:** after the widget hang, 0101s0 logs `SWEET FPS: 0 swaps ... GPU 0 ms pending`
+  and then the user's Power/Vol keys; the kernel was alive all along. The 0101d log stopped at 406 KB
+  because the `serial=3` console blocked IOLog once its buffer filled, not a kernel hang. Use serial=0
+  for daily/probes (default changed to 0); the persistent ring keeps working.
 - **FPS is still ~24-27 swaps/s after 0101:** the vsync tuple is correct now (and 0102 includes 0101),
   but the bottleneck is userland. The `redwood-gl` profile: 6.5 ms a frame in GL calls + 9.8 ms outside;
   `glTexImage2D` 10.6 s total, `glDeleteTextures` 6.8 s, 1052 empty textures up to 3088x3088. Next

@@ -3,10 +3,11 @@
 # Usage: tools/sweet-gpu-image.sh KERNEL_DIR TAG ["extra boot-args"]
 #   KERNEL_DIR holds kernel.development.sweet (CI artifact xnu-kernel); image -> shim/out/shim-boot-TAG.img
 # Default boot-args: best config so far (sweetgpu=2 cpus=8, 30 Hz framebuffer copy; SWEETFB_HZ=60
-# for the 60 Hz experiment). Add e.g. "sweetgpu_reboot=600 sweetgpu_swipe=90" for unattended runs
-# (tools/sweet-probe-loop.ps1).
+# for the 60 Hz experiment; SWEET_SERIAL=0 by default: the serial console blocks IOLog once its
+# buffer fills, serial=3 only for early-boot debugging). Add e.g. "sweetgpu_reboot=600
+# sweetgpu_swipe=90" for unattended runs (tools/sweet-probe-loop.ps1).
 set -e
-K=${1:?kernel dir}; T=${2:?tag}; EXTRA=${3:-}; HZ=${SWEETFB_HZ:-30}; SER=${SWEET_SERIAL:-3}
+K=${1:?kernel dir}; T=${2:?tag}; EXTRA=${3:-}; HZ=${SWEETFB_HZ:-30}; SER=${SWEET_SERIAL:-0}
 cd "$(dirname "$0")/.."
 python3 -I tools/mkadt.py shim/out/sweet-gpupool.adt --highmem --gpupool
 B="debug=0xc serial=$SER cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=$HZ sweetgpu=2 $EXTRA"
