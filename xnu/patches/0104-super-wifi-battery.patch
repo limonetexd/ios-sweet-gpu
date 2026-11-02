@@ -1,0 +1,5059 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7052e81..342acdd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -649,3 +649,10 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
++bsd/dev/sweet_pmem.c		standard
++bsd/dev/redwood_sta.c		standard
++bsd/dev/redwood_net.c		standard
++bsd/dev/redwood_apple80211.c	standard
++bsd/dev/flame_sta.c		standard
++bsd/dev/flame_wlan.c		standard
++bsd/dev/sweet_files.c		standard
+diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
+new file mode 100644
+index 0000000..7e40bda
+--- /dev/null
++++ b/bsd/dev/flame_sta.c
+@@ -0,0 +1,242 @@
++/*
++ * flame: the station side of sys/redwood_sta.h (ios-topaz 0900's topaz_sta.c) over the WCN3990 radio,
++ * which runs in userland (phone/wifi wland) and reaches the kernel through bsd/dev/flame_wlan.c (its
++ * C API, flame_wlan_*, the one topaz_wlan_* was). When wland says the radio is up, en0 is made (a radio,
++ * link down until a join) and the station attached, so that wifid finds a Wi-Fi interface.
++ */
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/redwood_net.h>
++#include <sys/redwood_sta.h>
++#include <sys/systm.h>
++
++extern kern_return_t thread_terminate(thread_t thread);
++
++struct flame_wlan_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;
++	int16_t rssi;
++	uint16_t beacon_interval, capability;
++	uint32_t age_ms;
++	uint16_t elements_length;
++	uint8_t elements[768];
++};
++extern void (*flame_wlan_ready_hook)(void);
++extern bool flame_wlan_ready(void);
++extern int flame_wlan_scan(void);
++extern bool flame_wlan_heard(unsigned index, struct flame_wlan_bss *bss);
++extern void flame_wlan_address(uint8_t address[6]);
++extern int flame_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len);
++extern int flame_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32]);
++extern int flame_wlan_leave(void);
++extern bool flame_wlan_joined(void);
++extern bool flame_wlan_transmit(const uint8_t *frame, size_t length);
++extern void (*flame_wlan_rx_hook)(const uint8_t *frame, size_t length);
++extern void (*flame_wlan_link_hook)(bool up);
++extern bool flame_wlan_link_bss(struct flame_wlan_bss *bss);
++
++static struct redwood_sta_bss sta_joined_bss;
++static int sta_last_error;
++
++static const uint16_t sta_freqs[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
++	5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700,
++	5745, 5765, 5785, 5805, 5825,
++};
++
++static int
++sta_power(__unused bool on)
++{
++	return 0;                               /* the radio stays up with the modem */
++}
++
++static int
++sta_scan(__unused const struct redwood_sta_scan *what)
++{
++	return flame_wlan_scan();
++}
++
++static void
++sta_heard(void (*each)(const struct redwood_sta_bss *bss, void *context), void *context)
++{
++	static struct flame_wlan_bss t;
++	static struct redwood_sta_bss b;
++
++	for (unsigned i = 0; flame_wlan_heard(i, &t); i++) {
++		if (t.age_ms > 60000) {
++			continue;                       /* not heard in the last minute */
++		}
++		bzero(&b, sizeof(b));
++		memcpy(b.bssid, t.bssid, 6);
++		memcpy(b.ssid, t.ssid, t.ssid_length);
++		b.ssid_length = t.ssid_length;
++		b.frequency = t.frequency;
++		b.rssi = t.rssi;
++		b.beacon_interval = t.beacon_interval;
++		b.capability = t.capability;
++		b.age_ms = t.age_ms;
++		b.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
++		memcpy(b.elements, t.elements, b.elements_length);
++		each(&b, context);
++	}
++}
++
++static int
++sta_join(const struct redwood_sta_join *what)
++{
++	static struct flame_wlan_bss t;
++	bool any = false;
++	int error;
++
++	for (int i = 0; i < 6; i++) {
++		any |= what->bssid[i] != 0;
++	}
++	if (what->security == REDWOOD_STA_WPA2_PSK && what->passphrase_length == 0) {
++		error = flame_wlan_join_pmk(what->ssid, what->ssid_length, any ? what->bssid : NULL, what->pmk);
++	} else error = flame_wlan_join(what->ssid, what->ssid_length, any ? what->bssid : NULL,
++	    what->security == REDWOOD_STA_WPA2_PSK ? what->passphrase : NULL,
++	    what->security == REDWOOD_STA_WPA2_PSK ? what->passphrase_length : 0);
++	sta_last_error = error;
++	bzero(&sta_joined_bss, sizeof(sta_joined_bss));
++	if (error == 0) {
++		for (unsigned i = 0; flame_wlan_heard(i, &t); i++) {
++			if (t.ssid_length == what->ssid_length && memcmp(t.ssid, what->ssid, t.ssid_length) == 0) {
++				memcpy(sta_joined_bss.bssid, t.bssid, 6);
++				memcpy(sta_joined_bss.ssid, t.ssid, t.ssid_length);
++				sta_joined_bss.ssid_length = t.ssid_length;
++				sta_joined_bss.frequency = t.frequency;
++				sta_joined_bss.rssi = t.rssi;
++				sta_joined_bss.beacon_interval = t.beacon_interval;
++				sta_joined_bss.capability = t.capability;
++				sta_joined_bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
++				memcpy(sta_joined_bss.elements, t.elements, sta_joined_bss.elements_length);
++				break;
++			}
++		}
++	}
++	printf("flame wifi: join -> %d\n", error);
++	return error;
++}
++
++static int
++sta_leave(void)
++{
++	return flame_wlan_leave();
++}
++
++static void
++sta_state(struct redwood_sta_state *state)
++{
++	bzero(state, sizeof(*state));
++	state->phase = flame_wlan_joined() ? REDWOOD_STA_JOINED : REDWOOD_STA_IDLE;
++	if (state->phase == REDWOOD_STA_JOINED) {
++		state->bss = sta_joined_bss;
++		if (state->bss.ssid_length == 0) {
++			/* flame: wland joined by itself (its wlan.conf, before wifid asked): the network it reports */
++			struct flame_wlan_bss t;        /* (on any thread: not static) */
++			if (flame_wlan_link_bss(&t)) {
++				memcpy(state->bss.bssid, t.bssid, 6);
++				memcpy(state->bss.ssid, t.ssid, t.ssid_length);
++				state->bss.ssid_length = t.ssid_length;
++				state->bss.frequency = t.frequency;
++				state->bss.rssi = t.rssi;
++				state->bss.beacon_interval = t.beacon_interval;
++				state->bss.capability = t.capability;
++				state->bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
++				memcpy(state->bss.elements, t.elements, state->bss.elements_length);
++			}
++		}
++	}
++	state->last_error = sta_last_error;
++}
++
++static unsigned
++sta_channels(struct redwood_sta_channel *channels, unsigned most)
++{
++	unsigned n = 0;
++	for (; n < most && n < sizeof(sta_freqs) / sizeof(sta_freqs[0]); n++) {
++		channels[n].frequency = sta_freqs[n];
++		channels[n].flags = REDWOOD_STA_CHANNEL_PASSIVE;
++	}
++	return n;
++}
++
++static struct redwood_sta_ops sta_ops = {
++	.power = sta_power,
++	.scan = sta_scan,
++	.heard = sta_heard,
++	.join = sta_join,
++	.leave = sta_leave,
++	.state = sta_state,
++	.channels = sta_channels,
++};
++
++static bool
++sta_transmit(mbuf_t packet, size_t length)
++{
++	static uint8_t frame[REDWOOD_NET_FRAME_MAX];   /* (one sender at a time: redwood_net's tx lock) */
++	if (length > sizeof(frame) || mbuf_copydata(packet, 0, length, frame) != 0) {
++		return false;
++	}
++	return flame_wlan_transmit(frame, length);
++}
++
++static void
++sta_rx(const uint8_t *frame, size_t length)
++{
++	redwood_net_input(frame, length);
++}
++
++static void
++sta_link_changed(bool up)
++{
++	redwood_net_link_state(up);
++	if (!up && sta_last_error == 0) {
++		redwood_sta_lost(ECONNRESET);
++	}
++}
++
++static struct redwood_net_link sta_link = {
++	.name = "wcn3990",
++	.wireless = true,
++	.up = false,
++	.transmit = sta_transmit,
++	.poll = NULL,
++};
++
++/* from the modem thread, once the radio is up: keep it short, the work goes on a thread */
++static void
++sta_bring_up(__unused void *arg, __unused wait_result_t wr)
++{
++	flame_wlan_address(sta_link.address);
++	memcpy(sta_ops.address, sta_link.address, 6);
++	flame_wlan_rx_hook = sta_rx;
++	flame_wlan_link_hook = sta_link_changed;
++	if (redwood_net_attach(&sta_link)) {
++		redwood_sta_attach(&sta_ops);
++		printf("flame wifi: en0 and the station are up for iOS\n");
++	}
++	thread_terminate(current_thread());
++}
++
++static void
++sta_ready(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(sta_bring_up, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++void MiniIONetworkStackStart(void);   /* iokit/Kernel/arm/MiniIONetworkStack.cpp */
++void flame_sta_init(void);
++void
++flame_sta_init(void)
++{
++	MiniIONetworkStackStart();              /* configd waits for it before it calls the registry quiet */
++	flame_wlan_ready_hook = sta_ready;
++}
+diff --git a/bsd/dev/flame_wlan.c b/bsd/dev/flame_wlan.c
+new file mode 100644
+index 0000000..7bac497
+--- /dev/null
++++ b/bsd/dev/flame_wlan.c
+@@ -0,0 +1,442 @@
++/*
++ * flame: the WCN3990 radio for the kernel's Wi-Fi station. bsd/dev/flame_sta.c (ios-topaz 0900's topaz_sta.c)
++ * puts en0 and wifid's Apple80211 requests (bsd/dev/redwood_*.c) on this file's flame_wlan_* C API, the one
++ * TopazModem.cpp offers there. The radio itself runs in userland (phone/wifi: wland), which opens /dev/wlan
++ * once it is up; sys/flame_wlan.h is the protocol, one message per read() or write().
++ *
++ * The station's requests (scan, join, leave) are queued for wland and each waits for its answer; frames en0
++ * sends are queued too (dropped when the queue is full). What wland writes back wakes the waiter, or goes to
++ * en0 (received frames) and the link hook. When wland closes the device the link is down and waiters fail.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <sys/flame_wlan.h>
++
++void flame_wlan_init(void);
++void flame_sta_init(void);              /* bsd/dev/flame_sta.c */
++void redwood_net_init(void);            /* bsd/dev/redwood_net.c: its boot-args */
++
++/* as bsd/dev/flame_sta.c declares it (topaz_wlan_bss) */
++struct flame_wlan_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;
++	int16_t rssi;
++	uint16_t beacon_interval, capability;
++	uint32_t age_ms;
++	uint16_t elements_length;
++	uint8_t elements[768];
++};
++
++void (*flame_wlan_ready_hook)(void);
++void (*flame_wlan_rx_hook)(const uint8_t *frame, size_t length);
++void (*flame_wlan_link_hook)(bool up);
++
++static LCK_GRP_DECLARE(fw_grp, "flame-wlan");
++static LCK_MTX_DECLARE(fw_lock, &fw_grp);
++
++#define FW_QLEN         64
++#define FW_PENDING      INT32_MIN
++static struct {
++	uint16_t type, len;
++	uint8_t data[FW_MSG_MAX - sizeof(struct fw_hdr)];
++} fw_q[FW_QLEN];
++static unsigned fw_q_head, fw_q_count;
++static uint64_t fw_tx_dropped;
++
++static bool fw_opened, fw_ready, fw_link_up;
++static uint8_t fw_addr[6];
++static struct fw_link fw_link;          /* the network of the last FW_LINK up */
++#define FW_BSS_MAX      64
++static struct flame_wlan_bss fw_bss[FW_BSS_MAX];
++static unsigned fw_nbss;
++static int32_t fw_scan_status = FW_PENDING, fw_join_status = FW_PENDING, fw_left_status = FW_PENDING;
++
++/* with fw_lock */
++static bool
++fw_queue_locked(uint16_t type, const void *data, size_t len)
++{
++	if (fw_q_count >= FW_QLEN || len > sizeof(fw_q[0].data)) {
++		return false;
++	}
++	unsigned i = (fw_q_head + fw_q_count) % FW_QLEN;
++	fw_q[i].type = type;
++	fw_q[i].len = (uint16_t)len;
++	if (len) {
++		memcpy(fw_q[i].data, data, len);
++	}
++	fw_q_count++;
++	wakeup(&fw_q_count);
++	return true;
++}
++
++/* A request of the station: queued for wland, then its answer (0 or an errno) within `secs`. */
++static int
++fw_request(uint16_t type, const void *data, size_t len, int32_t *status, int secs)
++{
++	lck_mtx_lock(&fw_lock);
++	if (!fw_opened) {
++		lck_mtx_unlock(&fw_lock);
++		return ENXIO;
++	}
++	*status = FW_PENDING;
++	if (!fw_queue_locked(type, data, len)) {
++		lck_mtx_unlock(&fw_lock);
++		return ENOBUFS;
++	}
++	struct timespec ts = { secs, 0 };
++	while (*status == FW_PENDING && fw_opened) {
++		if (msleep(status, &fw_lock, PZERO, "flamewlan", &ts) == EWOULDBLOCK) {
++			break;
++		}
++	}
++	int rc = *status != FW_PENDING ? *status : fw_opened ? ETIMEDOUT : ENXIO;
++	lck_mtx_unlock(&fw_lock);
++	return rc;
++}
++
++/* ---- the C API of bsd/dev/flame_sta.c ---- */
++
++bool flame_wlan_ready(void);
++int flame_wlan_scan(void);
++bool flame_wlan_heard(unsigned index, struct flame_wlan_bss *bss);
++void flame_wlan_address(uint8_t address[6]);
++int flame_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len);
++int flame_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32]);
++int flame_wlan_leave(void);
++bool flame_wlan_joined(void);
++bool flame_wlan_transmit(const uint8_t *frame, size_t length);
++
++bool
++flame_wlan_ready(void)
++{
++	return fw_ready;
++}
++
++int
++flame_wlan_scan(void)
++{
++	return fw_request(FW_SCAN, NULL, 0, &fw_scan_status, 20);
++}
++
++bool
++flame_wlan_heard(unsigned index, struct flame_wlan_bss *bss)
++{
++	lck_mtx_lock(&fw_lock);
++	bool have = index < fw_nbss;
++	if (have) {
++		memcpy(bss, &fw_bss[index], sizeof(*bss));
++	}
++	lck_mtx_unlock(&fw_lock);
++	return have;
++}
++
++void
++flame_wlan_address(uint8_t address[6])
++{
++	memcpy(address, fw_addr, 6);
++}
++
++static int
++fw_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, uint8_t kind, const uint8_t *key, unsigned key_len)
++{
++	struct fw_join j;
++	bzero(&j, sizeof(j));
++	if (ssid_len == 0 || ssid_len > sizeof(j.ssid) || key_len > sizeof(j.key)) {
++		return EINVAL;
++	}
++	memcpy(j.ssid, ssid, ssid_len);
++	j.ssid_len = (uint8_t)ssid_len;
++	if (bssid != NULL) {
++		memcpy(j.bssid, bssid, 6);
++	} else {
++		j.any_bssid = 1;
++	}
++	j.key_kind = kind;
++	j.key_len = (uint8_t)key_len;
++	if (key_len) {
++		memcpy(j.key, key, key_len);
++	}
++	return fw_request(FW_JOIN, &j, sizeof(j), &fw_join_status, 40);
++}
++
++int
++flame_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len)
++{
++	return fw_join(ssid, ssid_len, bssid, pass != NULL && pass_len ? FW_KEY_PASSPHRASE : FW_KEY_NONE, pass,
++	           pass != NULL ? pass_len : 0);
++}
++
++int
++flame_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32])
++{
++	return fw_join(ssid, ssid_len, bssid, FW_KEY_PMK, pmk, 32);
++}
++
++int
++flame_wlan_leave(void)
++{
++	return fw_request(FW_LEAVE, NULL, 0, &fw_left_status, 10);
++}
++
++bool
++flame_wlan_joined(void)
++{
++	return fw_link_up;
++}
++
++/* the network joined, as the last scan heard it (or by name alone): for a join wland made by itself */
++bool flame_wlan_link_bss(struct flame_wlan_bss *bss);
++bool
++flame_wlan_link_bss(struct flame_wlan_bss *bss)
++{
++	lck_mtx_lock(&fw_lock);
++	bool have = fw_link_up && fw_link.ssid_len > 0;
++	if (have) {
++		bzero(bss, sizeof(*bss));
++		unsigned i;
++		for (i = 0; i < fw_nbss && memcmp(fw_bss[i].bssid, fw_link.bssid, 6) != 0; i++) {
++		}
++		if (i < fw_nbss) {
++			memcpy(bss, &fw_bss[i], sizeof(*bss));
++		} else {
++			memcpy(bss->bssid, fw_link.bssid, 6);
++			memcpy(bss->ssid, fw_link.ssid, sizeof(bss->ssid));
++			bss->ssid_length = fw_link.ssid_len > 32 ? 32 : fw_link.ssid_len;
++		}
++	}
++	lck_mtx_unlock(&fw_lock);
++	return have;
++}
++
++bool
++flame_wlan_transmit(const uint8_t *frame, size_t length)
++{
++	lck_mtx_lock(&fw_lock);
++	bool ok = fw_opened && fw_link_up && fw_queue_locked(FW_TX, frame, length);
++	if (!ok) {
++		fw_tx_dropped++;
++	}
++	lck_mtx_unlock(&fw_lock);
++	return ok;
++}
++
++/* ---- /dev/wlan ---- */
++
++static int
++fw_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&fw_lock);
++	int rc = fw_opened ? EBUSY : 0;
++	if (rc == 0) {
++		fw_opened = true;
++		fw_q_head = fw_q_count = 0;
++	}
++	lck_mtx_unlock(&fw_lock);
++	return rc;
++}
++
++static int
++fw_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&fw_lock);
++	bool was_up = fw_link_up;
++	fw_opened = false;
++	fw_link_up = false;
++	fw_q_head = fw_q_count = 0;
++	wakeup(&fw_scan_status);
++	wakeup(&fw_join_status);
++	wakeup(&fw_left_status);
++	wakeup(&fw_q_count);
++	lck_mtx_unlock(&fw_lock);
++	printf("flame wlan: the radio's side closed /dev/wlan (%llu frames dropped)\n", fw_tx_dropped);
++	if (was_up && flame_wlan_link_hook != NULL) {
++		flame_wlan_link_hook(false);
++	}
++	return 0;
++}
++
++static int
++fw_read(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	static uint8_t buf[FW_MSG_MAX];         /* one reader: wland */
++	lck_mtx_lock(&fw_lock);
++	while (fw_q_count == 0) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&fw_lock);
++			return EWOULDBLOCK;
++		}
++		int e = msleep(&fw_q_count, &fw_lock, PZERO | PCATCH, "fwread", NULL);
++		if (e) {
++			lck_mtx_unlock(&fw_lock);
++			return e;
++		}
++	}
++	struct fw_hdr h = { fw_q[fw_q_head].type, fw_q[fw_q_head].len };
++	if (uio_resid(uio) < (user_ssize_t)(sizeof(h) + h.len)) {
++		lck_mtx_unlock(&fw_lock);
++		return EMSGSIZE;
++	}
++	memcpy(buf, &h, sizeof(h));
++	memcpy(buf + sizeof(h), fw_q[fw_q_head].data, h.len);
++	fw_q_head = (fw_q_head + 1) % FW_QLEN;
++	fw_q_count--;
++	lck_mtx_unlock(&fw_lock);
++	return uiomove((caddr_t)buf, (int)(sizeof(h) + h.len), uio);
++}
++
++static void
++fw_wake_status(int32_t *status, const uint8_t *p, size_t len)
++{
++	int32_t v = EIO;
++	if (len >= sizeof(v)) {
++		memcpy(&v, p, sizeof(v));
++	}
++	lck_mtx_lock(&fw_lock);
++	*status = v;
++	wakeup(status);
++	lck_mtx_unlock(&fw_lock);
++}
++
++static int
++fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	static uint8_t buf[FW_MSG_MAX];         /* one writer: wland */
++	user_ssize_t n = uio_resid(uio);
++	struct fw_hdr h;
++	if (n < (user_ssize_t)sizeof(h) || n > (user_ssize_t)sizeof(buf)) {
++		return EINVAL;
++	}
++	int e = uiomove((caddr_t)buf, (int)n, uio);
++	if (e) {
++		return e;
++	}
++	memcpy(&h, buf, sizeof(h));
++	const uint8_t *p = buf + sizeof(h);
++	if (h.len != n - (user_ssize_t)sizeof(h)) {
++		return EINVAL;
++	}
++	switch (h.type) {
++	case FW_HELLO: {
++		if (h.len < sizeof(struct fw_hello)) {
++			return EINVAL;
++		}
++		bool first = !fw_ready;
++		memcpy(fw_addr, ((const struct fw_hello *)p)->address, 6);
++		fw_ready = true;
++		printf("flame wlan: the radio is up (%02x:%02x:%02x:%02x:%02x:%02x)%s\n", fw_addr[0], fw_addr[1], fw_addr[2],
++		    fw_addr[3], fw_addr[4], fw_addr[5], first ? ": en0 for wifid" : "");
++		if (first && flame_wlan_ready_hook != NULL) {
++			flame_wlan_ready_hook();
++		}
++		break;
++	}
++	case FW_BSS_BEGIN:
++		lck_mtx_lock(&fw_lock);
++		fw_nbss = 0;
++		lck_mtx_unlock(&fw_lock);
++		break;
++	case FW_BSS: {
++		const struct fw_bss *b = (const struct fw_bss *)p;
++		if (h.len < sizeof(*b)) {
++			return EINVAL;
++		}
++		lck_mtx_lock(&fw_lock);
++		if (fw_nbss < FW_BSS_MAX) {
++			struct flame_wlan_bss *t = &fw_bss[fw_nbss++];
++			memcpy(t->bssid, b->bssid, 6);
++			memcpy(t->ssid, b->ssid, sizeof(t->ssid));
++			t->ssid_length = b->ssid_len > 32 ? 32 : b->ssid_len;
++			t->frequency = b->frequency;
++			t->rssi = b->rssi;
++			t->beacon_interval = b->beacon_interval;
++			t->capability = b->capability;
++			t->age_ms = b->age_ms;
++			t->elements_length = b->elements_len > sizeof(t->elements) ? sizeof(t->elements) : b->elements_len;
++			memcpy(t->elements, b->elements, t->elements_length);
++		}
++		lck_mtx_unlock(&fw_lock);
++		break;
++	}
++	case FW_SCAN_DONE:
++		fw_wake_status(&fw_scan_status, p, h.len);
++		break;
++	case FW_JOIN_DONE:
++		fw_wake_status(&fw_join_status, p, h.len);
++		break;
++	case FW_LEFT:
++		fw_wake_status(&fw_left_status, p, h.len);
++		break;
++	case FW_LINK: {
++		bool up = h.len >= 1 && p[0] != 0;
++		lck_mtx_lock(&fw_lock);
++		bool changed = up != fw_link_up;
++		fw_link_up = up;
++		if (up && h.len >= sizeof(fw_link)) {
++			memcpy(&fw_link, p, sizeof(fw_link));
++		}
++		lck_mtx_unlock(&fw_lock);
++		if (changed && flame_wlan_link_hook != NULL) {
++			flame_wlan_link_hook(up);
++		}
++		break;
++	}
++	case FW_RX:
++		if (h.len >= 14 && h.len <= FW_FRAME_MAX && flame_wlan_rx_hook != NULL) {
++			flame_wlan_rx_hook(p, h.len);
++		}
++		break;
++	default:
++		return EINVAL;
++	}
++	return 0;
++}
++
++static const struct cdevsw fw_cdevsw = {
++	.d_open       = fw_open,
++	.d_close      = fw_close,
++	.d_read       = fw_read,
++	.d_write      = fw_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* Boot-arg sweetwifid=0: no /dev/wlan, no en0 (wland keeps its own utun). */
++void
++flame_wlan_init(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetwifid", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	int major = cdevsw_add(-1, &fw_cdevsw);
++	if (major < 0) {
++		printf("flame wlan: cdevsw_add failed (%d)\n", major);
++		return;
++	}
++	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "wlan");
++	redwood_net_init();
++	flame_sta_init();
++	printf("flame wlan: /dev/wlan ready (major %d)\n", major);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+new file mode 100644
+index 0000000..e2674ee
+--- /dev/null
++++ b/bsd/dev/redwood_apple80211.c
+@@ -0,0 +1,739 @@
++/*
++ * Darwin-on-redwood: Apple80211, answered in the kernel.
++ *
++ * iOS's Wi-Fi side -- wifid, and through it Settings and the status bar -- talks to a Wi-Fi
++ * driver in requests that were once ioctls and are, where the driver offers no user client,
++ * ioctls still: SIOCGA80211 and SIOCSA80211 on any socket, with a struct apple80211req that
++ * names the interface, a request type, a value, and a buffer in the caller's memory
++ * (IO80211.framework: Apple80211Get/Set and their kin all end there). XNU hands an interface
++ * ioctl it does not know to the interface, so they arrive in bsd/dev/redwood_net.c, which
++ * passes them here when its link is a radio.
++ *
++ * What is asked is answered from the station boundary (sys/redwood_sta.h): the radio's power,
++ * its channels, a scan and what it heard, the network joined. What happens there by itself is
++ * told to iOS the way a driver tells it: kernel events of class 6 (IEEE 802.11), subclass 1,
++ * whose code is Apple80211's own event number and whose data begins with the interface's name
++ * in 16 bytes (IO80211.framework reads them from a PF_SYSTEM socket and compares the name).
++ *
++ * Every request is still written to the log -- who asks, get or set, the type, the value, the
++ * length -- because which of them wifid needs is found that way. Never what a request carries:
++ * a network's name or its key may be in there.
++ *
++ * The request types and the layouts are Apple's. The old ones are as the headers of its open
++ * IO80211 sources once described them (apple80211_ioctl.h, apple80211_var.h); where iOS 16.5
++ * differs the layout was read out of IO80211.framework of 16.5, which fills and reads the same
++ * structures on the other side (Apple80211GetWithIOCTL, _getScanData, _addScanResultToList,
++ * _performAssociation, _dispatchAsyncAssocEvent, _dispatchLinkChangedEvent).
++ *
++ * A join: ASSOCIATE (20) carries the network's name, perhaps its access point, and the
++ * passphrase as typed (the framework does not make the key of it), and is answered at once;
++ * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
++ * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
++ * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
++ */
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <sys/errno.h>
++#include <sys/kern_event.h>
++#include <sys/kernel.h>
++#include <sys/proc.h>
++#include <sys/redwood_input.h>
++#include <sys/redwood_net.h>
++#include <sys/redwood_sta.h>
++#include <sys/sockio.h>
++#include <sys/systm.h>
++
++#define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
++#define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
++
++struct apple80211req {
++	char req_if_name[16];
++	int32_t req_type;
++	int32_t req_val;
++	uint32_t req_len;
++	user_addr_t req_data __attribute__((aligned(8)));
++};
++
++/* (as far as they have come by: the names help reading the log) */
++static const char *
++type_name(int32_t type)
++{
++	static const struct {
++		int32_t type;
++		const char *name;
++	} names[] = {
++		{ 1, "SSID" }, { 2, "AUTH_TYPE" }, { 3, "CIPHER_KEY" }, { 4, "CHANNEL" }, { 5, "POWERSAVE" }, { 6, "PROTMODE" },
++		{ 7, "TXPOWER" }, { 8, "RATE" }, { 9, "BSSID" }, { 10, "SCAN_REQ" }, { 11, "SCAN_RESULT" }, { 12, "CARD_CAPABILITIES" },
++		{ 13, "STATE" }, { 14, "PHY_MODE" }, { 15, "OP_MODE" }, { 16, "RSSI" }, { 17, "NOISE" }, { 18, "INT_MIT" }, { 19, "POWER" },
++		{ 20, "ASSOCIATE" }, { 21, "ASSOCIATE_RESULT" }, { 22, "DISASSOCIATE" }, { 23, "STATUS_DEV_NAME" }, { 24, "IBSS_MODE" },
++		{ 25, "HOST_AP_MODE" }, { 26, "AP_MODE" }, { 27, "SUPPORTED_CHANNELS" }, { 28, "LOCALE" }, { 29, "DEAUTH" },
++		{ 30, "COUNTERMEASURES" }, { 32, "RATE_SET" }, { 42, "STATION_LIST" }, { 43, "DRIVER_VERSION" },
++		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
++		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
++		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
++		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
++		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
++	};
++
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (names[i].type == type) {
++			return names[i].name;
++		}
++	}
++	return "?";
++}
++
++/* ---- the layouts ------------------------------------------------------------------------------------------ */
++
++#define CHANNEL_20MHZ           0x2u
++#define CHANNEL_2GHZ            0x8u
++#define CHANNEL_5GHZ            0x10u
++#define CHANNEL_ACTIVE          0x80u           /* the radio may send there */
++#define CHANNEL_DFS             0x100u
++
++struct apple80211_channel {
++	uint32_t version, channel, flags;
++};
++
++/* SUPPORTED_CHANNELS (27) and HW_SUPPORTED_CHANNELS (254): 4824 bytes */
++struct apple80211_channels {
++	uint32_t version, count;
++	struct apple80211_channel channels[401];
++	uint32_t unused;
++};
++
++/* CHANNELS_INFO (207): 10016 bytes; of each channel a byte in each of several rows, and a word of flags */
++struct apple80211_channels_info {
++	uint8_t unknown_0[12];
++	uint16_t count;
++	uint8_t unknown_1[800];
++	uint8_t number[400], indoor[400], dfs[400], passive[400], wide_40[400], wide_80[400];
++	uint8_t unknown_2[1602];
++	uint32_t flags[400];
++	uint8_t unknown_3[3600];
++} __attribute__((packed));
++
++/* SCAN_REQ (10): 5456 bytes */
++struct apple80211_scan_request {
++	uint32_t version, bss_type;
++	uint8_t bssid[6], unused_0[2];
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint32_t scan_type;                     /* 1: asking, 2: listening only */
++	uint32_t phy_mode;
++	uint16_t dwell_ms, unused_1;
++	uint32_t rest_ms;
++	uint32_t channel_count;
++	struct apple80211_channel channels[400];
++	uint64_t flags;
++	uint32_t unused_2;
++	uint32_t name_count;                    /* networks asked for by name, each in 56 bytes */
++	uint8_t names[10][56];
++	uint32_t short_ssid, unused_3;
++};
++
++/* SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes */
++struct apple80211_scan_result {
++	uint32_t version;
++	struct apple80211_channel channel;
++	uint16_t noise_known;
++	int16_t noise, snr, rssi;
++	uint16_t beacon_interval, capability;
++	uint8_t bssid[6];
++	uint8_t rate_count, unused_0;
++	uint32_t rates[15];                     /* Mbit/s */
++	uint8_t ssid_length, ssid[32], unused_1[3];
++	uint32_t age_ms;
++	uint8_t flags, unused_2;
++	uint16_t elements_length;               /* comes in as the room there is */
++	uint8_t elements[1024];
++};
++
++/* ASSOCIATE (20): 592 bytes; of what follows the key (the RSN element wifid built, flags) nothing is used */
++struct apple80211_assoc {
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;   /* cipher 10: a passphrase as typed; 6: the key (from 64 hex digits) */
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
++	uint8_t rest[0x250 - 0x88];
++};
++
++#define CIPHER_PMK              6
++#define CIPHER_PASSPHRASE       10
++
++/* the link event's data (at least 32 bytes, or the framework drops the event) */
++struct apple80211_link_changed {
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
++_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
++    "the association request as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
++    "the link event as iOS 16.5 reads it");
++_Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
++    offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_scan_request) == 5456 && offsetof(struct apple80211_scan_request, channels) == 0x48 &&
++    offsetof(struct apple80211_scan_request, flags) == 0x1308 && offsetof(struct apple80211_scan_request, names) == 0x1318,
++    "the scan request as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
++    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
++    "a scan's result as iOS 16.5 has it");
++
++/* Apple80211's events (APPLE80211_M_...) */
++enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
++       EVENT_SCAN_DONE = 10 };
++
++static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
++
++static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
++static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
++static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
++static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
++
++/* ---- channels ---------------------------------------------------------------------------------------- */
++
++static unsigned
++channel_number(unsigned frequency)
++{
++	return frequency == 2484 ? 14 : frequency < 4000 ? (frequency - 2407) / 5 : (frequency - 5000) / 5;
++}
++
++static unsigned
++channel_frequency(const struct apple80211_channel *channel)
++{
++	bool low = channel->flags & CHANNEL_2GHZ ? true : channel->flags & CHANNEL_5GHZ ? false : channel->channel <= 14;
++
++	if (channel->channel == 0 || channel->channel > 196 || (channel->flags & 0x2000)) {     /* (0x2000: 6 GHz) */
++		return 0;
++	}
++	return low ? (channel->channel == 14 ? 2484 : 2407 + 5 * channel->channel) : 5000 + 5 * channel->channel;
++}
++
++static void
++channel_fill(struct apple80211_channel *channel, unsigned frequency, unsigned flags)
++{
++	channel->version = 1;
++	channel->channel = channel_number(frequency);
++	channel->flags = CHANNEL_20MHZ | (frequency < 4000 ? CHANNEL_2GHZ : CHANNEL_5GHZ) | (flags & REDWOOD_STA_CHANNEL_PASSIVE ?
++	    0 : CHANNEL_ACTIVE) | (flags & REDWOOD_STA_CHANNEL_RADAR ? CHANNEL_DFS : 0);
++}
++
++/* ---- what the caller is given back ------------------------------------------------------------------- */
++
++/* At most as many bytes as it has room for. */
++static int
++give(const struct apple80211req *request, const void *data, size_t length)
++{
++	return request->req_data == USER_ADDR_NULL ? 0 : copyout(data, request->req_data, length < request->req_len ? length :
++	       request->req_len);
++}
++
++/* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
++static int
++give_network(const struct apple80211req *request, const struct redwood_sta_bss *bss)
++{
++	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
++	unsigned room = sizeof(result->elements);
++	int error;
++
++	if (result == NULL) {
++		return ENOMEM;
++	}
++	if (request->req_len >= sizeof(*result) && copyin(request->req_data, result, offsetof(struct apple80211_scan_result,
++	    elements)) == 0 && result->elements_length < room) {
++		room = result->elements_length;
++	}
++	bzero(result, sizeof(*result));
++	result->version = 1;
++	channel_fill(&result->channel, bss->frequency, 0);
++	result->rssi = bss->rssi;
++	result->beacon_interval = bss->beacon_interval;
++	result->capability = bss->capability;
++	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
++	result->ssid_length = bss->ssid_length;
++	memcpy(result->ssid, bss->ssid, bss->ssid_length);
++	result->age_ms = bss->age_ms;
++	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
++	memcpy(result->elements, bss->elements, result->elements_length);
++	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
++	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
++	    at += 2 + bss->elements[at + 1]) {
++		for (unsigned i = 0; (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1]; i++) {
++			unsigned rate = (bss->elements[at + 2 + i] & 0x7f) / 2;
++
++			if (rate != 0 && rate <= 54 && result->rate_count < 15) {
++				result->rates[result->rate_count++] = rate;
++			}
++		}
++	}
++	error = give(request, result, sizeof(*result));
++	kfree_data(result, sizeof(*result));
++	return error;
++}
++
++/* ---- get ---------------------------------------------------------------------------------------------- */
++
++static int
++get(struct apple80211req *request)
++{
++	struct redwood_sta_state *state;
++	int error = 0;
++
++	switch (request->req_type) {
++	case 43:
++	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
++		static const char name[256] = "redwood: ath11k for the WCN6750";
++
++		return give(request, name, sizeof(name));
++	}
++	case 12: {
++		/*
++		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
++		 * bits alone, from the first (the framework hands in a buffer that begins after the old
++		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
++		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
++		 * for a WPA2 network ("Unable to join").
++		 */
++		uint8_t bits[13] = { 0 };
++		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++
++		for (unsigned i = 0; i < sizeof(has); i++) {
++			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
++		}
++		return give(request, bits, sizeof(bits));
++	}
++	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */
++		struct {                        /* is being brought up, and iOS asks this once, early */
++			uint32_t version, radios, state[4];
++		} answer = { .version = 1, .radios = 1, .state = { !redwood_sta_present() || redwood_sta_powered() } };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
++		request->req_val = 1;
++		return 0;
++	case 27:
++	case 254: {                             /* the channels the radio may tune to */
++		struct apple80211_channels *answer;
++		struct redwood_sta_channel channels[96];
++		unsigned count = redwood_sta_channels(channels, 96);
++
++		if (count == 0 || (answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO)) == NULL) {
++			return count == 0 ? ENXIO : ENOMEM;
++		}
++		answer->version = 1;
++		answer->count = count;
++		for (unsigned i = 0; i < count; i++) {
++			channel_fill(&answer->channels[i], channels[i].frequency, channels[i].flags);
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 207: {                             /* ... and more of each */
++		struct apple80211_channels_info *answer;
++		struct redwood_sta_channel channels[96];
++		unsigned count = redwood_sta_channels(channels, 96);
++
++		if (count == 0 || (answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO)) == NULL) {
++			return count == 0 ? ENXIO : ENOMEM;
++		}
++		answer->count = (uint16_t)count;
++		for (unsigned i = 0; i < count; i++) {
++			struct apple80211_channel channel;
++
++			channel_fill(&channel, channels[i].frequency, channels[i].flags);
++			answer->number[i] = (uint8_t)channel.channel;
++			answer->dfs[i] = (channels[i].flags & REDWOOD_STA_CHANNEL_RADAR) != 0;
++			answer->passive[i] = (channels[i].flags & REDWOOD_STA_CHANNEL_PASSIVE) != 0;
++			answer->flags[i] = channel.flags;
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 21:                                /* how the last join went (0: not over yet) */
++		lck_mtx_lock(&apple80211_lock);
++		request->req_val = (int32_t)join_result;
++		lck_mtx_unlock(&apple80211_lock);
++		return 0;
++	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
++		struct redwood_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
++		unsigned index;
++		bool there;
++
++		if (bss == NULL) {
++			return ENOMEM;
++		}
++		lck_mtx_lock(&apple80211_lock);
++		index = result_next++;
++		lck_mtx_unlock(&apple80211_lock);
++		there = redwood_sta_heard(index, bss);
++		error = there ? give_network(request, bss) : EIO;
++		kfree_data(bss, sizeof(*bss));
++		return error;
++	}
++	default:
++		break;
++	}
++
++	/* the rest is about the network joined, and there is none unless the station says so */
++	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
++		return ENOMEM;
++	}
++	redwood_sta_state(state);
++	switch (request->req_type) {
++	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
++		request->req_val = state->phase == REDWOOD_STA_JOINED ? 4 : state->phase == REDWOOD_STA_JOINING ? 2 :
++		    state->phase == REDWOOD_STA_SCANNING ? 1 : 0;
++		break;
++	case 1:                                 /* its name; the length goes back in the request */
++		if (state->phase != REDWOOD_STA_JOINED) {
++			error = ENXIO;
++		} else if ((error = give(request, state->bss.ssid, state->bss.ssid_length)) == 0) {
++			request->req_len = state->bss.ssid_length;
++		}
++		break;
++	case 9:                                 /* its access point's address */
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, state->bss.bssid, 6);
++		break;
++	case 4: {                               /* its channel */
++		struct {
++			uint32_t version;
++			struct apple80211_channel channel;
++		} answer = { .version = 1 };
++
++		if (state->phase != REDWOOD_STA_JOINED) {
++			error = ENXIO;
++		} else {
++			channel_fill(&answer.channel, state->bss.frequency, 0);
++			error = give(request, &answer, sizeof(answer));
++		}
++		break;
++	}
++	case 16: {                              /* how strongly it is heard: dBm, per radio and all together, twice over */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
++			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 103:                               /* all of it, as a scan's result */
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
++		break;
++	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
++		struct {
++			uint32_t version, lower, upper, extended;
++		} answer = { .version = 1, .lower = 1, .upper = 8 };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	default:
++		error = EOPNOTSUPP;
++		break;
++	}
++	kfree_data(state, sizeof(*state));
++	return error;
++}
++
++/* ---- set ---------------------------------------------------------------------------------------------- */
++
++static int
++set_scan(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_scan_request *asked;
++	struct redwood_sta_scan *what;
++	unsigned unknown = 0;
++	int error;
++
++	if (request->req_len != sizeof(*asked)) {
++		return EINVAL;
++	}
++	if (!redwood_sta_present()) {
++		return EBUSY;                   /* (the radio is still being brought up: the framework tries again) */
++	}
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK);
++	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
++	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, sizeof(*asked))) != 0) {
++		error = asked == NULL || what == NULL ? ENOMEM : error;
++		goto out;
++	}
++	if (asked->ssid_length <= sizeof(what->ssid)) {
++		what->ssid_length = (uint8_t)asked->ssid_length;
++		memcpy(what->ssid, asked->ssid, asked->ssid_length);
++	}
++	what->passive = asked->scan_type == 2;
++	what->dwell_ms = asked->dwell_ms;
++	/* (more channels than there is room to name: every channel) */
++	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
++		unsigned frequency = channel_frequency(&asked->channels[i]);
++
++		if (frequency != 0) {
++			what->frequencies[what->frequency_count++] = (uint16_t)frequency;
++		} else {
++			unknown++;
++		}
++	}
++	snprintf(said, said_size, " (a scan: type %u, %u channels of which %u are not the radio's, %u ms on each, a name of %u bytes, "
++	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown, asked->dwell_ms, asked->ssid_length,
++	    asked->name_count, asked->flags);
++	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
++		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
++	} else {
++		lck_mtx_lock(&apple80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&apple80211_lock);
++		error = redwood_sta_ask_scan(what);
++	}
++out:
++	if (asked != NULL) {
++		kfree_data(asked, sizeof(*asked));
++	}
++	if (what != NULL) {
++		kfree_data(what, sizeof(*what));
++	}
++	return error;
++}
++
++static int
++set_join(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_assoc *asked;
++	struct redwood_sta_join *what;
++	int error;
++
++	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
++		return EINVAL;
++	}
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
++	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
++	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
++		error = asked == NULL || what == NULL ? ENOMEM : error;
++		goto out;
++	}
++	/* (lengths and kinds only: the name, the access point and the key stay out of the log) */
++	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, a key of %u bytes of kind %u)",
++	    asked->ssid_length, asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] | asked->bssid[4] |
++	    asked->bssid[5] ? "a given" : "any", asked->auth_lower, asked->auth_upper, asked->key_length, asked->key_cipher);
++	if (asked->ssid_length == 0 || asked->ssid_length > sizeof(what->ssid)) {
++		error = EINVAL;
++		goto out;
++	}
++	what->ssid_length = (uint8_t)asked->ssid_length;
++	memcpy(what->ssid, asked->ssid, asked->ssid_length);
++	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
++	if (asked->key_length == 0) {
++		what->security = REDWOOD_STA_OPEN;
++	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
++		what->security = REDWOOD_STA_WPA2_PSK;
++		what->passphrase_length = (uint8_t)asked->key_length;
++		memcpy(what->passphrase, asked->key, asked->key_length);
++	} else if (asked->key_cipher == CIPHER_PMK && asked->key_length == sizeof(what->pmk)) {
++		what->security = REDWOOD_STA_WPA2_PSK;
++		memcpy(what->pmk, asked->key, sizeof(what->pmk));
++	} else {
++		error = EINVAL;
++		goto out;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	join_result = 0;
++	lck_mtx_unlock(&apple80211_lock);
++	error = redwood_sta_ask_join(what);
++out:
++	if (asked != NULL) {
++		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
++		kfree_data(asked, sizeof(*asked));
++	}
++	if (what != NULL) {
++		memset_s(what, sizeof(*what), 0, sizeof(*what));
++		kfree_data(what, sizeof(*what));
++	}
++	return error;
++}
++
++static int
++set(const struct apple80211req *request, char *said, size_t said_size)
++{
++	switch (request->req_type) {
++	case 20:
++		return set_join(request, said, said_size);
++	case 22:                                /* leave the network */
++		return redwood_sta_ask_leave();
++	case 19: {                              /* the radio's power */
++		struct {
++			uint32_t version, radios, state[4];
++		} asked;
++		int error;
++
++		if (request->req_len < sizeof(asked) || (error = copyin(request->req_data, &asked, sizeof(asked))) != 0) {
++			return request->req_len < sizeof(asked) ? EINVAL : error;
++		}
++		snprintf(said, said_size, " (power: %s)", asked.state[0] ? "on" : "off");
++		return redwood_sta_ask_power(asked.state[0] != 0);
++	}
++	case 10:
++		return set_scan(request, said, said_size);
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++/* ---- events -------------------------------------------------------------------------------------------- */
++
++static void
++post(uint32_t code, const void *data, uint32_t length)
++{
++	struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS, .kev_subclass = 1,
++		                   .event_code = code };
++	char name[16];
++
++	memcpy(name, interface_name, sizeof(name));
++	message.dv[0].data_length = sizeof(name);
++	message.dv[0].data_ptr = name;
++	if (length != 0) {
++		message.dv[1].data_length = length;
++		message.dv[1].data_ptr = __DECONST(void *, data);
++	}
++	kev_post_msg(&message);
++}
++
++/* What the station side says has happened (bsd/dev/redwood_sta.c calls this, on its thread or the station's). */
++void
++redwood_apple80211_event(enum redwood_sta_event event, int status)
++{
++	static unsigned said;
++
++	if (said < 200) {
++		said++;
++		printf("apple80211: the station says: %s, %d\n", event == REDWOOD_STA_POWER ? "power" : event == REDWOOD_STA_SCAN_DONE ?
++		    "a scan is over" : event == REDWOOD_STA_JOIN_DONE ? "a join is over" : "the link", status);
++	}
++	switch (event) {
++	case REDWOOD_STA_POWER:
++		post(EVENT_POWER_CHANGED, NULL, 0);
++		break;
++	case REDWOOD_STA_SCAN_DONE:
++		lck_mtx_lock(&apple80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&apple80211_lock);
++		post(EVENT_SCAN_DONE, NULL, 0);
++		break;
++	case REDWOOD_STA_JOIN_DONE:
++		lck_mtx_lock(&apple80211_lock);
++		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
++		lck_mtx_unlock(&apple80211_lock);
++		post(EVENT_ASSOC_DONE, NULL, 0);
++		break;
++	case REDWOOD_STA_LINK: {
++		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
++			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
++		struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++
++		if (state != NULL) {
++			redwood_sta_state(state);
++			link.rssi = status == 1 ? state->bss.rssi : 0;
++			kfree_data(state, sizeof(*state));
++		}
++		post(EVENT_SSID_CHANGED, NULL, 0);
++		post(EVENT_BSSID_CHANGED, NULL, 0);
++		post(EVENT_LINK_CHANGED, &link, sizeof(link));
++		break;
++	}
++	}
++}
++
++/* ---- the requests as they arrive --------------------------------------------------------------------- */
++
++/*
++ * How often each kind of request came and how it fared: said when the run ends, because the
++ * lines said along the way can be lost with the middle of a long log.
++ */
++static struct {
++	int32_t type;
++	bool set;
++	unsigned times, answered;
++	int last_error;
++} kinds[96];
++static unsigned kind_count;
++
++static void
++note(const struct apple80211req *request, bool is_set, int error)
++{
++	unsigned i;
++
++	lck_mtx_lock(&apple80211_lock);
++	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
++	}
++	if (i < sizeof(kinds) / sizeof(kinds[0])) {
++		if (i == kind_count) {
++			kinds[kind_count++] = (typeof(kinds[0])) { .type = request->req_type, .set = is_set };
++		}
++		kinds[i].times++;
++		kinds[i].answered += error == 0;
++		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
++	}
++	lck_mtx_unlock(&apple80211_lock);
++}
++
++void
++redwood_apple80211_summary(void)
++{
++	static bool said;
++
++	if (said) {
++		return;
++	}
++	said = true;
++	for (unsigned i = 0; i < kind_count; i++) {
++		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
++		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
++		if (kinds[i].last_error != 0) {
++			printf("; the last refusal: %d%s\n", kinds[i].last_error, kinds[i].last_error == EOPNOTSUPP ? " (not built)" : "");
++		}
++	}
++}
++
++/* An Apple80211 request for the radio's interface, from the process that is running now. */
++errno_t
++redwood_apple80211_ioctl(u_long command, void *data)
++{
++	static unsigned said;
++	struct apple80211req *request = data;
++	char who[32] = "?", what[200] = "";
++	bool is_set = command == SIOCSA80211;
++	int error;
++
++	if (command != SIOCSA80211 && command != SIOCGA80211) {
++		return EOPNOTSUPP;
++	}
++	proc_selfname(who, sizeof(who));
++	error = is_set ? set(request, what, sizeof(what)) : get(request);
++	note(request, is_set, error);
++	/* (a request that is repeated for ever is said a few hundred times) */
++	if (said < 800) {
++		said++;
++		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
++		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
++		    EOPNOTSUPP ? "REFUSED\n" : "");
++		if (error != 0 && error != EOPNOTSUPP) {
++			printf("error %d\n", error);
++		}
++	}
++	return error;
++}
+diff --git a/bsd/dev/redwood_net.c b/bsd/dev/redwood_net.c
+new file mode 100644
+index 0000000..e7b46fd
+--- /dev/null
++++ b/bsd/dev/redwood_net.c
+@@ -0,0 +1,376 @@
++/*
++ * en0: a network interface that is Ethernet as far as the rest of the kernel and iOS can tell.
++ *
++ * iOS expects its interfaces from IONetworkingFamily, which this kernel does not have; the BSD
++ * half of the kernel does not need it. The interface is made with the kernel's own interface
++ * KPI, the way bsd/net/if_fake.c makes its "feth": family Ethernet, the stock Ethernet framing
++ * and demultiplexing, one function that is given a frame to send and one call to hand a frame
++ * that has arrived to the stack. What iOS's user space makes of an interface that has no
++ * IOKit object behind it is another matter: see userland/src/net_test.m.
++ *
++ * What carries the frames is a link driver's business; sys/redwood_net.h is all that the two
++ * know of each other. The first link is QEMU's virtio network device (redwood_virtio_net.c).
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <net/bpf.h>
++#include <net/ethernet.h>
++#include <net/if.h>
++#include <net/if_ether.h>
++#include <net/if_media.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++#include <netinet/in.h>
++#include <pexpert/pexpert.h>
++#include <sys/kern_event.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/proc.h>
++#include <sys/redwood_net.h>
++#include <sys/sockio.h>
++#include <sys/systm.h>
++
++extern void RedwoodWLANStart(const char *interface, const uint8_t *address);  /* iokit/Kernel/RedwoodWLAN.cpp */
++
++static LCK_GRP_DECLARE(net_lck_grp, "redwood-net");
++static LCK_MTX_DECLARE(net_tx_lock, &net_lck_grp);
++static const struct redwood_net_link *net_link;
++static bool net_link_up;
++static ifnet_t net_ifp;
++
++/* What has gone through: said once a minute while anything moves. */
++static struct {
++	uint64_t sent, received, sent_bytes, received_bytes, dropped_out, dropped_in;
++} net_count;
++
++/*
++ * Boot-arg net_trace=N: a line in the log for each of the first N frames, either way.
++ * Boot-arg net_names=1: a line for every name asked of a DNS server and for every TCP connection
++ * begun from here -- which is how to see what a system that has just been given a network does
++ * with it (up to NAMES_MAX lines).
++ */
++#define NAMES_MAX       3000
++static uint32_t net_trace, net_names;
++
++static void
++trace_frame(const char *way, const uint8_t *frame, size_t length, size_t whole)
++{
++	static uint32_t said, names;
++	const uint8_t *end = frame + length, *ip = frame + ETHER_HDR_LEN, *l4;
++	uint16_t type;
++	bool ports;
++
++	if (length < ETHER_HDR_LEN + 28 || (said >= net_trace && (!net_names || names >= NAMES_MAX))) {
++		return;
++	}
++	type = (uint16_t)(frame[12] << 8 | frame[13]);
++	l4 = ip + 4 * (ip[0] & 0xf);
++	ports = type == ETHERTYPE_IP && (ip[9] == IPPROTO_TCP || ip[9] == IPPROTO_UDP) && l4 + 4 <= end;
++	if (net_names && names < NAMES_MAX && ports && way[0] == 'o') {
++		if (ip[9] == IPPROTO_UDP && (l4[2] << 8 | l4[3]) == 53 && l4 + 8 + 12 < end) {
++			char name[128];
++			const uint8_t *label = l4 + 8 + 12;
++			size_t n = 0;
++
++			/* the question: lengths and labels, up to a zero */
++			while (label < end && *label != 0 && *label < 64 && label + 1 + *label < end && n + *label + 2 < sizeof(name)) {
++				memcpy(name + n, label + 1, *label);
++				n += *label;
++				name[n++] = '.';
++				label += 1 + *label;
++			}
++			name[n ? n - 1 : 0] = 0;
++			names++;
++			printf("net: asks for the name %s (type %u)\n", name, label + 2 < end ? label[1] << 8 | label[2] : 0);
++		} else if (ip[9] == IPPROTO_TCP && l4 + 14 <= end && (l4[13] & 0x12) == 0x02) {
++			names++;
++			printf("net: connects to %u.%u.%u.%u port %u\n", ip[16], ip[17], ip[18], ip[19], l4[2] << 8 | l4[3]);
++		}
++	}
++	if (said >= net_trace) {
++		return;
++	}
++	said++;
++	if (type == ETHERTYPE_IP) {
++		printf("net: %s %zu bytes: IPv4 %s %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u%s\n", way, whole, ip[9] == IPPROTO_TCP ? "TCP" :
++		    ip[9] == IPPROTO_UDP ? "UDP" : ip[9] == IPPROTO_ICMP ? "ICMP" : "protocol?", ip[12], ip[13], ip[14], ip[15],
++		    ports ? l4[0] << 8 | l4[1] : 0, ip[16], ip[17], ip[18], ip[19], ports ? l4[2] << 8 | l4[3] : 0,
++		    ip[9] == IPPROTO_TCP && ports && l4 + 14 <= end ? (l4[13] & 2 ? " SYN" : l4[13] & 1 ? " FIN" : l4[13] & 4 ? " RST" : "") : "");
++	} else {
++		printf("net: %s %zu bytes: %s (type %#x) to %02x:%02x:%02x:%02x:%02x:%02x\n", way, whole, type == ETHERTYPE_ARP ? "ARP" :
++		    type == ETHERTYPE_IPV6 ? "IPv6" : "?", type, frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]);
++	}
++}
++
++/* ... of a frame on its way out: the start of it is enough */
++static void
++trace_packet(mbuf_t packet, size_t length)
++{
++	uint8_t start[192];
++	size_t have = length < sizeof(start) ? length : sizeof(start);
++
++	if ((net_trace || net_names) && mbuf_copydata(packet, 0, have, start) == 0) {
++		trace_frame("out", start, have, length);
++	}
++}
++
++/* ---- the interface -------------------------------------------------------------------------------- */
++
++/* The stack has a frame to send (a chain of mbufs that starts with the Ethernet header). */
++static errno_t
++net_output(ifnet_t ifp, mbuf_t packet)
++{
++	size_t length = mbuf_pkthdr_len(packet);
++	bool sent = false;
++
++	if (length <= REDWOOD_NET_FRAME_MAX && net_link_up) {
++		bpf_tap_out(ifp, DLT_EN10MB, packet, NULL, 0);
++		trace_packet(packet, length);
++		lck_mtx_lock(&net_tx_lock);
++		sent = net_link->transmit(packet, length);
++		lck_mtx_unlock(&net_tx_lock);
++	}
++	if (sent) {
++		net_count.sent++;
++		net_count.sent_bytes += length;
++		ifnet_stat_increment_out(ifp, 1, (uint32_t)length, 0);
++	} else {
++		net_count.dropped_out++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	}
++	mbuf_freem(packet);
++	return 0;
++}
++
++/* A frame has arrived. */
++void
++redwood_net_input(const uint8_t *frame, size_t length)
++{
++	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (uint32_t)length };
++	unsigned int chunks = 1;
++	mbuf_t packet = NULL;
++	char *header;
++
++	trace_frame("in ", frame, length, length);
++	if (net_ifp == NULL || length < ETHER_HDR_LEN || length > REDWOOD_NET_FRAME_MAX ||
++	    mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) != 0) {
++		net_count.dropped_in++;
++		return;
++	}
++	if (mbuf_copyback(packet, 0, length, frame, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(packet);
++		net_count.dropped_in++;
++		return;
++	}
++	/* as every Ethernet driver hands a frame up: the header noted and stepped over */
++	header = mbuf_data(packet);
++	mbuf_pkthdr_setrcvif(packet, net_ifp);
++	mbuf_pkthdr_setheader(packet, header);
++	mbuf_pkthdr_adjustlen(packet, -ETHER_HDR_LEN);
++	mbuf_setdata(packet, header + ETHER_HDR_LEN, length - ETHER_HDR_LEN);
++	bpf_tap_in(net_ifp, DLT_EN10MB, packet, header, ETHER_HDR_LEN);
++	net_count.received++;
++	net_count.received_bytes += length;
++	ifnet_input(net_ifp, packet, &stats);
++}
++
++static unsigned net_ioctls_said;
++
++static errno_t
++net_ioctl(ifnet_t ifp, u_long command, void *data)
++{
++	/* (a radio says it is one here too: IO80211.framework lists the interfaces whose media is 802.11) */
++	const int media[] = { (net_link->wireless ? IFM_IEEE80211 : IFM_ETHER) | IFM_AUTO };
++	struct ifreq *request = data;
++	struct ifmediareq *media_request = data;
++	user_addr_t list;
++	errno_t error = 0;
++
++	if (net_link->wireless && net_ioctls_said < 80) {
++		char who[32] = "?";
++
++		/* (while iOS's Wi-Fi side is being got to talk to this: who asks the interface what) */
++		proc_selfname(who, sizeof(who));
++		if (strcmp(who, "configd") != 0) {
++			net_ioctls_said++;
++			printf("net: en0 is asked %#lx by %s\n", command, who);
++		}
++	}
++	switch (command) {
++	case SIOCSIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		break;
++	case SIOCSIFFLAGS:
++		/* running whenever it is up: the link is there or it is not, nothing is switched on */
++		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
++		break;
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64:
++		/* what configd asks to learn whether the cable is in */
++		list = command == SIOCGIFMEDIA64 ? ((struct ifmediareq64 *)media_request)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)media_request)->ifmu_ulist);
++		media_request->ifm_active = media_request->ifm_current = media[0];
++		media_request->ifm_mask = 0;
++		media_request->ifm_status = IFM_AVALID | (net_link_up ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && media_request->ifm_count > 0) {
++			error = copyout(media, list, sizeof(media));
++		}
++		media_request->ifm_count = 1;
++		break;
++	case SIOCGIFDEVMTU:
++		request->ifr_devmtu.ifdm_current = ifnet_mtu(ifp);
++		request->ifr_devmtu.ifdm_max = ETHERMTU;
++		request->ifr_devmtu.ifdm_min = IF_MINMTU;
++		break;
++	case SIOCSIFMTU:
++		error = request->ifr_mtu > ETHERMTU || request->ifr_mtu < IF_MINMTU ? EINVAL : ifnet_set_mtu(ifp, request->ifr_mtu);
++		break;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		break;                          /* the link hands us everything anyway */
++	default:
++		/* what iOS's Wi-Fi side asks of a radio's interface: bsd/dev/redwood_apple80211.c */
++		error = net_link->wireless ? redwood_apple80211_ioctl(command, data) : EOPNOTSUPP;
++		break;
++	}
++	return error;
++}
++
++/* Tell whoever listens for kernel events (configd does) that the link is up, or down. */
++static void
++net_link_event(ifnet_t ifp, uint32_t code)
++{
++	_Alignas(struct kern_event_msg) char message[sizeof(struct kern_event_msg) + sizeof(struct net_event_data)] = { 0 };
++	struct kern_event_msg *header = (struct kern_event_msg *)message;
++	struct net_event_data *about = (struct net_event_data *)(header + 1);
++
++	header->total_size = sizeof(message);
++	header->vendor_code = KEV_VENDOR_APPLE;
++	header->kev_class = KEV_NETWORK_CLASS;
++	header->kev_subclass = KEV_DL_SUBCLASS;
++	header->event_code = code;
++	about->if_family = ifnet_family(ifp);
++	about->if_unit = ifnet_unit(ifp);
++	strlcpy(about->if_name, ifnet_name(ifp), IFNAMSIZ);
++	ifnet_event(ifp, header);
++}
++
++void
++redwood_net_link_state(bool up)
++{
++	if (net_ifp == NULL || up == net_link_up) {
++		return;
++	}
++	net_link_up = up;
++	printf("net: the link (%s) is %s\n", net_link->name, up ? "up" : "down");
++	net_link_event(net_ifp, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
++}
++
++/* The interface's own thread: for a link that wants to be asked, and for the minute's line in the log. */
++static void
++net_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	uint64_t said = 0, total;
++	unsigned quiet = 0;
++
++	for (unsigned tick = 1;; tick++) {
++		quiet = net_link->poll != NULL && net_link->poll() ? 0 : quiet + 1;
++		/* about once a minute, if anything has moved since */
++		total = net_count.sent + net_count.received + net_count.dropped_out + net_count.dropped_in;
++		if (tick % 8192 == 0 && total != said) {
++			said = total;
++			printf("net: so far %llu frames sent (%llu bytes), %llu received (%llu bytes); dropped: %llu out, %llu in\n",
++			    net_count.sent, net_count.sent_bytes, net_count.received, net_count.received_bytes,
++			    net_count.dropped_out, net_count.dropped_in);
++		}
++		delay_for_interval(quiet < 100 ? 2 : 10, NSEC_PER_MSEC);
++	}
++}
++
++bool
++redwood_net_attach(const struct redwood_net_link *link)
++{
++	struct ifnet_init_eparams init = {
++		.ver = IFNET_INIT_CURRENT_VERSION,
++		.len = sizeof(init),
++		/*
++		 * The simple model: every frame straight to net_output(). And no Skywalk "nexus" made for
++		 * the interface by itself: sockets are all that is asked of it so far.
++		 */
++		.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO,
++		.uniqueid = "redwood-en0",
++		.uniqueid_len = 11,
++		.name = "en",
++		.unit = 0,
++		.family = IFNET_FAMILY_ETHERNET,
++		.subfamily = link->wireless ? IFNET_SUBFAMILY_WIFI : IFNET_SUBFAMILY_ANY,
++		.type = IFT_ETHER,
++		.output = net_output,
++		.demux = ether_demux,
++		.add_proto = ether_add_proto,
++		.del_proto = ether_del_proto,
++		.check_multi = ether_check_multi,
++		.framer_extended = ether_frameout_extended,
++		.ioctl = net_ioctl,
++		.broadcast_addr = etherbroadcastaddr,
++		.broadcast_len = ETHER_ADDR_LEN,
++	};
++	const uint8_t *address = link->address;
++	ifnet_t ifp = NULL;
++	thread_t thread;
++	errno_t error;
++
++	if (net_link != NULL) {
++		printf("net: en0 is on %s already; %s is not attached\n", net_link->name, link->name);
++		return false;
++	}
++	net_link = link;
++	net_link_up = link->up;
++	error = ifnet_allocate_extended(&init, &ifp);
++	if (error != 0) {
++		printf("net: the interface cannot be made: error %d\n", error);
++		net_link = NULL;
++		return false;
++	}
++	ifnet_set_capabilities_enabled(ifp, 0, -1);
++	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	ifnet_set_baudrate(ifp, 100 * 1000 * 1000);
++	ifnet_set_mtu(ifp, ETHERMTU);
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	ifnet_set_offload(ifp, 0);
++	error = ifnet_attach(ifp, NULL);
++	if (error != 0) {
++		printf("net: the interface cannot be attached: error %d\n", error);
++		ifnet_release(ifp);
++		net_link = NULL;
++		return false;
++	}
++	ifnet_set_lladdr(ifp, address, ETHER_ADDR_LEN);
++	bpfattach(ifp, DLT_EN10MB, ETHER_HDR_LEN);
++	net_ifp = ifp;
++	if (net_link_up) {
++		net_link_event(ifp, KEV_DL_LINK_ON);
++	}
++	if (link->wireless) {
++		/* (a radio's address is the phone's own: not for the log; and iOS's Wi-Fi side finds the interface by a service) */
++		printf("net: en0 attached on %s (a radio), link %s\n", link->name, net_link_up ? "up" : "down");
++		RedwoodWLANStart("en0", address);
++	} else {
++		printf("net: en0 attached on %s, address %02x:%02x:%02x:%02x:%02x:%02x, link %s\n", link->name, address[0],
++		    address[1], address[2], address[3], address[4], address[5], net_link_up ? "up" : "down");
++	}
++	if (kernel_thread_start(net_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	return true;
++}
++
++void
++redwood_net_init(void)
++{
++	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
++	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
++}
+diff --git a/bsd/dev/redwood_sta.c b/bsd/dev/redwood_sta.c
+new file mode 100644
+index 0000000..f4e0490
+--- /dev/null
++++ b/bsd/dev/redwood_sta.c
+@@ -0,0 +1,371 @@
++/*
++ * Darwin-on-redwood: what stands between the two sides of the station boundary
++ * (sys/redwood_sta.h).
++ *
++ * Whoever wants a network asks from wherever it happens to be: an ioctl of wifid's, the thread
++ * that brings the radio up. The station side wants to be called by one thread, one call at a
++ * time, and a scan or a join takes seconds. So what is asked for is noted here and done by a
++ * thread of this file's; the asker returns at once and hears the outcome as an event. One
++ * request of each kind can wait: a second scan asked for while the first has not begun
++ * replaces it, as does a second join.
++ *
++ * What the last scan heard is kept here, so that it can be read without entering the station
++ * side, and so is the list of channels.
++ *
++ * The network the kernel was given in a file is a standing request: joined at the start, and
++ * again whenever the radio is turned back on (Settings' switch), until somebody asks for
++ * another network -- as iOS itself rejoins the networks it knows. If that other network cannot
++ * be joined (a wrong passphrase), the standing one is joined again.
++ */
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <sys/errno.h>
++#include <sys/redwood_input.h>
++#include <sys/redwood_sta.h>
++#include <sys/systm.h>
++
++extern void thread_set_thread_name(thread_t thread, const char *name);
++
++#define HEARD_MOST      128
++#define CHANNELS_MOST   96
++
++static LCK_GRP_DECLARE(sta_lock_group, "redwood-sta");
++static LCK_MTX_DECLARE(sta_lock, &sta_lock_group);
++
++static const struct redwood_sta_ops *sta_ops;   /* the station side, while there is one */
++static bool sta_thread_made;
++static bool sta_calls;                          /* the thread is in a call of the station side's */
++static unsigned sta_reads;                      /* ... and so many others are in its state() */
++static bool sta_on;                             /* the radio's power, as last asked for */
++
++/* what has been asked for and not begun */
++static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
++static struct redwood_sta_scan asked_scan_what;
++static struct redwood_sta_join asked_join_what;
++static struct redwood_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
++static struct redwood_sta_join fallback;        /* ... as it was before a join that has not come through yet */
++
++static struct redwood_sta_bss *heard;           /* by the last scan that came to an end */
++static unsigned heard_count;
++static struct redwood_sta_channel channels[CHANNELS_MOST];
++static unsigned channel_count;
++
++static void
++heard_one(const struct redwood_sta_bss *bss, __unused void *context)
++{
++	/* (only the thread writes the list, and it reads the count without the lock) */
++	if (heard_count < HEARD_MOST) {
++		lck_mtx_lock(&sta_lock);
++		heard[heard_count++] = *bss;
++		lck_mtx_unlock(&sta_lock);
++	}
++}
++
++static void
++sta_runs(__unused void *parameter, __unused wait_result_t result)
++{
++	static struct redwood_sta_scan scan;
++	static struct redwood_sta_join join;
++
++	for (;;) {
++		const struct redwood_sta_ops *ops;
++		bool power = false, power_on = false, leave = false, do_join = false, do_scan = false;
++		int error = 0;
++
++		lck_mtx_lock(&sta_lock);
++		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
++			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
++		}
++		ops = sta_ops;
++		/* one thing at a time, in the order that makes sense when several wait */
++		if (asked_power) {
++			power = true;
++			power_on = asked_power_on;
++			asked_power = false;
++		} else if (asked_leave) {
++			leave = true;
++			asked_leave = false;
++		} else if (asked_join) {
++			do_join = true;
++			join = asked_join_what;
++			bzero(&asked_join_what, sizeof(asked_join_what));
++			asked_join = false;
++		} else {
++			do_scan = true;
++			scan = asked_scan_what;
++			asked_scan = false;
++		}
++		sta_calls = true;
++		lck_mtx_unlock(&sta_lock);
++
++		if (power) {
++			struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++			bool was_joined = false;
++
++			if (state != NULL) {
++				ops->state(state);
++				was_joined = state->phase == REDWOOD_STA_JOINED;
++				kfree_data(state, sizeof(*state));
++			}
++			error = ops->power(power_on);
++			if (!power_on && was_joined) {
++				redwood_apple80211_event(REDWOOD_STA_LINK, 0);
++			}
++			redwood_apple80211_event(REDWOOD_STA_POWER, error == 0 ? power_on : !power_on);
++			lck_mtx_lock(&sta_lock);
++			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join) {
++				asked_join_what = standing;
++				asked_join = true;
++			}
++			lck_mtx_unlock(&sta_lock);
++		} else if (leave) {
++			ops->leave();
++			redwood_apple80211_event(REDWOOD_STA_LINK, 0);
++		} else if (do_join) {
++			error = ops->join(&join);
++			bzero(&join, sizeof(join));
++			redwood_apple80211_event(REDWOOD_STA_JOIN_DONE, error);
++			if (error == 0) {
++				redwood_apple80211_event(REDWOOD_STA_LINK, 1);
++			}
++			/* a join that did not come through (a wrong passphrase) leaves things as they were: the standing network again */
++			lck_mtx_lock(&sta_lock);
++			if (error != 0 && fallback.ssid_length != 0 && !asked_join && !asked_leave && !asked_power) {
++				standing = asked_join_what = fallback;
++				asked_join = true;
++			}
++			bzero(&fallback, sizeof(fallback));
++			lck_mtx_unlock(&sta_lock);
++		} else if (do_scan) {
++			error = ops->scan(&scan);
++			lck_mtx_lock(&sta_lock);
++			heard_count = 0;
++			lck_mtx_unlock(&sta_lock);
++			ops->heard(heard_one, NULL);
++			redwood_apple80211_event(REDWOOD_STA_SCAN_DONE, error);
++		}
++
++		lck_mtx_lock(&sta_lock);
++		sta_calls = false;
++		lck_mtx_unlock(&sta_lock);
++		thread_wakeup((event_t)&sta_calls);
++	}
++}
++
++/* ---- the station side ---------------------------------------------------------------------------------- */
++
++void
++redwood_sta_attach(const struct redwood_sta_ops *ops)
++{
++	thread_t thread;
++
++	if (ops == NULL) {
++		lck_mtx_lock(&sta_lock);
++		sta_ops = NULL;
++		asked_power = asked_scan = asked_join = asked_leave = false;
++		while (sta_calls || sta_reads != 0) {
++			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
++		}
++		heard_count = channel_count = 0;
++		lck_mtx_unlock(&sta_lock);
++		return;
++	}
++	if (heard == NULL) {
++		heard = kalloc_data(HEARD_MOST * sizeof(*heard), Z_WAITOK | Z_ZERO);
++	}
++	if (heard == NULL) {
++		redwood_wifi_tell("wifi: no memory for what a scan hears: nobody can ask the radio for a network\n");
++		return;
++	}
++	if (!sta_thread_made) {
++		if (kernel_thread_start(sta_runs, NULL, &thread) != KERN_SUCCESS) {
++			redwood_wifi_tell("wifi: no thread for the station: nobody can ask the radio for a network\n");
++			return;
++		}
++		thread_set_thread_name(thread, "wifi-station");
++		thread_deallocate(thread);
++		sta_thread_made = true;
++	}
++	channel_count = ops->channels(channels, CHANNELS_MOST);
++	lck_mtx_lock(&sta_lock);
++	sta_ops = ops;
++	sta_on = true;
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	redwood_apple80211_event(REDWOOD_STA_POWER, 1);
++}
++
++void
++redwood_sta_lost(int error)
++{
++	redwood_apple80211_event(REDWOOD_STA_LINK, error != 0 ? error : ECONNRESET);
++}
++
++/* ---- who wants a network ------------------------------------------------------------------------------- */
++
++bool
++redwood_sta_present(void)
++{
++	return sta_ops != NULL;
++}
++
++bool
++redwood_sta_powered(void)
++{
++	return sta_ops != NULL && sta_on;
++}
++
++bool
++redwood_sta_busy(void)
++{
++	bool busy;
++
++	lck_mtx_lock(&sta_lock);
++	busy = sta_ops != NULL && (sta_calls || asked_power || asked_leave || asked_join || asked_scan);
++	lck_mtx_unlock(&sta_lock);
++	return busy;
++}
++
++int
++redwood_sta_ask_power(bool on)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL) {
++		lck_mtx_unlock(&sta_lock);
++		return ENXIO;
++	}
++	sta_on = on;
++	asked_power = true;
++	asked_power_on = on;
++	if (!on) {
++		asked_scan = asked_join = asked_leave = false;
++	}
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++int
++redwood_sta_ask_scan(const struct redwood_sta_scan *what)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL || !sta_on) {
++		lck_mtx_unlock(&sta_lock);
++		return sta_ops == NULL ? ENXIO : ENETDOWN;
++	}
++	asked_scan_what = *what;
++	asked_scan = true;
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++int
++redwood_sta_ask_join_standing(const struct redwood_sta_join *what)
++{
++	int error = redwood_sta_ask_join(what);
++
++	lck_mtx_lock(&sta_lock);
++	if (error == 0) {
++		standing = *what;
++	}
++	lck_mtx_unlock(&sta_lock);
++	return error;
++}
++
++int
++redwood_sta_ask_join(const struct redwood_sta_join *what)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL || !sta_on) {
++		lck_mtx_unlock(&sta_lock);
++		return sta_ops == NULL ? ENXIO : ENETDOWN;
++	}
++	if (standing.ssid_length != 0) {
++		fallback = standing;
++	}
++	bzero(&standing, sizeof(standing));     /* (whoever asks for a network now has the say) */
++	asked_join_what = *what;
++	asked_join = true;
++	asked_leave = false;
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++int
++redwood_sta_ask_leave(void)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta_ops == NULL) {
++		lck_mtx_unlock(&sta_lock);
++		return ENXIO;
++	}
++	asked_leave = true;
++	asked_join = false;
++	bzero(&asked_join_what, sizeof(asked_join_what));
++	bzero(&fallback, sizeof(fallback));
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++	return 0;
++}
++
++bool
++redwood_sta_heard(unsigned index, struct redwood_sta_bss *bss)
++{
++	bool there;
++
++	lck_mtx_lock(&sta_lock);
++	if ((there = index < heard_count)) {
++		*bss = heard[index];
++	}
++	lck_mtx_unlock(&sta_lock);
++	return there;
++}
++
++void
++redwood_sta_state(struct redwood_sta_state *state)
++{
++	const struct redwood_sta_ops *ops;
++
++	bzero(state, sizeof(*state));
++	lck_mtx_lock(&sta_lock);
++	if ((ops = sta_ops) != NULL) {
++		sta_reads++;
++	}
++	lck_mtx_unlock(&sta_lock);
++	if (ops != NULL) {
++		ops->state(state);
++		lck_mtx_lock(&sta_lock);
++		sta_reads--;
++		lck_mtx_unlock(&sta_lock);
++		thread_wakeup((event_t)&sta_calls);
++	}
++}
++
++unsigned
++redwood_sta_channels(struct redwood_sta_channel *out, unsigned most)
++{
++	unsigned count;
++
++	lck_mtx_lock(&sta_lock);
++	count = channel_count < most ? channel_count : most;
++	memcpy(out, channels, count * sizeof(*out));
++	lck_mtx_unlock(&sta_lock);
++	return count;
++}
++
++bool
++redwood_sta_address(uint8_t *address)
++{
++	const struct redwood_sta_ops *ops = sta_ops;
++
++	if (ops != NULL) {
++		memcpy(address, ops->address, 6);
++	}
++	return ops != NULL;
++}
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+new file mode 100644
+index 0000000..53f6a8d
+--- /dev/null
++++ b/bsd/dev/sweet_files.c
+@@ -0,0 +1,355 @@
++/*
++ * File server for the running iOS root, over USB Ethernet: TCP
++ * 192.168.7.2:2223 (on the Mac: 127.0.0.1:2223 through FlameBridge,
++ * tools/flame-files.py). One request per connection, a header line then
++ * data:
++ *
++ *   PUT <path> <mode-octal> <size>\n<size bytes>  -> "OK <size>\n"  (root:wheel)
++ *   GET <path>\n                                  -> "OK <size>\n<bytes>"
++ *   MKDIR <path> <mode-octal>\n                   -> "OK\n"
++ *   LINK <target> <path>\n                        -> "OK\n"  (symlink)
++ *   RM <path>\n                                   -> "OK\n"
++ *   CHMOD <path> <mode-octal>\n                   -> "OK\n"
++ *   SYNC\n                                        -> "OK\n"  (0168)
++ *
++ * Errors: "ERR <errno>\n". Paths have no spaces. Started with the USB
++ * gadget (sweet_usb.c) when the interface comes up.
++ *
++ * ios-sweet 0168 (from ios-flame/sunfish 0091, tools/flame-files.py): root file access to the running
++ * system over the USB cable only. Boot-arg sweetfiles=1 enables it; it binds 192.168.7.2 (ue0) instead
++ * of every address, so it is not reachable over Wi-Fi, and closes connections from outside
++ * 192.168.7.0/24.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kernel.h>
++#include <sys/kauth.h>
++#include <sys/proc_internal.h>
++#include <sys/kpi_socket.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
++#include <netinet/in.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++
++extern int sweet_vfs_mkdir(const char *path, int mode);
++extern int sweet_vfs_symlink(const char *target, const char *link);
++extern int sweet_vfs_unlink(const char *path);
++extern kern_return_t thread_terminate(thread_t);
++struct sync_args;
++extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
++void sweet_files_start(void);
++
++#define SF_BUF  (64 * 1024)
++
++static char *sf_buf;
++static int sf_chan;
++
++static void
++sf_sleep_ms(int ms)
++{
++	(void)tsleep(&sf_chan, PZERO, "sweetfiles", MAX(1, ms * hz / 1000));
++}
++
++static unsigned long long
++sf_dec(const char *p)
++{
++	unsigned long long v = 0;
++	while (*p == ' ') {
++		p++;
++	}
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (unsigned)(*p++ - '0');
++	}
++	return v;
++}
++
++static int
++sf_recv(socket_t so, void *buf, size_t len, size_t *got, int flags)
++{
++	struct iovec iov = { .iov_base = buf, .iov_len = len };
++	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++	return sock_receive(so, &msg, flags, got);
++}
++
++static int
++sf_recv_all(socket_t so, void *buf, size_t len)
++{
++	size_t off = 0;
++	while (off < len) {
++		size_t got = 0;
++		int err = sf_recv(so, (char *)buf + off, len - off, &got, MSG_WAITALL);
++		if (err) {
++			return err;
++		}
++		if (got == 0) {
++			return ECONNRESET;
++		}
++		off += got;
++	}
++	return 0;
++}
++
++static int
++sf_send(socket_t so, const void *buf, size_t len)
++{
++	size_t off = 0;
++	while (off < len) {
++		struct iovec iov = { .iov_base = (char *)buf + off, .iov_len = len - off };
++		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++		size_t sent = 0;
++		int err = sock_send(so, &msg, 0, &sent);
++		if (err) {
++			return err;
++		}
++		off += sent;
++	}
++	return 0;
++}
++
++static void
++sf_reply(socket_t so, int err, uint64_t n, bool with_n)
++{
++	char line[48];
++	int len = err ? snprintf(line, sizeof(line), "ERR %d\n", err) :
++	    with_n ? snprintf(line, sizeof(line), "OK %llu\n", n) : snprintf(line, sizeof(line), "OK\n");
++	(void)sf_send(so, line, (size_t)len);
++}
++
++/* Header line: up to '\n', read byte by byte so data after it stays queued. */
++static int
++sf_line(socket_t so, char *line, size_t max)
++{
++	size_t n = 0;
++	while (n + 1 < max) {
++		size_t got = 0;
++		int err = sf_recv(so, line + n, 1, &got, MSG_WAITALL);
++		if (err || got == 0) {
++			return err ? err : ECONNRESET;
++		}
++		if (line[n] == '\n') {
++			break;
++		}
++		n++;
++	}
++	line[n] = 0;
++	return 0;
++}
++
++static int
++sf_setattr(const char *path, int mode, bool owner)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_lookup(path, 0, &vp, ctx);
++	if (err) {
++		return err;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & 07777);
++	if (owner) {
++		VATTR_SET(&va, va_uid, 0);
++		VATTR_SET(&va, va_gid, 0);
++	}
++	err = vnode_setattr(vp, &va, ctx);
++	vnode_put(vp);
++	return err;
++}
++
++static int
++sf_put(socket_t so, const char *path, int mode, uint64_t size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	uint64_t off = 0;
++	while (off < size) {
++		size_t chunk = (size_t)MIN((uint64_t)SF_BUF, size - off);
++		int rerr = sf_recv_all(so, sf_buf, chunk);
++		if (rerr) {
++			err = err ? err : rerr;
++			break;
++		}
++		if (!err) {
++			int resid = 0;
++			err = vn_rdwr(UIO_WRITE, vp, sf_buf, (int)chunk, (off_t)off, UIO_SYSSPACE, IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			if (!err && resid) {
++				err = EIO;
++			}
++		}
++		off += chunk;
++	}
++	if (vp != NULLVP) {
++		vnode_close(vp, FWRITE, ctx);
++	}
++	if (!err) {
++		err = sf_setattr(path, mode, true);
++	}
++	return err;
++}
++
++static int
++sf_get(socket_t so, const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (!err) {
++		err = vnode_size(vp, &size, ctx);
++	}
++	if (err) {
++		if (vp != NULLVP) {
++			vnode_close(vp, FREAD, ctx);
++		}
++		sf_reply(so, err, 0, false);
++		return err;
++	}
++	sf_reply(so, 0, (uint64_t)size, true);
++	for (off_t off = 0; off < size && !err;) {
++		int chunk = (int)MIN((off_t)SF_BUF, size - off), resid = 0;
++		err = vn_rdwr(UIO_READ, vp, sf_buf, chunk, off, UIO_SYSSPACE, IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!err) {
++			err = sf_send(so, sf_buf, (size_t)(chunk - resid));
++		}
++		off += chunk;
++	}
++	vnode_close(vp, FREAD, ctx);
++	return err;
++}
++
++static void
++sf_handle(socket_t so)
++{
++	static char line[1100];
++	char a[512], b[512];
++	unsigned long long n = 0;
++	int err = sf_line(so, line, sizeof(line));
++	if (err) {
++		return;
++	}
++	a[0] = b[0] = 0;
++	if (!strncmp(line, "PUT ", 4)) {
++		unsigned mode = 0644;
++		char *p = line + 4, *sp = strchr(p, ' ');
++		if (!sp || (size_t)(sp - p) >= sizeof(a)) {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		memcpy(a, p, (size_t)(sp - p));
++		a[sp - p] = 0;
++		mode = (unsigned)strtoul(sp + 1, &p, 8);
++		n = sf_dec(p);
++		err = sf_put(so, a, (int)mode, n);
++		printf("SWEET FILES: PUT %s %o %llu -> %d\n", a, mode, n, err);
++		sf_reply(so, err, n, true);
++		return;
++	}
++	if (!strncmp(line, "GET ", 4)) {
++		err = sf_get(so, line + 4);
++		printf("SWEET FILES: GET %s -> %d\n", line + 4, err);
++		return;
++	}
++	if (!strcmp(line, "SYNC")) {
++		/* flush written files before a forced reboot (0168) */
++		int32_t rv = 0;
++		err = sync(kernproc, NULL, &rv);
++		printf("SWEET FILES: SYNC -> %d\n", err);
++		sf_reply(so, err, 0, false);
++		return;
++	}
++	char *sp = strchr(line, ' ');
++	if (!sp) {
++		sf_reply(so, EINVAL, 0, false);
++		return;
++	}
++	*sp = 0;
++	char *arg1 = sp + 1, *arg2 = strchr(arg1, ' ');
++	if (arg2) {
++		*arg2++ = 0;
++	}
++	if (!strcmp(line, "MKDIR")) {
++		err = sweet_vfs_mkdir(arg1, arg2 ? (int)strtoul(arg2, NULL, 8) : 0755);
++		if (err == EEXIST) {
++			err = 0;
++		}
++	} else if (!strcmp(line, "LINK") && arg2) {
++		err = sweet_vfs_symlink(arg1, arg2);
++	} else if (!strcmp(line, "RM")) {
++		err = sweet_vfs_unlink(arg1);
++	} else if (!strcmp(line, "CHMOD") && arg2) {
++		err = sf_setattr(arg1, (int)strtoul(arg2, NULL, 8), false);
++	} else {
++		err = EINVAL;
++	}
++	printf("SWEET FILES: %s %s %s -> %d\n", line, arg1, arg2 ? arg2 : "", err);
++	sf_reply(so, err, 0, false);
++}
++
++static void
++sf_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	socket_t ls = NULL;
++	struct sockaddr_in me;
++	int one = 1;
++
++	sf_buf = kalloc_data(SF_BUF, Z_WAITOK);
++	for (;;) {
++		if (sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls) == 0) {
++			(void)sock_setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++			bzero(&me, sizeof(me));
++			me.sin_len = sizeof(me);
++			me.sin_family = AF_INET;
++			me.sin_port = htons(2223);
++			me.sin_addr.s_addr = htonl(0xc0a80702);   /* 192.168.7.2: ue0 only */
++			if (sock_bind(ls, (struct sockaddr *)&me) == 0 && sock_listen(ls, 4) == 0) {
++				break;
++			}
++			sock_close(ls);
++		}
++		ls = NULL;
++		sf_sleep_ms(1000);
++	}
++	printf("SWEET FILES: listening on tcp 2223\n");
++	for (;;) {
++		socket_t c = NULL;
++		struct sockaddr_in peer;
++		bzero(&peer, sizeof(peer));
++		if (sock_accept(ls, (struct sockaddr *)&peer, sizeof(peer), 0, NULL, NULL, &c) != 0 || c == NULL) {
++			sf_sleep_ms(100);
++			continue;
++		}
++		if (peer.sin_family != AF_INET || (ntohl(peer.sin_addr.s_addr) & 0xffffff00u) != 0xc0a80700u) {
++			printf("SWEET FILES: refused a connection from outside 192.168.7.0/24\n");
++			sock_close(c);
++			continue;
++		}
++		sf_handle(c);
++		sock_close(c);
++	}
++}
++
++void
++sweet_files_start(void)
++{
++	int on = 0;
++	PE_parse_boot_argn("sweetfiles", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(sf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+new file mode 100644
+index 0000000..e06ae75
+--- /dev/null
++++ b/bsd/dev/sweet_pmem.c
+@@ -0,0 +1,417 @@
++/*
++ * /dev/pmem: physical memory for userland hardware experiments (the GPU
++ * bring-up in work/userland/gpu runs on it over SSH, no reboot per try).
++ * Root only (0600); Sweet creates the node only with boot-arg sweetpmem=1.
++ *
++ *   pread/pwrite at offset = physical address.
++ *     Managed DRAM goes through the physical aperture with the lines
++ *     cleaned+invalidated to the point of coherency before and after, so
++ *     data a device wrote is seen and CPU writes reach memory (IO is not
++ *     coherent here). Anything else (MMIO, carve-outs such as the panel
++ *     framebuffer) is mapped as device memory and accessed with 32-bit
++ *     loads/stores only: offset and length must be multiples of 4.
++ *     Reading an unclocked block hangs the SoC, as with poke scripts.
++ *   ioctl PMEM_ALLOC   {size, align} -> {pa}: zeroed, physically contiguous
++ *                      kernel memory (stays until PMEM_FREE, survives exit)
++ *   ioctl PMEM_FREE    {pa}
++ *   ioctl PMEM_SMC     x0..x7 in, x0..x3 out (SMCCC; e.g. SCM PAS calls)
++ *   ioctl PMEM_LIST    allocation table, for tools that lost their state
++ *
++ * Userland side: work/userland/gpu/pmem.h (same structs and numbers).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <mach/mach_time.h>
++#include <kern/clock.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern boolean_t pmap_valid_address(uint64_t pa);
++extern vm_map_address_t phystokv(uint64_t pa);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern void _disable_preemption(void);
++extern void _enable_preemption(void);
++void sweet_pmem_init(void);
++
++struct pmem_alloc {
++	uint64_t size;          /* in: bytes (rounded up to pages) */
++	uint64_t align;         /* in: bytes, power of 2, 0 = page */
++	uint64_t pa;            /* out */
++};
++struct pmem_smc {
++	uint64_t x[8];
++};
++#define PMEM_LIST_MAX   64
++struct pmem_list {
++	uint32_t count;
++	uint32_t pad;
++	struct {
++		uint64_t pa, size;
++	} ent[PMEM_LIST_MAX];
++};
++#define PMEM_ALLOC      _IOWR('P', 1, struct pmem_alloc)
++#define PMEM_FREE       _IOW('P', 2, uint64_t)
++#define PMEM_SMC        _IOWR('P', 3, struct pmem_smc)
++#define PMEM_LIST       _IOR('P', 4, struct pmem_list)
++/* ios-flame 0102: one RPMh active vote for wland (bsd/dev/sweet_rpmh.c checks it). */
++struct pmem_rpmh {
++	char res[16];           /* cmd-db name */
++	uint32_t n;             /* 1..4 commands */
++	uint32_t offset[4];     /* from the resource address */
++	uint32_t value[4];
++};
++#define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++
++#define PMEM_MAPS       16              /* 2 MB device windows, round robin */
++#define PMEM_WIN        0x200000ULL
++
++static struct {
++	vm_offset_t va;
++	uint64_t pa, size;
++} pm_alloc[PMEM_LIST_MAX];
++static struct {
++	vm_offset_t va;
++	uint64_t win;
++} pm_map[PMEM_MAPS];
++static unsigned pm_map_next;
++static uint32_t pm_bounce[PAGE_SIZE / 4];
++
++static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
++static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
++
++/*
++ * Device mapping of the 2 MB window holding pa, from a small round-robin
++ * cache. ml_io_map's mappings are permanent (unmapping one panics) and come
++ * from the small io_submap (a 2 MB one panicked "kmem_alloc failed"), so
++ * windows use ml_io_map_unmappable: kernel_map, freed by ml_io_unmap.
++ */
++static volatile uint32_t *
++pm_io(uint64_t pa)
++{
++	uint64_t win = pa & ~(PMEM_WIN - 1);
++	for (unsigned i = 0; i < PMEM_MAPS; i++) {
++		if (pm_map[i].va && pm_map[i].win == win) {
++			return (volatile uint32_t *)(pm_map[i].va + (pa - win));
++		}
++	}
++	unsigned i = pm_map_next++ % PMEM_MAPS;
++	if (pm_map[i].va) {
++		ml_io_unmap(pm_map[i].va, PMEM_WIN);
++	}
++	pm_map[i].va = ml_io_map_unmappable((vm_offset_t)win, PMEM_WIN, VM_WIMG_IO);
++	pm_map[i].win = win;
++	return pm_map[i].va ? (volatile uint32_t *)(pm_map[i].va + (pa - win)) : NULL;
++}
++
++/* 0151: 0131/0140 wland stopped on its first apps-SMMU read through here while
++ * the kernel's own read of the same registers (0149/0150) worked. Trace the
++ * first device accesses: CPU, address, and the value once the access returned. */
++static unsigned pm_traced;
++extern int cpu_number(void);
++
++/* The probe's read through this exact path (window cache + mapping). */
++uint32_t sweet_pmem_probe_read(uint64_t pa);
++uint32_t
++sweet_pmem_probe_read(uint64_t pa)
++{
++	lck_mtx_lock(&sweet_pmem_lock);
++	volatile uint32_t *r = pm_io(pa);
++	const uint32_t v = r ? *r : 0xdeadbeef;
++	lck_mtx_unlock(&sweet_pmem_lock);
++	return v;
++}
++
++static int
++pm_rw(struct uio *uio, bool write)
++{
++	int err = 0;
++	lck_mtx_lock(&sweet_pmem_lock);
++	while (!err && uio_resid(uio) > 0) {
++		uint64_t pa = (uint64_t)uio_offset(uio);
++		uint64_t off = pa & PAGE_MASK;
++		unsigned n = (unsigned)MIN((user_ssize_t)(PAGE_SIZE - off), uio_resid(uio));
++		if (pmap_valid_address(pa)) {
++			caddr_t va = (caddr_t)phystokv(pa);
++			flush_dcache64((addr64_t)pa, n, TRUE);
++			err = uiomove(va, (int)n, uio);
++			flush_dcache64((addr64_t)pa, n, TRUE);
++			continue;
++		}
++		if ((pa | n) & 3) {
++			err = EINVAL;
++			break;
++		}
++		/* 0152: 0141 hardware: wland's first apps-SMMU load stalled CPU2 on the
++		 * very mapping the kernel probe had read through 20 s earlier. The SN15/CN0
++		 * votes went to RPMh's active set only; recast them (at most every 50 ms)
++		 * right before an access to the SMMU's window. */
++		if (pa >= 0x15000000ULL && pa < 0x15200000ULL) {
++			extern int sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y);
++			static uint64_t voted_at;
++			uint64_t now = mach_absolute_time(), ns = 0;
++			absolutetime_to_nanoseconds(now - voted_at, &ns);
++			if (!voted_at || ns > 50 * NSEC_PER_MSEC) {
++				const int sn = sweet_rpmh_bcm_vote("SN15", 1, 1), cn = sweet_rpmh_bcm_vote("CN0", 1, 1);
++				static unsigned revotes;
++				if (++revotes <= 8 || sn || cn) {
++					printf("SWEET PMEM: apps SMMU access: recast SN15=%d CN0=%d (%u)\n", sn, cn, revotes);
++				}
++				voted_at = now;
++			}
++		}
++		const bool trace = pm_traced < 48;
++		if (trace) {
++			pm_traced++;
++			printf("SWEET PMEM: cpu%d %s %u at %#llx (%s)\n", cpu_number(), write ? "write" : "read", n,
++			    (unsigned long long)pa, proc_best_name(current_proc()));
++		}
++		volatile uint32_t *r = pm_io(pa);
++		if (r == NULL) {
++			err = ENOMEM;
++			break;
++		}
++		if (trace) {
++			printf("SWEET PMEM: mapped %#llx at %p\n", (unsigned long long)pa, (void *)(uintptr_t)r);
++		}
++		if (write) {
++			err = uiomove((caddr_t)pm_bounce, (int)n, uio);
++			__asm__ volatile ("dmb oshst" ::: "memory");
++			for (unsigned i = 0; !err && i < n / 4; i++) {
++				r[i] = pm_bounce[i];
++			}
++			__asm__ volatile ("dsb osh" ::: "memory");
++		} else {
++			for (unsigned i = 0; i < n / 4; i++) {
++				pm_bounce[i] = r[i];
++			}
++			__asm__ volatile ("dmb oshld" ::: "memory");
++			if (trace) {
++				printf("SWEET PMEM: read %#llx -> %#x\n", (unsigned long long)pa, pm_bounce[0]);
++			}
++			err = uiomove((caddr_t)pm_bounce, (int)n, uio);
++		}
++	}
++	lck_mtx_unlock(&sweet_pmem_lock);
++	return err;
++}
++
++static int
++pm_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return pm_rw(uio, false);
++}
++
++static int
++pm_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return pm_rw(uio, true);
++}
++
++static int
++pm_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++pm_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++pm_smc_once(uint64_t x[8])
++{
++	register uint64_t x0 __asm__("x0") = x[0];
++	register uint64_t x1 __asm__("x1") = x[1];
++	register uint64_t x2 __asm__("x2") = x[2];
++	register uint64_t x3 __asm__("x3") = x[3];
++	register uint64_t x4 __asm__("x4") = x[4];
++	register uint64_t x5 __asm__("x5") = x[5];
++	register uint64_t x6 __asm__("x6") = x[6];
++	register uint64_t x7 __asm__("x7") = x[7];
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++            :
++            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	x[0] = x0;
++	x[1] = x1;
++	x[2] = x2;
++	x[3] = x3;
++	x[6] = x6;
++}
++
++/*
++ * Qualcomm TZ returns QCOM_SCM_INTERRUPTED (1) when a non-secure interrupt
++ * arrives during a call (the shim never saw it: interrupts off). Like
++ * Linux's __scm_smc_do_quirk: call again with x0 = 1, the same arguments
++ * and the x6 TZ handed back (ARM_SMCCC_QUIRK_QCOM_A6), on the same CPU,
++ * until a final result.
++ */
++#define QCOM_SCM_INTERRUPTED    1
++
++static void
++pm_smc(struct pmem_smc *s)
++{
++	uint64_t x[8], fn = s->x[0];
++	unsigned resumes = 0;
++	memcpy(x, s->x, sizeof(x));
++	_disable_preemption();
++	for (;;) {
++		pm_smc_once(x);
++		if (x[0] != QCOM_SCM_INTERRUPTED || resumes >= 100000) {
++			break;
++		}
++		uint64_t a6 = x[6];
++		memcpy(x, s->x, sizeof(x));
++		x[0] = QCOM_SCM_INTERRUPTED;
++		x[6] = a6;
++		resumes++;
++	}
++	_enable_preemption();
++	memcpy(s->x, x, 4 * sizeof(uint64_t));
++	if (resumes) {
++		printf("SWEET PMEM: smc %llx resumed %u times -> %llx\n", fn, resumes, x[0]);
++	}
++}
++
++static int
++pm_do_alloc(struct pmem_alloc *a)
++{
++	vm_size_t size = round_page(a->size);
++	uint64_t align = a->align > PAGE_SIZE ? a->align : PAGE_SIZE;
++	if (size == 0 || (align & (align - 1))) {
++		return EINVAL;
++	}
++	int slot = -1;
++	for (int i = 0; i < PMEM_LIST_MAX; i++) {
++		if (!pm_alloc[i].va) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot < 0) {
++		return ENOSPC;
++	}
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, 0, (ppnum_t)(atop_64(align) - 1),
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		kmem_free(kernel_map, va, size);
++		return ENOMEM;
++	}
++	a->pa = ptoa_64(pn);
++	flush_dcache64((addr64_t)a->pa, (unsigned)size, TRUE);
++	pm_alloc[slot].va = va;
++	pm_alloc[slot].pa = a->pa;
++	pm_alloc[slot].size = size;
++	printf("SWEET PMEM: alloc %llu bytes at 0x%llx (pid %d)\n", (uint64_t)size, a->pa, proc_selfpid());
++	return 0;
++}
++
++static int
++pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	int err = 0;
++	if (cmd == PMEM_RPMH) {
++		/* Waits for the TCS; not under the pmem lock. */
++		struct pmem_rpmh *r = (struct pmem_rpmh *)data;
++		r->res[sizeof(r->res) - 1] = 0;
++		err = sweet_rpmh_write(r->res, r->n, r->offset, r->value);
++		printf("SWEET PMEM: rpmh %s %u cmds (%#x=%u ...) -> %d\n", r->res, r->n, r->offset[0], r->value[0], err);
++		return err;
++	}
++	lck_mtx_lock(&sweet_pmem_lock);
++	switch (cmd) {
++	case PMEM_ALLOC:
++		err = pm_do_alloc((struct pmem_alloc *)data);
++		break;
++	case PMEM_FREE: {
++		uint64_t pa = *(uint64_t *)data;
++		err = ENOENT;
++		for (int i = 0; i < PMEM_LIST_MAX; i++) {
++			if (pm_alloc[i].va && pm_alloc[i].pa == pa) {
++				kmem_free(kernel_map, pm_alloc[i].va, (vm_size_t)pm_alloc[i].size);
++				pm_alloc[i].va = 0;
++				err = 0;
++				break;
++			}
++		}
++		break;
++	}
++	case PMEM_SMC:
++		pm_smc((struct pmem_smc *)data);
++		break;
++	case PMEM_LIST: {
++		struct pmem_list *l = (struct pmem_list *)data;
++		bzero(l, sizeof(*l));
++		for (int i = 0; i < PMEM_LIST_MAX; i++) {
++			if (pm_alloc[i].va) {
++				l->ent[l->count].pa = pm_alloc[i].pa;
++				l->ent[l->count].size = pm_alloc[i].size;
++				l->count++;
++			}
++		}
++		break;
++	}
++	default:
++		err = ENOTTY;
++	}
++	lck_mtx_unlock(&sweet_pmem_lock);
++	return err;
++}
++
++static const struct cdevsw sweet_pmem_cdevsw = {
++	.d_open       = pm_open,
++	.d_close      = pm_close,
++	.d_read       = pm_read,
++	.d_write      = pm_write,
++	.d_ioctl      = pm_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++void
++sweet_pmem_init(void)
++{
++	/* Sweet: off unless a Wi-Fi bring-up boot asks for it (raw physical
++	 * memory and SMC access for root's wland). */
++	uint32_t on = 0;
++	PE_parse_boot_argn("sweetpmem", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	int major = cdevsw_add(-1, &sweet_pmem_cdevsw);
++	if (major < 0) {
++		printf("SWEET PMEM: cdevsw_add failed (%d)\n", major);
++		return;
++	}
++	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "pmem");
++	printf("SWEET PMEM: /dev/pmem ready (major %d)\n", major);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..e6b7f32 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,9 +9,23 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_arc_probe(const char *res);
++int sweet_rpmh_arc_read(const char *res);
++int sweet_rpmh_arc_require(const char *res, unsigned minimum);
++int sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl);
++
++/* Resource descriptor resolved from the bootloader command DB. */
++struct rh_res {
++	uint32_t addr;
++	uint32_t aux;
++	uint16_t aux_len;
++	unsigned slave;
++};
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -26,6 +40,13 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_IRQ_EN       0x00u
+ #define RH_IRQ_STATUS   0x04u
+ #define RH_IRQ_CLEAR    0x08u
++/* Saved sweet live FDT: apps_rsc interrupts=<0 5 0>, GICv3 at
++ * 0x17a00000. SPI5 is GIC INTID37. RSC completion latching and GIC
++ * delivery are separate gates: keep delivery disabled while polling. */
++#define RH_GICD_PA      0x17a00000u
++#define RH_GIC_INTID    37u
++#define RH_GIC_ISENABLER 0x100u
++#define RH_GIC_ISACTIVER 0x300u
+ #define RH_WAIT         0x10u
+ #define RH_CONTROL      0x14u
+ #define RH_STATUS       0x18u
+@@ -34,23 +55,31 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_ADDR         0x34u
+ #define RH_DATA         0x38u
+ #define RH_CMD_STATUS   0x3cu
++#define RH_RESP_DATA    0x40u
+ #define RH_AMC_EN       (1u << 16)
+ #define RH_TRIGGER      (1u << 24)
+ #define RH_ISSUED       (1u << 8)
+ #define RH_COMPLETE     (1u << 16)
+-#define RH_WRITE_ACK    (8u | (1u << 8) | (1u << 16))
++#define RH_READ_ACK     (8u | (1u << 8))
++#define RH_WRITE_ACK    (RH_READ_ACK | (1u << 16))
+ #define RH_DB_MAGIC     0x0c0330dbu
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
++#define RH_BCM          5u
++#define RH_ARC_LEVEL_SIZE   2u
++#define RH_ARC_MAX_LEVELS   16u
+ #define RH_TIMEOUT_US   100000u
++#define RH_ARC_TIMEOUT_US 200000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
++static bool rh_touch_ready; /* protected by rh_lock; ARC reads run after L11C */
+ 
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+@@ -159,7 +188,7 @@ rh_map(void)
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned expected_slave, struct rh_res *out)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -173,10 +202,10 @@ rh_lookup(const char *res, uint32_t *address)
+ 			break;
+ 		}
+ 		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+-		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		uint32_t data = RH_DB_HEADER + rh_db16(h + 4);
+ 		unsigned count = rh_db16(h + 6);
+ 		if (slave < 3 || slave > 5 || (entries & 3u) ||
+-		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(data, 0)) {
+ 			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
+ 			return EINVAL;
+ 		}
+@@ -186,15 +215,32 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+-			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++			uint32_t aux_len = rh_db16(e + 20);
++			uint32_t aux_off = rh_db16(e + 22);
++			uint32_t align = expected_slave == RH_VRM ? 15u : 3u;
++			if (slave != expected_slave || (addr >> 16) != expected_slave ||
++			    (addr & align) || aux_off > rh_db_size - data ||
++			    !rh_range(data + aux_off, aux_len)) {
++				printf("SWEET RPMH: invalid slave %u entry for %s\n",
++				    expected_slave, res);
++				return EINVAL;
++			}
++			if (expected_slave == RH_ARC &&
++			    ((data + aux_off) & 1u || rh_db16(h + 8) != 0x1000u ||
++			    aux_len < RH_ARC_LEVEL_SIZE ||
++			    aux_len > RH_ARC_MAX_LEVELS * RH_ARC_LEVEL_SIZE ||
++			    (aux_len & (RH_ARC_LEVEL_SIZE - 1u)))) {
++				printf("SWEET RPMH: invalid ARC aux length %u for %s\n",
++				    aux_len, res);
+ 				return EINVAL;
+ 			}
+-			*address = addr;
++			out->addr = addr;
++			out->aux = data + aux_off;
++			out->aux_len = (uint16_t)aux_len;
++			out->slave = slave;
+ 			++matches;
+-			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+-			    res, addr, slave, rh_db16(h + 8),
++			printf("SWEET RPMH: %s addr=%#x slave=%u aux=%u@%#x version=%#x priority=%#x:%#x\n",
++			    res, addr, slave, aux_len, data + aux_off, rh_db16(h + 8),
+ 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+ 		}
+ 	}
+@@ -205,6 +251,44 @@ rh_lookup(const char *res, uint32_t *address)
+ 	return 0;
+ }
+ 
++/*
++ * Decode an ARC level table.  Command-DB aux data is a little-endian u16
++ * array of resource-specific levels; the consumer level adds one because
++ * zero is an invalid voltage.  Zero padding after the first entry is
++ * ignored, matching the downstream regulator driver.
++ */
++static int
++rh_arc_levels(const struct rh_res *res, uint32_t *level, unsigned *count)
++{
++	unsigned n = res->aux_len / RH_ARC_LEVEL_SIZE;
++	if (n == 0 || n > RH_ARC_MAX_LEVELS) {
++		return EINVAL;
++	}
++	unsigned used = n;
++	for (unsigned i = 0; i < n; ++i) {
++		uint16_t value = rh_db16(res->aux + i * RH_ARC_LEVEL_SIZE);
++		if (i > 0 && value == 0) {
++			used = i;
++			for (unsigned j = i + 1; j < n; ++j) {
++				if (rh_db16(res->aux + j * RH_ARC_LEVEL_SIZE)) {
++					return EINVAL; /* nonzero data after padding */
++				}
++			}
++			break;
++		}
++		level[i] = value + 1;
++		if (i > 0 && level[i] < level[i - 1]) {
++			printf("SWEET RPMH: non-monotonic ARC table index=%u\n", i);
++			return EINVAL;
++		}
++	}
++	if (used == 0 || level[used - 1] == 0) {
++		return EINVAL;
++	}
++	*count = used;
++	return 0;
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -218,9 +302,45 @@ rh_free(unsigned t)
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* No GIC writes: this polled controller has no registered IRQ handler.
++ * Refuse ownership if another user has enabled or activated its SPI. */
++static bool
++rh_poll_delivery_disabled(void)
++{
++	static vm_offset_t gicd;
++	if (!gicd) {
++		gicd = ml_io_map(RH_GICD_PA, 0x1000);
++	}
++	if (!gicd) {
++		return false;
++	}
++	const uint32_t reg = (RH_GIC_INTID / 32u) * 4u;
++	const uint32_t bit = 1u << (RH_GIC_INTID % 32u);
++	uint32_t enabled = rh_read(gicd, RH_GIC_ISENABLER + reg);
++	uint32_t active = rh_read(gicd, RH_GIC_ISACTIVER + reg);
++	printf("SWEET RPMH: poll completion v2 GIC INTID%u enable=%#x active=%#x\n",
++	    RH_GIC_INTID, enabled, active);
++	return enabled != 0xffffffffu && active != 0xffffffffu &&
++	    !(enabled & bit) && !(active & bit);
++}
++
++static void
++rh_quarantine_source(uint32_t bit)
++{
++	/* Never acknowledge, reset or retry an uncertain transaction. Mask only
++	 * our source; retain the poisoned state and all command storage. */
++	(void)rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit);
++}
++
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send_cmds(const char *res, uint32_t address, uint32_t align_mask,
++    const uint32_t *offsets, const uint32_t *values, unsigned n,
++    unsigned timeout_us, uint32_t *response)
+ {
++	if (n == 0 || n > rh_ncpt || n > RH_ARC_MAX_LEVELS ||
++	    (response && n != 1)) {
++		return EINVAL;
++	}
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+@@ -233,8 +353,10 @@ rh_send(uint32_t address, unsigned mv)
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) &
++			    ~align_mask) == address) {
++				printf("SWEET RPMH: conflicting inherited %s request in TCS%u\n",
++				    res, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -248,8 +370,10 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	unsigned t = (unsigned)chosen;
+ 	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t enable = (1u << n) - 1u;
+ 	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
+-	if (irq_en == 0xffffffffu || !rh_free(t)) {
++	const bool poll_latch = strcmp(res, "ldoc11") != 0;
++	if (irq_en == 0xffffffffu || !rh_free(t) || (poll_latch && !rh_poll_delivery_disabled())) {
+ 		return EBUSY;
+ 	}
+ 	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
+@@ -266,51 +390,72 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE %s %s commands=%u irq-enable=%#x\n",
++	    t, response ? "READ" : "WRITE", res, n, irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+-		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++		if (!rh_sync(cmd + RH_MSGID, response ? RH_READ_ACK : RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, values[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, enable) || !rh_sync(b + RH_ENABLE, enable) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
++	/* Linux keeps ACTIVE TCS completion sources enabled. Masking this
++	 * source made IRQ_STATUS stay zero and left only a transient busy edge
++	 * as completion evidence. Clear only our known-free latch, enable it,
++	 * and require it to start clear. GIC delivery stays disabled throughout. */
++	if (poll_latch) {
++		rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
++		if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++		    !rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) | bit) ||
++		    (rh_read(rh_tcs, RH_IRQ_STATUS) & bit)) {
++			rh_quarantine_source(bit);
++			return EIO;
++		}
++	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[RH_ARC_MAX_LEVELS] = {0};
+ 	bool done = false, progress = false;
+-	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++	for (unsigned us = 0; us < timeout_us; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+ 		}
+-		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
+ 		progress |= idle == 0 || !complete;
++		/* ARC requires the fresh latch. Preserve the existing touchscreen
++		 * regulator path; it is not part of this GPU completion change.
++		 * Old command status and an idle TCS alone are never accepted. */
+ 		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
+-		    ((irq & bit) || progress) && complete) {
++		    ((irq & bit) || (!poll_latch && progress)) && complete) {
+ 			done = true;
+ 			break;
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x",
++	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL));
++	for (unsigned c = 0; c < n; ++c) {
++		printf(" status%u=%#x", c, status[c]);
++	}
++	printf("\n");
+ 	if (!done) {
++		rh_quarantine_source(bit);
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+ 	}
++	/* Read payload before releasing the slot; do not expose it on cleanup error. */
++	uint32_t reply = response ? rh_read(rh_tcs, b + RH_RESP_DATA) : 0;
+ 	/* Proven completion: clear trigger before mode, then free only our commands. */
+-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	if (!rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit) ||
++	    !rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
+ 	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+ 		return EIO;
+ 	}
+@@ -320,7 +465,12 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	if (response) {
++		*response = reply;
++		printf("SWEET RPMH: %s ACTIVE read complete raw=%#x\n", res, reply);
++	} else {
++		printf("SWEET RPMH: %s ACTIVE vote complete\n", res);
++	}
+ 	return 0;
+ }
+ 
+@@ -336,17 +486,24 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 		return EBUSY;
+ 	}
+ 	int error = EIO;
+-	uint32_t address = 0;
++	struct rh_res found = {0};
+ 	if (rh_poisoned) {
+ 		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
+ 		goto out;
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &found);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t offsets[3] = {0, 8, 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send_cmds(res, found.addr, 15u, offsets, values, 3,
++		    RH_TIMEOUT_US, NULL);
++		if (!error) {
++			rh_touch_ready = true;
++		}
+ 	}
+ out:
+ 	if (error) {
+@@ -355,4 +512,703 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * Bluetooth rails (bsd/dev/sweet_bt.c, sweet DT bt_wcn3990): vdd-io L10A, xtal L1C, core L2C,
++ * pa L10C, each within its DT range; voltage, HPM, then enable, like vreg_enable. Only "on":
++ * an APPS "off" vote also drops what ABL voted through this DRV (Bergamota boot 0116hw).
++ */
++int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
++int
++sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
++{
++	static const struct { const char *name; unsigned min_mv, max_mv; } bt[] = {
++		{ "ldoa10", 1704, 1900 }, { "ldoc1", 1704, 1900 }, { "ldoc2", 1245, 1350 }, { "ldoc10", 3200, 3400 },
++	};
++	bool ok = false;
++	for (unsigned i = 0; res && i < sizeof(bt) / sizeof(bt[0]); i++) {
++		ok |= !strcmp(res, bt[i].name) && mv >= bt[i].min_mv && mv <= bt[i].max_mv;
++	}
++	if (!ok || !enable) {
++		printf("SWEET RPMH: BT rail vote %s %u mV %s refused\n", res ? res : "(null)", mv, enable ? "on" : "off");
++		return EPERM;
++	}
++	for (unsigned tries = 0; __atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE); tries++) {
++		if (tries >= 200) {
++			return EBUSY;
++		}
++		delay(1000);
++	}
++	int error = EIO;
++	struct rh_res found = {0};
++	if (!rh_poisoned) {
++		error = rh_map();
++		if (!error) {
++			error = rh_lookup(res, RH_VRM, &found);
++		}
++		if (!error) {
++			const uint32_t offsets[3] = {0, 8, 4};
++			const uint32_t values[3] = {mv, 7, 1};
++			error = rh_send_cmds(res, found.addr, 15u, offsets, values, 3, RH_TIMEOUT_US, NULL);
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++static bool
++rh_arc_name(const char *res)
++{
++	return res && (!strcmp(res, "cx.lvl") || !strcmp(res, "mx.lvl") ||
++	    !strcmp(res, "gfx.lvl"));
++}
++
++/*
++ * Read-only command-DB inspection.  No TCS is claimed, no RPMH command is
++ * written, and no rail is changed.  This is the evidence-gathering step before
++ * the first ARC vote.
++ */
++int
++sweet_rpmh_arc_probe(const char *res)
++{
++	/* XO inspection only: write APIs retain the original resource whitelist. */
++	if (!rh_arc_name(res) && (!res || strcmp(res, "xo.lvl"))) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	struct rh_res found = {0};
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_ARC, &found);
++	}
++	if (!error) {
++		uint32_t level[RH_ARC_MAX_LEVELS] = {0};
++		unsigned count = 0;
++		error = rh_arc_levels(&found, level, &count);
++		if (!error) {
++			printf("SWEET RPMH: ARC %s read-only table:", res);
++			for (unsigned i = 0; i < count; ++i) {
++				printf(" %u:%u", i, level[i]);
++			}
++			printf("\n");
++		}
++	}
++	if (error) {
++		printf("SWEET RPMH: ARC probe %s failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/* Build wire votes from raw command-DB levels, not regulator levels (+1).
++ * Uses only command-DB RAM: no new ACTIVE TCS write authority. */
++int sweet_rpmh_adreno_votes(uint32_t *gpu, uint32_t *gmu);
++int
++sweet_rpmh_adreno_votes(uint32_t *gpu, uint32_t *gmu)
++{
++ if (!gpu || !gmu) return EINVAL;
++ *gpu = *gmu = 0;
++ if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++ const char *names[] = {"gfx.lvl", "cx.lvl", "mx.lvl"};
++ const uint32_t address[] = {0x30050, 0x30000, 0x30010};
++ uint32_t levels[3][RH_ARC_MAX_LEVELS] = {{0}};
++ unsigned counts[3] = {0}, selected[3] = {0};
++ int error = rh_map();
++ for (unsigned r = 0; !error && r < 3; ++r) {
++  struct rh_res resource = {0};
++  error = rh_lookup(names[r], RH_ARC, &resource);
++  if (!error && resource.addr != address[r]) error = ENODEV;
++  if (!error) error = rh_arc_levels(&resource, levels[r], &counts[r]);
++  if (error) break;
++  /* MIN_SVS is raw 48 in the pinned RPMh bindings. The measured
++  * GFX/CX tables round this up to 64; MX rounds up to 192. */
++  unsigned i;
++  for (i = 0; i < counts[r]; ++i) {
++   --levels[r][i];
++   if (!selected[r] && levels[r][i] >= 48) selected[r] = i;
++  }
++  if (!selected[r] || levels[r][0] != 0) error = ERANGE;
++ }
++ if (!error) {
++  *gpu = (levels[0][selected[0]] << 16) | (selected[2] << 8) | selected[0];
++  *gmu = (levels[1][selected[1]] << 16) | (selected[2] << 8) | selected[1];
++ }
++ __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++ return error;
++}
++
++/*
++ * One GPU performance level's wire vote, as Linux a6xx_gmu_rpmh_arc_votes_init:
++ * the first gfx.lvl entry at or above the OPP's raw level is primary; the
++ * first mx.lvl entry at or above it is secondary, else the highest nonzero
++ * one. *mx_level returns that secondary level for an APPS raise-only floor.
++ */
++int sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level);
++int
++sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level)
++{
++ if (!vote || !mx_level || !level) return EINVAL;
++ *vote = 0; *mx_level = 0;
++ if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++ const char *names[] = {"gfx.lvl", "mx.lvl"};
++ const uint32_t address[] = {0x30050, 0x30010};
++ uint32_t levels[2][RH_ARC_MAX_LEVELS] = {{0}};
++ unsigned counts[2] = {0}, index[2] = {0};
++ bool found[2] = {false, false};
++ int error = rh_map();
++ for (unsigned r = 0; !error && r < 2; ++r) {
++  struct rh_res resource = {0};
++  error = rh_lookup(names[r], RH_ARC, &resource);
++  if (!error && resource.addr != address[r]) error = ENODEV;
++  if (!error) error = rh_arc_levels(&resource, levels[r], &counts[r]);
++  if (error) break;
++  for (unsigned i = 0; i < counts[r]; ++i) {
++   --levels[r][i];
++   if (!found[r] && levels[r][i] >= level) { index[r] = i; found[r] = true; }
++   else if (!found[r] && r == 1 && levels[r][i]) index[r] = i;
++  }
++  if (levels[r][0] != 0) error = ERANGE;
++ }
++ if (!error && !found[0]) error = ERANGE;
++ if (!error && !index[1]) error = ERANGE;
++ if (!error) {
++  *vote = (levels[0][index[0]] << 16) | (index[1] << 8) | index[0];
++  *mx_level = levels[1][index[1]];
++ }
++ __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++ return error;
++}
++
++/*
++ * Read one ARC resource while the caller holds rh_lock. The same serialized
++ * ACTIVE TCS engine is used for reads and for the raise-only write below.
++ */
++static int
++rh_arc_read_locked(const char *res, struct rh_res *found,
++    uint32_t *level, unsigned *count, uint32_t *reply)
++{
++	int error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_ARC, found);
++	}
++	if (!error) {
++		error = rh_arc_levels(found, level, count);
++	}
++	if (!error) {
++		const uint32_t zero = 0;
++		error = rh_send_cmds(res, found->addr, 3u, &zero, &zero, 1,
++		    RH_ARC_TIMEOUT_US, reply);
++	}
++	return error;
++}
++
++/*
++ * ARC READ uses the same serialized ACTIVE TCS engine as the touch VRM.
++ * qcom-rpmh-mailbox.c defines READ by clearing MSGID.WRITE and retrieves
++ * CMD_RESP_DATA at 0x40. This does not change a resource vote, although it
++ * programs a TCS. Do not infer the retained APPS vote from the DT minimum.
++ *
++ * The meaning of an ARC reply must be established on this board before
++ * introducing a vote floor. Until then this API logs raw replies only.
++ */
++int
++sweet_rpmh_arc_read(const char *res)
++{
++	if (!rh_arc_name(res)) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	struct rh_res found = {0};
++	uint32_t level[RH_ARC_MAX_LEVELS] = {0};
++	unsigned count = 0;
++	uint32_t reply = 0xffffffffu;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing ARC read\n");
++		goto out;
++	}
++	if (!rh_touch_ready) {
++		/* A failed experiment must not block the first touch-power vote. */
++		error = EAGAIN;
++		printf("SWEET RPMH: ARC read deferred: L11C has not completed\n");
++		goto out;
++	}
++	error = rh_arc_read_locked(res, &found, level, &count, &reply);
++	if (!error) {
++		printf("SWEET RPMH: ARC %s reply=%#x table-count=%u\n",
++		    res, reply, count);
++		if (reply < count) {
++			printf("SWEET RPMH: ARC reply as index: vlvl=%u (interpretation unverified)\n",
++			    level[reply]);
++		} else {
++			printf("SWEET RPMH: ARC reply is not a plain table index\n");
++		}
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: ARC read %s failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/* Check the current board's ARC selector interpretation without voting.
++ * Unlike arc_read(), this returns an error for off/out-of-range replies.
++ * This is a resource-setting check; it does not measure a rail voltage.
++ */
++int
++sweet_rpmh_arc_require(const char *res, unsigned minimum)
++{
++	if (!rh_arc_name(res) || minimum <= 1)
++		return EINVAL;
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE))
++		return EBUSY;
++	int error = EIO;
++	struct rh_res found = {0};
++	uint32_t levels[RH_ARC_MAX_LEVELS] = {0}, reply = 0xffffffffu;
++	unsigned count = 0;
++	if (rh_poisoned)
++		goto out;
++	if (!rh_touch_ready) {
++		error = EAGAIN;
++		goto out;
++	}
++	error = rh_arc_read_locked(res, &found, levels, &count, &reply);
++	if (error)
++		goto out;
++	if (reply >= count) {
++		error = EIO;
++		goto out;
++	}
++	printf("SWEET RPMH: ARC require %s selector=%u interpreted-level=%u minimum=%u\n",
++	    res, reply, levels[reply], minimum);
++	if (levels[reply] < minimum)
++		error = EAGAIN;
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/*
++ * Userland RPMh votes for wland (/dev/pmem PMEM_RPMH, root, sweetpmem=1),
++ * limited to what Sweet's WCN3990 and modem bring-up need, with the ranges
++ * from the live FDT: icnss rails L9A (cx-mx 624-760mV), L1C (1.8-xo
++ * 1616-1984), L2C (1.3-rfa 1200-1352), L10C (3.3-ch0 3200-3312) as
++ * {voltage@0, mode@8 (HPM 7), enable@4}; rfclka2 enable@4; and the modem
++ * proxy votes on cx.lvl/mss.lvl (one table index at offset 0). Everything
++ * else, including Sweet's touch supply L11C, is refused.
++ */
++int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++int
++sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
++{
++	static const struct { const char *name; unsigned min_mv, max_mv; } rails[] = {
++		{ "ldoa9", 624, 760 }, { "ldoc1", 1616, 1984 }, { "ldoc2", 1200, 1352 }, { "ldoc10", 3200, 3312 },
++	};
++	if (!res || !offsets || !values || n == 0 || n > 4) {
++		return EINVAL;
++	}
++	int rail = -1;
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		if (!strcmp(res, rails[i].name)) {
++			rail = (int)i;
++		}
++	}
++	const bool clock = !strcmp(res, "rfclka2");
++	const bool arc = !strcmp(res, "cx.lvl") || !strcmp(res, "mss.lvl");
++	if (rail < 0 && !clock && !arc) {
++		printf("SWEET RPMH: userland vote for %s refused (not a Wi-Fi/modem resource)\n", res);
++		return EPERM;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		const uint32_t o = offsets[i], v = values[i];
++		const bool ok = arc ? (o == 0 && v < RH_ARC_MAX_LEVELS) :
++		    clock ? (o == 4 && v <= 1) :
++		    ((o == 0 && v >= rails[rail].min_mv && v <= rails[rail].max_mv) || (o == 4 && v <= 1) || (o == 8 && v == 7));
++		if (!ok) {
++			printf("SWEET RPMH: userland vote %s offset %#x value %u refused\n", res, o, v);
++			return EPERM;
++		}
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	struct rh_res found = {0};
++	uint32_t level[RH_ARC_MAX_LEVELS] = {0};
++	unsigned count = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing userland vote\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, arc ? RH_ARC : RH_VRM, &found);
++	}
++	if (!error && arc) {
++		error = rh_arc_levels(&found, level, &count);
++		if (!error && values[0] >= count) {
++			error = ERANGE;
++		}
++	}
++	if (!error) {
++		error = rh_send_cmds(res, found.addr, arc ? 3u : 15u, offsets, values, n,
++		    arc ? RH_ARC_TIMEOUT_US : RH_TIMEOUT_US, NULL);
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/*
++ * 0149: a bus (BCM) vote from the kernel. The apps SMMU (0x15000000) sits
++ * behind the path its downstream node votes (msm-bus 161 -> 627 = BCMs SN15
++ * and CN0, active-only, 1000 KBps); 0131's wland stalled a CPU on its first
++ * apps-SMMU read with no such vote. Command: commit|valid|x<<14|y, as
++ * Linux's BCM_TCS_CMD. Only those two BCMs, only small nonzero levels.
++ */
++int sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y);
++int
++sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y)
++{
++	/* SN15/CN0: the apps SMMU's path (0149, tiny votes); MC0/SH0/ACV: the memory (0169) */
++	const bool memory = res && (!strcmp(res, "MC0") || !strcmp(res, "SH0") || !strcmp(res, "ACV"));
++	if (!res || (strcmp(res, "SN15") && strcmp(res, "CN0") && !memory) ||
++	    x > (memory ? 0x3fffu : 16u) || y > (memory ? 0x3fffu : 16u) || (!x && !y)) {
++		return EPERM;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	struct rh_res found = {0};
++	if (!rh_poisoned) {
++		error = rh_map();
++		if (!error) {
++			error = rh_lookup(res, RH_BCM, &found);
++		}
++		if (!error) {
++			const uint32_t offset = 0, value = 1u << 30 | 1u << 29 | x << 14 | y;
++			error = rh_send_cmds(res, found.addr, 3u, &offset, &value, 1, RH_TIMEOUT_US, NULL);
++			static unsigned bcm_logged;
++			if (error || ++bcm_logged <= 4) {
++				printf("SWEET RPMH: BCM %s addr=%#x vote %#x -> %d\n", res, found.addr, value, error);
++			}
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/*
++ * Raise-only ARC vote. This is deliberately narrower than 0083's fixed
++ * votes: it reads the resource first, refuses a non-index reply, and never
++ * writes a selector below the current level. gfx.lvl and mx.lvl only: a
++ * GPU clock above the bootloader corner first raises both APPS floors so the
++ * rails cannot depend solely on the GMU's own votes. cx.lvl stays untouched.
++ */
++int
++sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl)
++{
++	if (!res || (strcmp(res, "gfx.lvl") && strcmp(res, "mx.lvl")) || target_vlvl == 0) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	struct rh_res found = {0};
++	uint32_t level[RH_ARC_MAX_LEVELS] = {0};
++	unsigned count = 0;
++	uint32_t before = 0xffffffffu, after = 0xffffffffu;
++	unsigned selector = 0;
++
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing ARC raise\n");
++		goto out;
++	}
++	if (!rh_touch_ready) {
++		error = EAGAIN;
++		printf("SWEET RPMH: ARC raise deferred: L11C has not completed\n");
++		goto out;
++	}
++	error = rh_arc_read_locked(res, &found, level, &count, &before);
++	if (error) {
++		goto out;
++	}
++	printf("SWEET RPMH: ARC %s raise before=%#x table-count=%u target-vlvl=%u\n",
++	    res, before, count, target_vlvl);
++	if (before >= count) {
++		printf("SWEET RPMH: ARC %s reply is not a table index; refusing write\n", res);
++		error = EINVAL;
++		goto out;
++	}
++	if (level[before] >= target_vlvl) {
++		printf("SWEET RPMH: ARC %s already at/above vlvl=%u; no write\n",
++		    res, level[before]);
++		error = 0;
++		goto out;
++	}
++	for (selector = 0; selector < count; ++selector) {
++		if (level[selector] >= target_vlvl) {
++			break;
++		}
++	}
++	if (selector == 0 || selector >= count) {
++		printf("SWEET RPMH: ARC %s no safe selector >= target; refusing write\n", res);
++		error = ERANGE;
++		goto out;
++	}
++	printf("SWEET RPMH: ARC %s raise selector=%u vlvl=%u from=%#x vlvl=%u\n",
++	    res, selector, level[selector], before, level[before]);
++	{
++		const uint32_t offset = 0;
++		const uint32_t value = selector;
++		error = rh_send_cmds(res, found.addr, 3u, &offset, &value, 1,
++		    RH_ARC_TIMEOUT_US, NULL);
++	}
++	if (error) {
++		goto out;
++	}
++	error = rh_arc_read_locked(res, &found, level, &count, &after);
++	if (error) {
++		goto out;
++	}
++	printf("SWEET RPMH: ARC %s raise after=%#x expected=%u\n",
++	    res, after, selector);
++	if (after != selector) {
++		printf("SWEET RPMH: ARC %s raise readback mismatch; no retry, no GPUCC access\n", res);
++		error = EIO;
++	} else if (after >= count) {
++		printf("SWEET RPMH: ARC %s raise readback index outside table; no retry\n", res);
++		error = EIO;
++	} else {
++		printf("SWEET RPMH: ARC %s raise verified selector=%u vlvl=%u\n",
++		    res, selector, level[after]);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: ARC raise %s failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++
++/*
++ * 0149 opt-in (sweetsmmuprobe=1): vote SN15+CN0, then read the apps SMMU's
++ * ID registers from a thread of its own, logging before each read so a stall
++ * is visible as the last line. Votes stay in place for wland's SMMU step.
++ */
++/*
++ * 0153 (sweetsmmuwlan=1): wland's smmu_wlan_identity() done here at boot,
++ * where the apps-SMMU reads work, so wland (told by the boot-arg) never
++ * touches the SMMU. Same policy: WLAN SID 0x240 mask 1 -> the lowest free SMR
++ * and a free context bank with translation off (CBAR 0x1f000 = S1 translate,
++ * S2 bypass as ABL's banks; CBA2R AArch64; SCTLR 0xe0 = fault reporting, M=0).
++ */
++#define SMMU_WLAN_SID   0x240u
++#define SMMU_WLAN_MASK  0x1u
++static bool
++smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
++{
++	uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
++	return ((id ^ sid) & ~(m | mask) & 0x7fff) == 0;
++}
++static void
++sweet_smmu_wlan_stream(volatile uint32_t *gr0, uint32_t id0, uint32_t id1)
++{
++	const uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	const uint64_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1ull << (((id1 >> 28) & 7) + 1);
++	if (psize != 0x1000 || nsmr > 128 || ncb > 128 || (npage + ncb) * psize > 0x100000) {
++		printf("SWEET SMMU: WLAN stream: unexpected geometry smr=%u cb=%u page=%#llx x %llu\n", nsmr, ncb, psize, npage);
++		return;
++	}
++	volatile uint32_t *gr1 = (volatile uint32_t *)ml_io_map(0x15000000 + psize, psize);
++	if (!gr1) {
++		return;
++	}
++	uint64_t used[2] = {0, 0};
++	int slot = -1;
++	for (uint32_t i = 0; i < nsmr; i++) {
++		const uint32_t smr = gr0[(0x800 + 4 * i) / 4], s2cr = gr0[(0xc00 + 4 * i) / 4];
++		if (!(smr >> 31)) {
++			if (slot < 0) {
++				slot = (int)i;
++			}
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
++		}
++		if (smmu_sid_match(smr, SMMU_WLAN_SID, SMMU_WLAN_MASK)) {
++			printf("SWEET SMMU: WLAN stream: SMR%u %#x already matches (S2CR %#x)\n", i, smr, s2cr);
++			return;
++		}
++	}
++	int cb = -1;
++	volatile uint32_t *cbp = NULL;
++	for (uint32_t c = 0; c < ncb && cb < 0; c++) {
++		if (used[c / 64] & (1ull << (c % 64)) || gr1[c] != 0) {
++			continue;
++		}
++		volatile uint32_t *page = (volatile uint32_t *)ml_io_map(0x15000000 + (npage + c) * psize, psize);
++		if (page && !(page[0] & 1)) {
++			cb = (int)c;
++			cbp = page;
++		}
++	}
++	if (slot < 0 || cb < 0) {
++		printf("SWEET SMMU: WLAN stream: no free SMR/bank (SMR %d, bank %d)\n", slot, cb);
++		return;
++	}
++	cbp[0x58 / 4] = 0xffffffff;     /* FSR clear */
++	cbp[0x20 / 4] = 0;              /* TTBR0 */
++	cbp[0x24 / 4] = 0;
++	cbp[0x30 / 4] = 0;              /* TCR */
++	cbp[0x10 / 4] = 0;              /* TCR2 */
++	cbp[0x38 / 4] = 0;              /* MAIR */
++	cbp[0x3c / 4] = 0;
++	gr1[(0x800 + 4 * cb) / 4] = 0x00000001;          /* CBA2R: AArch64 */
++	gr1[cb] = 0x0001f000;                             /* CBAR */
++	cbp[0] = 0x000000e0;                              /* SCTLR last */
++	gr0[(0xc00 + 4 * slot) / 4] = (uint32_t)cb;       /* S2CR: translate via the bank */
++	gr0[(0x800 + 4 * slot) / 4] = (1u << 31) | (SMMU_WLAN_MASK << 16) | SMMU_WLAN_SID;
++	gr0[0x70 / 4] = 0;                                /* sTLBGSYNC */
++	for (int i = 0; i < 1000 && (gr0[0x74 / 4] & 1); i++) {
++		delay(1000);
++	}
++	const uint32_t smr = gr0[(0x800 + 4 * slot) / 4], s2cr = gr0[(0xc00 + 4 * slot) / 4];
++	const bool ok = (smr >> 31) && smmu_sid_match(smr, SMMU_WLAN_SID, SMMU_WLAN_MASK) &&
++	    ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)cb;
++	printf("SWEET SMMU: WLAN %#x/%#x -> CB%d via SMR%d: SMR %#x S2CR %#x SCTLR %#x CBAR %#x -> %s\n",
++	    SMMU_WLAN_SID, SMMU_WLAN_MASK, cb, slot, smr, s2cr, cbp[0], gr1[cb], ok ? "ok" : "NOT as written");
++}
++
++/*
++ * 0180: read-only. Which SMRs route the display controller (MDSS, DT iommus
++ * SID 0x800 mask 0x440) and how its context bank translates, so a page-flip
++ * present knows whether scanout addresses are physical (bypass or SCTLR.M=0)
++ * or go through an ABL page table (TTBR0).
++ */
++#define SMMU_MDSS_SID   0x800u
++#define SMMU_MDSS_MASK  0x440u
++static void
++sweet_smmu_dump_mdss(volatile uint32_t *gr0, uint32_t id0, uint32_t id1)
++{
++	const uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	const uint64_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1ull << (((id1 >> 28) & 7) + 1);
++	if (psize != 0x1000 || nsmr > 128 || ncb > 128 || (npage + ncb) * psize > 0x100000) {
++		printf("SWEET SMMU: MDSS: unexpected geometry\n");
++		return;
++	}
++	volatile uint32_t *gr1 = (volatile uint32_t *)ml_io_map(0x15000000 + psize, psize);
++	unsigned found = 0;
++	for (uint32_t i = 0; i < nsmr; i++) {
++		const uint32_t smr = gr0[(0x800 + 4 * i) / 4], s2cr = gr0[(0xc00 + 4 * i) / 4];
++		if (!(smr >> 31)) {
++			continue;
++		}
++		const uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
++		/* Overlaps the MDSS stream group: some SID matches both. */
++		if (((id ^ SMMU_MDSS_SID) & ~(m | SMMU_MDSS_MASK) & 0x7fff) != 0) {
++			continue;
++		}
++		found++;
++		const uint32_t type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
++		if (type != 0 || cb >= ncb || gr1 == NULL) {
++			printf("SWEET SMMU: MDSS SMR%u %#x S2CR %#x (type %u: %s)\n", i, smr, s2cr, type,
++			    type == 1 ? "bypass" : type == 2 ? "fault" : "translate");
++			continue;
++		}
++		volatile uint32_t *cbp = (volatile uint32_t *)ml_io_map(0x15000000 + (npage + cb) * psize, psize);
++		if (cbp == NULL) {
++			continue;
++		}
++		printf("SWEET SMMU: MDSS SMR%u %#x S2CR %#x -> CB%u CBAR %#x CBA2R %#x SCTLR %#x TTBR0 %#x%08x TCR %#x TCR2 %#x MAIR %#x,%#x FSR %#x FAR %#x%08x\n",
++		    i, smr, s2cr, cb, gr1[cb], gr1[(0x800 + 4 * cb) / 4], cbp[0], cbp[0x24 / 4], cbp[0x20 / 4],
++		    cbp[0x30 / 4], cbp[0x10 / 4], cbp[0x38 / 4], cbp[0x3c / 4], cbp[0x58 / 4], cbp[0x64 / 4], cbp[0x60 / 4]);
++	}
++	printf("SWEET SMMU: MDSS %#x/%#x: %u matching SMRs\n", SMMU_MDSS_SID, SMMU_MDSS_MASK, found);
++}
++
++static void
++sweet_smmu_probe_thread(void *arg, wait_result_t wr)
++{
++	(void)wr;
++	extern void IOSleep(unsigned);
++	const int votes = (int)(uintptr_t)arg;
++	IOSleep(1000);
++	printf("SWEET SMMU: votes %s; reading apps SMMU sCR0/ID0/ID1 next\n", votes ? "failed" : "held");
++	volatile uint32_t *smmu = (volatile uint32_t *)ml_io_map(0x15000000, 0x1000);
++	if (!smmu) {
++		printf("SWEET SMMU: map failed\n");
++		return;
++	}
++	const uint32_t scr0 = smmu[0];
++	printf("SWEET SMMU: sCR0=%#x\n", scr0);
++	const uint32_t id0 = smmu[0x20 / 4], id1 = smmu[0x24 / 4], id2 = smmu[0x28 / 4];
++	printf("SWEET SMMU: ID0=%#x ID1=%#x ID2=%#x: %u SMRs, %u context banks\n", id0, id1, id2, id0 & 0xff, id1 & 0xff);
++	extern uint32_t sweet_pmem_probe_read(uint64_t pa);
++	printf("SWEET SMMU: reading ID0 through the /dev/pmem window path next\n");
++	printf("SWEET SMMU: pmem-path ID0=%#x\n", sweet_pmem_probe_read(0x15000020));
++	int wlan = 0;
++	PE_parse_boot_argn("sweetsmmuwlan", &wlan, sizeof(wlan));
++	if (wlan) {
++		sweet_smmu_wlan_stream(smmu, id0, id1);
++	}
++	sweet_smmu_dump_mdss(smmu, id0, id1);
++}
++
++void sweet_smmu_probe_start(void);
++void
++sweet_smmu_probe_start(void)
++{
++	int on = 0;
++	PE_parse_boot_argn("sweetsmmuprobe", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	/* 0150: vote now, in bsd init, so the path is up before launchd can start
++	 * wland (0139: the 20 s-later votes made the first apps-SMMU reads work). */
++	const int sn = sweet_rpmh_bcm_vote("SN15", 1, 1), cn = sweet_rpmh_bcm_vote("CN0", 1, 1);
++	printf("SWEET SMMU: votes SN15=%d CN0=%d\n", sn, cn);
++	thread_t thread = THREAD_NULL;
++	if (kernel_thread_start(sweet_smmu_probe_thread, (void *)(uintptr_t)(sn || cn), &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET SMMU: apps SMMU probe armed (1 s)\n");
++	}
++}
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0169: memory bandwidth. Nothing here voted for DRAM; the frames stayed at ~300 Mpx/s of GPU fill
++ * whatever the GPU clock, tiling or shaders (0154-0158 hardware). HackiOS (oosexgang/hackios-xnu-kernel,
++ * bsd/dev/hakios.cpufreq.c ddr_raise(), Poco X5 Pro) casts what Linux's interconnect driver casts for a
++ * busy GPU: the memory controller's BCM (MC0) and the shared hub with the system cache (SH0) at the
++ * most there is (commit, valid, average and peak 14 bits each), and ACV with the apps bit (8): their
++ * Control Center 46 -> 59 frames/s, Settings opening 29 -> 37. sweetddr=0: no vote; sweetddrvote=N:
++ * N instead of 0x3fff.
++ */
++void sweet_rpmh_ddr_raise(void);
++void
++sweet_rpmh_ddr_raise(void)
++{
++	uint32_t on = 1, vote = 0x3fff;
++	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
++	PE_parse_boot_argn("sweetddrvote", &vote, sizeof(vote));
++	if (!on || vote == 0 || vote > 0x3fff) {
++		printf("SWEET DDR: no memory bandwidth vote (sweetddr=%u, vote %u)\n", on, vote);
++		return;
++	}
++	const int mc0 = sweet_rpmh_bcm_vote("MC0", vote, vote);
++	const int sh0 = sweet_rpmh_bcm_vote("SH0", vote, vote);
++	const int acv = sweet_rpmh_bcm_vote("ACV", 0, 8);
++	printf("SWEET DDR: memory bandwidth vote %u: MC0 %d, SH0 %d, ACV %d\n", vote, mc0, sh0, acv);
++}
++#endif
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..f297a01 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -86,11 +86,13 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery blocks; keys retain their own lanes. 0xb6: the QG SDAM
++	 * (stock DT qcom,qg-sdam@b600), memory the Linux QG driver keeps its SOC in (0164). 0x60: the
++	 * RTC's counter, read once to set the calendar (0166). */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0xb6 && peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 82ea1dd..bc7198f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -51,9 +51,16 @@ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
++extern void sweet_pmem_init(void);
++extern void flame_wlan_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_gpu_probe(void);
++extern int sweet_native_adreno_reserve_pool(void);
++extern void sweet_smmu_probe_start(void);
++extern void sweet_rpmh_ddr_raise(void);
++extern void sweet_bt_init(void);
++extern void sweet_haptic_init(void);
+ extern void sweet_usb_probe(void);
+-extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -657,11 +664,18 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
++	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
++	sweet_rpmh_ddr_raise();     /* sweetddr: MC0/SH0 at the most, ACV apps (0169, from HackiOS) */
++	sweet_smmu_probe_start();   /* sweetsmmuprobe=1: BCM votes + apps SMMU ID read (0149) */
++	sweet_haptic_init();     /* sweethaptic=1|2|3: AW8624 on QUP1 SE3 (bsd/dev/sweet_haptic.c) */
++	sweet_bt_init();         /* sweetbt=1: WCN3990 Bluetooth over QUP0 SE3, com.apple.uart.bluetooth (bsd/dev/sweet_bt.c) */
++	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c, from ios-flame 0123 */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_gpu_probe();
+ 	sweet_usb_probe();
+-	sweet_gpu_init();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/sys/flame_wlan.h b/bsd/sys/flame_wlan.h
+new file mode 100644
+index 0000000..9107cbb
+--- /dev/null
++++ b/bsd/sys/flame_wlan.h
+@@ -0,0 +1,69 @@
++/*
++ * /dev/wlan: the kernel's Wi-Fi station (bsd/dev/flame_wlan.c, under en0 and wifid's Apple80211 requests,
++ * ios-topaz 0900's redwood code) and the radio, which runs in userland (phone/wifi: wland). The same file is
++ * the kernel's bsd/sys/flame_wlan.h.
++ *
++ * One message per read() or write(): a header, then `len` bytes. wland opens the device once the radio is up,
++ * says HELLO, and from then on reads the kernel's requests (non-blocking) and writes what happened.
++ */
++#ifndef _SYS_FLAME_WLAN_H_
++#define _SYS_FLAME_WLAN_H_
++#include <stdint.h>
++
++struct fw_hdr {
++	uint16_t type;
++	uint16_t len;			/* of the payload after the header */
++};
++
++enum {
++	/* kernel -> wland */
++	FW_SCAN = 1,			/* no payload: scan, then BSS_BEGIN, BSS..., SCAN_DONE */
++	FW_JOIN = 2,			/* struct fw_join; JOIN_DONE when frames can pass or why not */
++	FW_LEAVE = 3,			/* no payload; LEFT */
++	FW_TX = 4,			/* an Ethernet frame (destination, source, type, payload) */
++
++	/* wland -> kernel */
++	FW_HELLO = 16,			/* struct fw_hello: the radio is up */
++	FW_BSS_BEGIN = 17,		/* no payload: a new list of what was heard follows */
++	FW_BSS = 18,			/* struct fw_bss */
++	FW_SCAN_DONE = 19,		/* int32_t: 0 or an errno */
++	FW_JOIN_DONE = 20,		/* int32_t: 0 or an errno */
++	FW_LEFT = 21,			/* int32_t */
++	FW_LINK = 22,			/* struct fw_link: frames can pass now (up), or no longer (left or lost) */
++	FW_RX = 23,			/* an Ethernet frame */
++};
++
++#define FW_FRAME_MAX	1514
++#define FW_MSG_MAX	(sizeof(struct fw_hdr) + 1600)
++
++struct fw_hello {
++	uint8_t address[6];
++};
++
++enum { FW_KEY_NONE, FW_KEY_PASSPHRASE, FW_KEY_PMK };
++
++struct fw_join {
++	uint8_t ssid[32], ssid_len;
++	uint8_t bssid[6], any_bssid;	/* any_bssid: the access point of that name heard best */
++	uint8_t key_kind, key_len;	/* FW_KEY_*: the passphrase (8-63 bytes) or the 32-byte PMK */
++	uint8_t key[64];
++};
++
++struct fw_link {
++	uint8_t up;
++	uint8_t ssid[32], ssid_len;	/* the network joined (also when wland joined it by itself: wlan.conf) */
++	uint8_t bssid[6];
++};
++
++struct fw_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_len;
++	uint16_t frequency;		/* MHz */
++	int16_t rssi;			/* dBm */
++	uint16_t beacon_interval, capability;
++	uint32_t age_ms;
++	uint16_t elements_len;
++	uint8_t elements[768];		/* the beacon's information elements */
++};
++
++#endif
+diff --git a/bsd/sys/redwood_input.h b/bsd/sys/redwood_input.h
+new file mode 100644
+index 0000000..c5dbd02
+--- /dev/null
++++ b/bsd/sys/redwood_input.h
+@@ -0,0 +1,5 @@
++/* topaz: the one thing the station files take from redwood_input.h */
++#ifndef _SYS_REDWOOD_INPUT_H_
++#define _SYS_REDWOOD_INPUT_H_
++#define redwood_wifi_tell(...) printf(__VA_ARGS__)
++#endif
+diff --git a/bsd/sys/redwood_net.h b/bsd/sys/redwood_net.h
+new file mode 100644
+index 0000000..41550ce
+--- /dev/null
++++ b/bsd/sys/redwood_net.h
+@@ -0,0 +1,63 @@
++/*
++ * en0, and what stands behind it.
++ *
++ * The network interface iOS uses here is made in bsd/dev/redwood_net.c with the kernel's own
++ * interface KPI: Ethernet as far as the rest of the kernel and user space can tell. What carries
++ * the frames is a "link", a driver of its own that knows nothing about interfaces: QEMU's virtio
++ * network device today (bsd/dev/redwood_virtio_net.c), the phone's radio or frames carried over
++ * the boot loader's USB channel tomorrow. This is all the two know of each other.
++ *
++ * A link driver
++ *   - fills in a struct redwood_net_link and calls redwood_net_attach() once, when it is ready
++ *     to carry frames (for a radio: when its firmware is up, not when it has joined a network);
++ *   - hands every frame that arrives to redwood_net_input(): from its own thread, or from
++ *     the poll function the interface's thread calls for it. Not from interrupt context;
++ *   - says with redwood_net_link_state() when frames can pass and when they no longer can
++ *     (the cable, or for a radio: associated and the keys set). configd starts DHCP on that.
++ * A frame is what goes over an Ethernet cable without the checksum at its end: destination,
++ * source, type, payload; at most REDWOOD_NET_FRAME_MAX bytes. A radio whose frames are 802.11
++ * converts in its driver (or has its firmware do it: "Ethernet decap/encap").
++ */
++#ifndef _SYS_REDWOOD_NET_H_
++#define _SYS_REDWOOD_NET_H_
++
++#ifdef KERNEL
++#include <sys/kpi_mbuf.h>
++
++#define REDWOOD_NET_FRAME_MAX   1514
++
++struct redwood_net_link {
++	const char *    name;           /* for the log */
++	uint8_t         address[6];     /* the interface's Ethernet address */
++	bool            wireless;       /* the interface is told to be Wi-Fi (its "subfamily"), which is how the
++	                                 * network stack and configd tell a radio from a cable */
++	bool            up;             /* frames can pass from the start (else: wait for redwood_net_link_state()) */
++	/*
++	 * Send one frame: a chain of mbufs, `length` bytes in all, the Ethernet header first. The
++	 * packet stays the caller's: copy it (mbuf_copydata()). Returns false if it had to be dropped.
++	 * Called by one thread at a time, never from interrupt context.
++	 */
++	bool            (*transmit)(mbuf_t packet, size_t length);
++	/*
++	 * Optional. Look whether frames have arrived and call redwood_net_input() for each; returns
++	 * how many there were. The interface's thread calls it every 2 ms while frames are coming and
++	 * every 10 ms when none has for a while. A link that has a thread or an interrupt of its own
++	 * leaves it NULL.
++	 */
++	unsigned        (*poll)(void);
++};
++
++/* Make en0 on top of that link (the structure must stay). One link, once: false if there is one already. */
++bool redwood_net_attach(const struct redwood_net_link *link);
++/* A frame has arrived. Copied; the buffer is the caller's again on return. */
++void redwood_net_input(const uint8_t *frame, size_t length);
++/* Frames can pass now / can no longer pass. */
++void redwood_net_link_state(bool up);
++
++void redwood_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
++/* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: redwood_apple80211.c */
++errno_t redwood_apple80211_ioctl(u_long command, void *data);
++void redwood_virtio_net_init(void);     /* boot-arg virtio_net=1: QEMU's virtio network device */
++#endif /* KERNEL */
++
++#endif /* _SYS_REDWOOD_NET_H_ */
+diff --git a/bsd/sys/redwood_sta.h b/bsd/sys/redwood_sta.h
+new file mode 100644
+index 0000000..c5ed067
+--- /dev/null
++++ b/bsd/sys/redwood_sta.h
+@@ -0,0 +1,122 @@
++/*
++ * Darwin-on-redwood: the station boundary.
++ *
++ * On one side whatever does the scanning and the joining with a radio: the station logic over
++ * ath11k on the phone (wifi/lx in the repository). On the other whoever wants a network: the
++ * Apple80211 requests of iOS's Wi-Fi side, answered in bsd/dev/redwood_apple80211.c, and the
++ * kernel's own join of the network it was given in a file (bsd/dev/redwood_wifi.c). Frames do
++ * not pass here, and neither does "the link is up": those go through bsd/sys/redwood_net.h,
++ * which the station side calls itself.
++ *
++ * Between the two stands bsd/dev/redwood_sta.c: one thread, on which every call into the station
++ * side is made, one at a time, and what the last scan heard, kept for whoever asks.
++ *
++ * Nothing but C's own types here: the station side is not compiled as XNU's code.
++ */
++#ifndef _SYS_REDWOOD_STA_H_
++#define _SYS_REDWOOD_STA_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define REDWOOD_STA_ELEMENTS_MOST       1024
++
++/* One access point, as a scan heard it. */
++struct redwood_sta_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;                     /* MHz */
++	int16_t rssi;                           /* dBm */
++	uint16_t beacon_interval;               /* in units of 1024 microseconds */
++	uint16_t capability;                    /* the beacon's capability field */
++	uint32_t age_ms;                        /* how long ago it was last heard */
++	uint16_t elements_length;               /* the beacon's information elements as received: who asks */
++	uint8_t elements[REDWOOD_STA_ELEMENTS_MOST];    /* reads the network's protection out of them itself */
++};
++
++/* What to scan for. All zero: every channel, the radio's own way. */
++struct redwood_sta_scan {
++	uint8_t ssid[32], ssid_length;          /* ask for this network by name (a hidden one answers only then) */
++	uint16_t frequencies[64], frequency_count;      /* only these channels */
++	bool passive;                           /* only listen */
++	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
++};
++
++enum { REDWOOD_STA_OPEN, REDWOOD_STA_WPA2_PSK };
++
++struct redwood_sta_join {
++	uint8_t ssid[32], ssid_length;
++	uint8_t bssid[6];                       /* all zero: the access point of that name heard best */
++	int security;
++	uint8_t pmk[32];                        /* WPA2 with a passphrase: the key made of the passphrase and the name ... */
++	uint8_t passphrase[64], passphrase_length;      /* ... or, if this is not empty, the passphrase itself */
++};
++
++enum redwood_sta_phase { REDWOOD_STA_OFF, REDWOOD_STA_IDLE, REDWOOD_STA_SCANNING, REDWOOD_STA_JOINING, REDWOOD_STA_JOINED };
++
++struct redwood_sta_state {
++	enum redwood_sta_phase phase;
++	struct redwood_sta_bss bss;             /* the network joined or being joined */
++	int last_error;                         /* why the last join failed or the network was lost (an errno); 0: it was not */
++};
++
++#define REDWOOD_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */
++#define REDWOOD_STA_CHANNEL_RADAR       2u      /* ... and has to look out for radar */
++
++struct redwood_sta_channel {
++	uint16_t frequency;                     /* MHz */
++	uint16_t flags;
++};
++
++/*
++ * What the station side supplies. All but state() are called on one thread, one at a time, and
++ * may take as long as the thing takes: scan() returns when the scan is over, join() when frames
++ * can pass or it is known why not. Each gives 0 or an errno.
++ */
++struct redwood_sta_ops {
++	int (*power)(bool on);                  /* off: leave the network, stop the radio; on: start it */
++	int (*scan)(const struct redwood_sta_scan *what);
++	void (*heard)(void (*each)(const struct redwood_sta_bss *bss, void *context), void *context);   /* by the last scan */
++	int (*join)(const struct redwood_sta_join *what);
++	int (*leave)(void);
++	void (*state)(struct redwood_sta_state *state);         /* on any thread; does not sleep */
++	unsigned (*channels)(struct redwood_sta_channel *channels, unsigned most);      /* what the radio may tune to */
++	uint8_t address[6];
++};
++
++/* What happens, said to whoever listens (the Apple80211 side). */
++enum redwood_sta_event {
++	REDWOOD_STA_POWER,                      /* status: 1 on, 0 off */
++	REDWOOD_STA_SCAN_DONE,                  /* status: 0, or the scan's errno */
++	REDWOOD_STA_JOIN_DONE,                  /* status: 0, or the join's errno */
++	REDWOOD_STA_LINK,                       /* status: 1 a network is joined, 0 it has been left when asked,
++	                                         * an errno: it was lost (the access point showed us the door) */
++};
++
++#ifdef KERNEL
++/* ---- the station side ---- */
++void     redwood_sta_attach(const struct redwood_sta_ops *ops);         /* NULL: it is going away (waits for a call under way) */
++void     redwood_sta_lost(int error);                                   /* the network joined is gone by itself */
++
++/* ---- who wants a network: each asks and returns; the outcome is an event. 0, or an errno ---- */
++bool     redwood_sta_present(void);
++int      redwood_sta_ask_power(bool on);
++int      redwood_sta_ask_scan(const struct redwood_sta_scan *what);
++int      redwood_sta_ask_join(const struct redwood_sta_join *what);
++/* ... and joined again whenever the radio is turned on, until some other network is asked for */
++int      redwood_sta_ask_join_standing(const struct redwood_sta_join *what);
++int      redwood_sta_ask_leave(void);
++bool     redwood_sta_busy(void);                                        /* something asked for is not over yet */
++bool     redwood_sta_powered(void);
++/* the `index`th access point the last scan heard: true, or false when there are not that many */
++bool     redwood_sta_heard(unsigned index, struct redwood_sta_bss *bss);
++void     redwood_sta_state(struct redwood_sta_state *state);
++unsigned redwood_sta_channels(struct redwood_sta_channel *channels, unsigned most);
++bool     redwood_sta_address(uint8_t *address);
++
++/* ---- the listener: bsd/dev/redwood_apple80211.c ---- */
++void     redwood_apple80211_event(enum redwood_sta_event event, int status);
++void     redwood_apple80211_summary(void);                              /* what was asked in this run, to the log */
++#endif
++
++#endif
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 59c834e..6a518c3 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,7 +1200,9 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if !defined(ARM64_BOARD_CONFIG_SWEET)                 /* SWEET takes no hold for it (IOStartIOKit.cpp) */
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..02ce1bd 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -188,7 +188,16 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: no IOKit daemon ever reports that it has launched (no kexts to manage), so this
++	 * hold kept the registry root busy forever: IOKit never quiesced, configd's InterfaceNamer
++	 * never said "quiet", and wifid waited for that (ios-flame 0123).
++	 */
++	if (false) {
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
+diff --git a/iokit/Kernel/arm/MiniIONetworkStack.cpp b/iokit/Kernel/arm/MiniIONetworkStack.cpp
+new file mode 100644
+index 0000000..081fd35
+--- /dev/null
++++ b/iokit/Kernel/arm/MiniIONetworkStack.cpp
+@@ -0,0 +1,114 @@
++/*
++ * MiniIONetworkStack: a stand-in for IONetworkStack of Apple's IONetworkingFamily, as seen by
++ * configd's interface namer.
++ *
++ * The real one gives the BSD names (en0, en1, ...) to the IONetworkInterface objects of the
++ * drivers, when the interface namer asks. Here interfaces are made with the BSD interface KPI
++ * (bsd/dev/redwood_net.c) and are born with their names, so there is never anything to name.
++ * But the namer wants this object all the same: until it has opened it, it does not say in
++ * configd's store that the registry has gone quiet (the key Plugin:InterfaceNamer, "*QUIET*"),
++ * and gives up only after five minutes ("*TIMEOUT*"). SystemConfiguration's
++ * SCNetworkInterfaceCopyAll() waits for one of the two, and with it whoever asks for the list of
++ * interfaces: wifid as soon as it has a device, and behind wifid SpringBoard.
++ *
++ * So: the service, a user client that can be opened, and a refusal of the naming request.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++
++extern "C" void MiniIONetworkStackStart(void);
++
++class IONetworkStack : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkStack);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++bool
++IONetworkStack::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
++	setName("IONetworkStack");
++	registerService();
++	return true;
++}
++
++class IONetworkStackUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++bool
++IONetworkStackUserClient::start(IOService * provider)
++{
++	char who[32] = "?";
++
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	/* whether the registry is quiet at this moment is what the namer goes on to ask */
++	proc_selfname(who, sizeof(who));
++	IOLog("MiniIONetworkStack: opened by %s; the registry's busy state is %u\n", who,
++	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	return true;
++}
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++/* "Name this interface" (a dictionary: IONetworkStackUserCommand, IOPathMatch, IOInterfaceUnit). */
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject * properties)
++{
++	static unsigned said;
++
++	if (said++ < 4) {
++		IOLog("MiniIONetworkStack: asked to name an interface: there are none of that kind\n");
++	}
++	return kIOReturnUnsupported;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++void
++MiniIONetworkStackStart(void)
++{
++	/* where the real one is: IOService:/IOResources/IONetworkStack */
++	IOService * resources = IOService::getResourceService();
++	IONetworkStack * stack = OSTypeAlloc(IONetworkStack);
++
++	if (resources == NULL || stack == NULL || !stack->init() || !stack->attach(resources)) {
++		OSSafeReleaseNULL(stack);
++		IOLog("MiniIONetworkStack: cannot create the service\n");
++		return;
++	}
++	if (!stack->start(resources)) {
++		stack->detach(resources);
++	}
++	stack->release();
++}
+diff --git a/iokit/Kernel/arm/RedwoodWLAN.cpp b/iokit/Kernel/arm/RedwoodWLAN.cpp
+new file mode 100644
+index 0000000..89d8840
+--- /dev/null
++++ b/iokit/Kernel/arm/RedwoodWLAN.cpp
+@@ -0,0 +1,137 @@
++/*
++ * RedwoodWLAN: the registry entries by which iOS finds the Wi-Fi interface.
++ *
++ * en0 is made with the BSD interface KPI (bsd/dev/redwood_net.c) and has no IOKit object behind
++ * it of its own; iOS looks for two, as IO80211Family would have made them:
++ *
++ *   - wifid's device is whatever service has the property IO80211InterfaceRole =
++ *     "Infrastructure", and IO80211.framework binds to an interface through a service whose
++ *     IOInterfaceName is the interface's name. The service has no user client, on purpose:
++ *     the framework's attempt to open one fails, it says "Falling back to IOCTL path", and
++ *     from then on every request is an ioctl on a socket, which bsd/dev/redwood_apple80211.c
++ *     answers.
++ *   - SystemConfiguration (SCNetworkInterfaceCopyAll) lists the network interfaces it finds as
++ *     objects of the class IONetworkInterface, and calls one a Wi-Fi interface when its parent
++ *     is of the class IO80211Controller; type, unit, name and built-in-ness are properties of
++ *     the interface, the hardware address one of the controller. configd makes a network
++ *     service (DHCP and the rest) for an interface it has listed, and only an interface with a
++ *     service can be the one the system routes through -- which wifid waits for after a join
++ *     ("failed to become routable interface") before Settings ticks the network.
++ *
++ * So: a controller of the class IO80211Controller under the platform, and below it one object
++ * that is both, an IONetworkInterface with wifid's properties. Both classes are ours, named as
++ * IO80211Family and IONetworkingFamily name theirs; neither has anything but properties.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++
++extern "C" void RedwoodWLANStart(const char * interface, const uint8_t * address);
++
++class IO80211Controller : public IOService
++{
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++
++OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++
++class IONetworkInterface : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class RedwoodWLAN : public IONetworkInterface
++{
++	OSDeclareDefaultStructors(RedwoodWLAN);
++
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodWLAN, IONetworkInterface);
++
++/* There is none (see the top); that somebody asked shows that the service was found. */
++IOReturn
++RedwoodWLAN::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties, IOUserClient ** handler)
++{
++	static unsigned said;
++
++	if (said++ < 8) {
++		IOLog("RedwoodWLAN: a user client of type %u is asked for: there is none\n", (unsigned) type);
++	}
++	return kIOReturnUnsupported;
++}
++
++/* attach, start, register: the service, or NULL */
++static IOService *
++publish(IOService * service, IOService * provider, const char * name)
++{
++	if (service == NULL || !service->attach(provider)) {
++		OSSafeReleaseNULL(service);
++		return NULL;
++	}
++	service->setName(name);
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		return NULL;
++	}
++	service->registerService();
++	return service;
++}
++
++/* Once, when the interface of a radio exists. */
++void
++RedwoodWLANStart(const char * interface, const uint8_t * address)
++{
++	IOService * platform = IOService::getPlatform();
++	IO80211Controller * controller = OSTypeAlloc(IO80211Controller);
++	RedwoodWLAN * wlan = OSTypeAlloc(RedwoodWLAN);
++	OSData * mac;
++	OSNumber * number;
++
++	if (platform == NULL || controller == NULL || wlan == NULL || !controller->init() || !wlan->init()) {
++		OSSafeReleaseNULL(controller);
++		OSSafeReleaseNULL(wlan);
++		IOLog("RedwoodWLAN: cannot create the services\n");
++		return;
++	}
++	if ((mac = OSData::withBytes(address, 6)) != NULL) {
++		controller->setProperty("IOMACAddress", mac);
++		mac->release();
++	}
++	controller->setProperty("IOBuiltin", true);
++	if ((controller = (IO80211Controller *) publish(controller, platform, "RedwoodWLANController")) == NULL) {
++		wlan->release();
++		IOLog("RedwoodWLAN: the controller did not start\n");
++		return;
++	}
++
++	wlan->setProperty("IOInterfaceName", interface);
++	wlan->setProperty("BSD Name", interface);
++	wlan->setProperty("IOInterfaceNamePrefix", "en");
++	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
++		wlan->setProperty("IOInterfaceType", number);
++		number->release();
++	}
++	if ((number = OSNumber::withNumber((unsigned long long) (interface[2] - '0'), 32)) != NULL) {
++		wlan->setProperty("IOInterfaceUnit", number);
++		number->release();
++	}
++	wlan->setProperty("IOBuiltin", true);
++	wlan->setProperty("IOPrimaryInterface", true);
++	wlan->setProperty("IO80211InterfaceRole", "Infrastructure");
++	if (publish(wlan, controller, "RedwoodWLAN") == NULL) {
++		IOLog("RedwoodWLAN: the service did not start\n");
++	} else {
++		wlan->release();
++	}
++	controller->release();
++}
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..942ba80 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -13,6 +13,7 @@
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+ /* bsd/dev/sweet_spmi.c */
++#include <kern/clock.h>
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+@@ -28,6 +29,13 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	/* 0156: charge tracked between polls (milli-percent), seeded from the voltage curve */
++	bool fSocValid;
++	int32_t fSocMilli;
++	uint64_t fLastPoll;
++	unsigned fPolls;
++	unsigned fFailures;     /* 0161: consecutive failed reads */
++	bool fSeededSdam;       /* 0162: seeded from the QG driver's SOC: count only, no drift */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -186,11 +194,14 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++	/* 0162: the phone's own OCV table at 25 C (stock DT qcom,pc-temp-v1-lut, Sunwoda and
++	 * NVT 5020 mAh profiles agree within ~10 mV). 20-50% spans only 3.77-3.89 V, so under
++	 * load this is a fallback only; the QG SDAM charge seeds the count when it is there. */
++	static const unsigned volts[] = {3000, 3310, 3450, 3600, 3686, 3708, 3729, 3772, 3801,
++	    3816, 3835, 3852, 3872, 3895, 3922, 3970, 4018, 4056, 4097, 4142, 4190, 4238, 4287,
++	    4335, 4378, 4416, 4433};
++	static const unsigned soc[] = {0, 1, 2, 4, 6, 10, 14, 20, 26, 32, 38, 42, 46, 50, 54, 58,
++	    62, 66, 70, 74, 78, 82, 86, 90, 94, 98, 100};
+ 	if (mv <= volts[0]) {
+ 		return soc[0];
+ 	}
+@@ -220,10 +231,20 @@ SweetBattery::poll(void)
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
++	/*
++	 * 0161 (0150/0151 hardware: 13 and 3 single failed polls, each published 100% and not
++	 * charging for 5 s): hold the last good reading through up to a minute of failures.
++	 */
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		if (!fSocValid || ++fFailures >= 12) {
++			if (fFailures == 12) {
++				IOLog("SWEET BATTERY: 12 failed reads in a row; static fallback\n");
++			}
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
+ 		return;
+ 	}
++	fFailures = 0;
+ 	bool external = (usb & 0x10u) != 0;
+ 	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+ 	unsigned state = charger & 7u;
+@@ -236,14 +257,79 @@ SweetBattery::poll(void)
+ 	uint16_t rawCurrent;
+ 	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+ 	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+-	    rawCurrent != 0x8000;
++	    rawCurrent != 0x8000 && rawCurrent != 0;   /* 0161: an exact 0 is not a running phone */
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++	/*
++	 * 0156 (0149 hardware: 3941 mV while charging read as 66%): the curve is for an open-circuit
++	 * voltage, so take out the drop across the cell's resistance (~150 mOhm; charging raises the
++	 * terminal voltage), seed the charge from that once, then count the measured current against
++	 * the 5020 mAh design capacity. Near rest (|I| < 150 mA) drift 5% of the way back to the curve
++	 * per poll, so a wrong seed or gauge offset does not stay forever.
++	 */
++	int ocv = (int)mv - (currentValid ? ma * 150 / 1000 : 0);
++	int32_t curve = (int32_t)estimatePercent(ocv > 0 ? (unsigned)ocv : 0) * 1000;
++	uint64_t now = mach_absolute_time(), ns = 0;
++	if (!fSocValid) {
++		fSocMilli = curve;
++		fSocValid = true;
++		/*
++		 * 0162 (0151 hardware: the count said 55% where OrangeFox's QG driver said 25%): the
++		 * Linux QG driver keeps its SOC in the PM6150 QG SDAM (stock DT qcom,qg-sdam@b600),
++		 * qg-sdam layout: valid 0x46, SOC 0x47 (percent). Seed from it; logged raw once.
++		 */
++		uint8_t sdam[16];
++		bool sdamOk = true;
++		for (unsigned i = 0; i < sizeof(sdam) && sdamOk; i++) {
++			sdamOk = !sweet_spmi_read(0, 0xb640 + i, &sdam[i]);
++		}
++		if (sdamOk) {
++			IOLog("SWEET BATTERY: QG SDAM b640: %02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x\n", sdam[0], sdam[1], sdam[2], sdam[3],
++			    sdam[4], sdam[5], sdam[6], sdam[7], sdam[8], sdam[9], sdam[10], sdam[11],
++			    sdam[12], sdam[13], sdam[14], sdam[15]);
++		}
++		if (sdamOk && sdam[6] != 0 && sdam[7] <= 100) {
++			fSocMilli = (int32_t)sdam[7] * 1000;
++			fSeededSdam = true;
++		}
++		IOLog("SWEET BATTERY: seed %d%% from %s (curve %d%%)\n", (int)(fSocMilli / 1000),
++		    fSeededSdam ? "QG SDAM" : "the OCV table", (int)(curve / 1000));
++	} else {
++		absolutetime_to_nanoseconds(now - fLastPoll, &ns);
++		uint64_t ms = ns / 1000000ull;
++		if (currentValid && ms < 600000ull) {
++			/* milli-percent = mA * ms / 3600000 * 100 / 5020 * 1000 */
++			fSocMilli += (int32_t)((int64_t)ma * (int64_t)ms / 180720);
++		}
++		/* 0158 (0150 hardware: the curve swung 40-61% under load): drift only at a measured rest,
++		 * 2% of the difference per poll; with no valid current hold the counted value. */
++		if (!fSeededSdam && currentValid && ma > -100 && ma < 100) {
++			fSocMilli += (curve - fSocMilli) / 50;
++		}
++	}
++	fLastPoll = now;
++	if (full) {
++		fSocMilli = 100000;
++	}
++	if (fSocMilli > 100000) {
++		fSocMilli = 100000;
++	}
++	if (fSocMilli < 0) {
++		fSocMilli = 0;
++	}
++	unsigned percent = (unsigned)((fSocMilli + 500) / 1000);
++	if (charging && percent >= 100 && !full) {
++		percent = 99;    /* only the charger's own "full" says 100 while charging */
++	}
++	if (fPolls++ % 12 == 0) {
++		IOLog("SWEET BATTERY: %u%% (curve %d%%) %umV ocv %dmV %dmA external=%d charging=%d full=%d\n",
++		    percent, (int)(curve / 1000), mv, ocv, ma, external, charging, full);
++	}
++	publish(percent, mv, ma, external, capable, charging, full, true, currentValid);
+ }
+ 
+ void
+@@ -252,19 +338,69 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(5000);   /* 0156: plug/unplug within seconds */
+ 	}
+ }
+ 
++/*
++ * 0166: set the calendar from the PM6150 RTC (Linux rtc-pm8xxx, pm8941 layout: control 0x6046 bit 7
++ * enabled, seconds 0x6048-0x604b little endian; re-read when the low byte moved). Without it every
++ * boot's calendar starts at the epoch and kern.boottime is the same ~40 s each boot; wland's auto
++ * start compares it with /var/local/wland.boot and exits "already started in this boot" whenever
++ * it repeats (0145c, 0153, 0154: no Wi-Fi). Only when the calendar is still before 2001.
++ */
++static void
++sweetSetCalendarFromRtc(void)
++{
++	clock_sec_t now = 0;
++	clock_usec_t us = 0;
++	clock_get_calendar_microtime(&now, &us);
++	if (now > 978307200) {
++		return;
++	}
++	uint8_t ctl = 0, b[4], low = 0;
++	if (sweet_spmi_read(0, 0x6046, &ctl) || !(ctl & 0x80u)) {
++		IOLog("SWEET RTC: PM6150 RTC not readable or disabled (ctl %#x)\n", ctl);
++		return;
++	}
++	for (int attempt = 0; attempt < 3; attempt++) {
++		bool ok = true;
++		for (unsigned i = 0; i < 4 && ok; i++) {
++			ok = !sweet_spmi_read(0, 0x6048 + i, &b[i]);
++		}
++		if (!ok || sweet_spmi_read(0, 0x6048, &low)) {
++			IOLog("SWEET RTC: PM6150 RTC read failed\n");
++			return;
++		}
++		if (low == b[0]) {
++			uint32_t secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			if (secs < 86400u) {
++				IOLog("SWEET RTC: PM6150 RTC %u s: too small, calendar left alone\n", secs);
++				return;
++			}
++			clock_set_calendar_microtime((clock_sec_t)secs, 0);
++			clock_sec_t bs = 0;
++			clock_usec_t bus = 0;
++			clock_get_boottime_microtime(&bs, &bus);
++			IOLog("SWEET RTC: calendar set from the PM6150 RTC: %u s (boot time now %lu)\n", secs, (unsigned long)bs);
++			return;
++		}
++	}
++	IOLog("SWEET RTC: PM6150 RTC kept moving while read\n");
++}
++
+ bool
+ SweetBattery::start(IOService *provider)
+ {
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 1;   /* 0149 hardware: PM6150 QG/SMB5 reads work; sweetbattery=0 = static 100% */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	if (sweet_spmi_init() == 0) {
++		sweetSetCalendarFromRtc();
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -273,7 +409,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(5000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index e95080f..73d9267 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -57,7 +57,7 @@ enum {
+  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+  * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
+  */
+-#define SWEET_AKS_LOCK_STATE    0x6     /* no passcode (bit 1), unlocked since boot (bit 2); ios-sailfish 0180 */
++#define SWEET_AKS_LOCK_STATE    0x4
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -150,7 +150,7 @@ sweet_aks_device_state(IOExternalMethodArguments *args)
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 3 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+@@ -227,18 +227,58 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	/*
++	 * (from HackiOS) kAKSWrapKey / kAKSUnwrapKey: securityd wraps each keychain item's key with
++	 * its protection class before storing it. No SEP, no secret: a mark, the class and the key
++	 * mixed with a fixed pattern, 8 bytes longer like AES key wrap. Without them no keychain item
++	 * (wifid's network passwords among them) could be stored.
++	 */
++	case kAKSWrapKey: {
++		uint8_t wrapped[8 + 64];
++		size_t len = args->structureInputSize;
++		if (args->structureInput == NULL || len == 0 || len > 64 || in_scalars < 2) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(wrapped, "HKwr", 4);
++		wrapped[4] = (uint8_t)args->scalarInput[1];
++		wrapped[5] = wrapped[6] = wrapped[7] = 0;
++		memcpy(wrapped + 8, args->structureInput, len);
++		for (size_t i = 0; i < len; i++) {
++			wrapped[8 + i] ^= (uint8_t)(0x5a + 37 * i);
++		}
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = args->scalarInput[1];
++			args->scalarOutputCount = 1;
++		}
++		ret = sweet_aks_struct_out(args, wrapped, (uint32_t)(8 + len));
++		break;
++	}
++	case kAKSUnwrapKey: {
++		uint8_t key[64];
++		const uint8_t *w = (const uint8_t *)args->structureInput;
++		size_t len = args->structureInputSize;
++		if (w == NULL || len <= 8 || len > 8 + sizeof(key) || memcmp(w, "HKwr", 4) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(key, w + 8, len - 8);
++		for (size_t i = 0; i < len - 8; i++) {
++			key[i] ^= (uint8_t)(0x5a + 37 * i);
++		}
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_struct_out(args, key, (uint32_t)(len - 8));
++		break;
++	}
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
+ 
+-	static uint32_t logged[128];            /* a few lines a selector: coreduetd asks thousands of times */
+-	if (selector >= 128 || logged[selector]++ < 5) {
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
+-	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
+ 	return ret;
+ }
+ #endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 6ff8c46..768fedd 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -22,3 +22,5 @@ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/RedwoodWLAN.cpp		optional iokitcpp
++iokit/Kernel/arm/MiniIONetworkStack.cpp	optional iokitcpp
