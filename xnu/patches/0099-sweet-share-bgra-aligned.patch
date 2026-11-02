@@ -1,0 +1,38 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 19e149e..fec9456 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -45,6 +45,7 @@
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+ #include <mach/vm_param.h>
++#include <sys/proc.h>
+ #include <sys/systm.h>
+ 
+ #include "SweetSurface.h"
+@@ -857,6 +858,25 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		s->release();
+ 		return kIOReturnUnsupported;
+ 	}
++	/*
++	 * 0099 (ios-topaz 0938): besides the GPU pool's screens, only surfaces with
++	 * 4-byte elements, one plane and 64-byte rows go to the GPU as they are.
++	 * The first try shared everything contiguous (text masks LA08 with 640- and
++	 * 480-byte rows among them) and the GPU stopped after a minute. A surface
++	 * refused here is filled into a texture by eagl and read back (a copy).
++	 */
++	if (!s->gpuPool && (s->bytesPerElement != 4 || s->planeCount > 1 || (s->bytesPerRow & 63) != 0)) {
++		static uint32_t refused;
++		if (refused++ < 16) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET GPU: %s surface %u (%ux%u fmt %#x bpe %u bpr %u planes %u) not shared: copied\n",
++			    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
++			    s->bytesPerRow, s->planeCount);
++		}
++		s->release();
++		return kIOReturnUnsupported;
++	}
+ 	size = round_page_64(s->allocSize);
+ 	/* around client memory (SweetSurface wrapped): no more than the task's range, which starts wrapDelta into its first page */
+ 	if (s->wrapped && size > s->memory->getLength()) {

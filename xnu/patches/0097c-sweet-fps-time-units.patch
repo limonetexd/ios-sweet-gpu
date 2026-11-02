@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e752556..632db56 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -131,8 +131,8 @@ public:
+ 	uint64_t      fStatWindow;            /* mach time this window began */
+ 	uint64_t      fStatLastSwap;          /* last SwapEnd */
+ 	uint64_t      fStatLastVsync;         /* last vsync timer tick */
+-	uint64_t      fStatSwapGapMax;        /* longest SwapEnd-to-SwapEnd */
+-	uint64_t      fStatVsyncGapMax;       /* longest tick-to-tick (a late or stuck timer) */
++	uint64_t      fStatSwapGapMax;        /* longest SwapEnd-to-SwapEnd, ns */
++	uint64_t      fStatVsyncGapMax;       /* longest tick-to-tick (a late or stuck timer), ns */
+ 	uint64_t      fStatPresentSum;        /* time in drawn()+present() this window */
+ 	uint64_t      fStatPresentMax;
+ 	uint32_t      fStatSwaps, fStatLateSwaps;
+@@ -281,9 +281,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fStatLock != NULL) {
+ 		IOLockLock(fb->fStatLock);
+ 		if (fb->fStatLastVsync != 0) {
+-			uint64_t gap = now - fb->fStatLastVsync;
+-			if (gap > fb->fStatVsyncGapMax) {
+-				fb->fStatVsyncGapMax = gap;
++			uint64_t gap = now - fb->fStatLastVsync, ns;
++			absolutetime_to_nanoseconds(gap, &ns);   /* (mach ticks, not ns) */
++			if (ns > fb->fStatVsyncGapMax) {
++				fb->fStatVsyncGapMax = ns;
+ 			}
+ 		}
+ 		fb->fStatLastVsync = now;
+@@ -503,11 +504,12 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		uint64_t now = mach_absolute_time();
+ 		IOLockLock(fStatLock);
+ 		if (fStatLastSwap != 0) {
+-			uint64_t gap = now - fStatLastSwap;
+-			if (gap > fStatSwapGapMax) {
+-				fStatSwapGapMax = gap;
++			uint64_t gap = now - fStatLastSwap, ns;
++			absolutetime_to_nanoseconds(gap, &ns);   /* (mach ticks, not ns) */
++			if (ns > fStatSwapGapMax) {
++				fStatSwapGapMax = ns;
+ 			}
+-			if (gap > 20 * NSEC_PER_MSEC) {
++			if (ns > 20 * NSEC_PER_MSEC) {
+ 				fStatLateSwaps++;
+ 			}
+ 		}
