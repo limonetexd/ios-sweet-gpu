@@ -138,8 +138,23 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
 - **0101/0102 do not raise the frame rate** because CA's own timer is 30 Hz; 0101's tuple is only used
   with `CA_FORCE_TIMER`. The trace shows no 3088x3088 allocations in Settings scroll; the texture
   churn is small textures (204x204, 180x180, 783x416...), one/two per frame.
-- **Daily image:** `shim/out/shim-boot-0101s0.img` (serial=0, no sweetfix, 60 Hz). Avoid widget picker;
-  it still hangs (userland PosterBoard/widgets, not GPU).
+- **DC28088/ios-sweet branch `codex/native-adreno-metal` (same sweet/iOS 16.7.16/HFS+) is far ahead
+  on userland:** Wi-Fi WCN3990 works (wland/en0/Apple80211 + RPMh/PMEM/SMMU WLAN; WCN3990 on SNOC
+  `0x18800000`, SID `0x240`, MSA ~`0x97d00000`); wallpaper/PosterBoard assertion fixed via chosen MACs
+  in ADT + AMFI trust-cache query IOService (`sweetamfi=1`) + a one-time LaunchServices rebuild;
+  `CA_FORCE_TIMER=1` set in a merged launchd plist for BackBoard; 64-byte surface rows; panel is 120 Hz
+  (INTF_1 8.333 ms). But its perf is **render-bound: 12-30 fps**, backboardd 14-20 ms/frame; user
+  feedback "under 30". So CA_FORCE_TIMER alone is not the fps fix. Their Wi-Fi is a merge (RPMh/PMEM/
+  SMMU + wland + en0/IOKit/AKS + ADT/MACs + firmware/rmtfs), not a drop-in. The wallpaper fix needs
+  ADT MACs + AMFI service + LS rebuild, i.e. userland/root work.
+- **0103 `ca_vbl=1` probe result: WORSE, discard.** `logs/xnu-0103p.txt`, same 619 one-second samples as
+  the 0097-60 probe: **avg 6.82 swaps/s vs 17.19** (idle included), 302 vs 473 nonzero seconds, 88 vs 421
+  seconds >=20, max 34 both. CA_FORCE_TIMER makes CoreAnimation follow our IOTimerEventSource vsync
+  notifications, which jitter (22-24 ms) and are sent without the presenter/direct-frame work of topaz
+  0945; CA stalls. `CA_FORCE_TIMER` only makes sense after topaz 0941 (INTF_1-locked vsync) + 0945
+  presenter; do not put `ca_vbl=1` in a daily image.
+- **Daily is 0101s0** (`shim-boot-0101s0.img`): 0099+0101, 60 Hz, serial=0, no sweetfix. Active periods
+  ~24-30 swaps/s (the 0097-60 log), 30-32 ms frames. `shim-boot-0103d.img` has `ca_vbl=1`; do not use.
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
