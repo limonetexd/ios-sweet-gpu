@@ -147,6 +147,16 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   feedback "under 30". So CA_FORCE_TIMER alone is not the fps fix. Their Wi-Fi is a merge (RPMh/PMEM/
   SMMU + wland + en0/IOKit/AKS + ADT/MACs + firmware/rmtfs), not a drop-in. The wallpaper fix needs
   ADT MACs + AMFI service + LS rebuild, i.e. userland/root work.
+- **PosterBoard/assetsd research (agent, 2026-11-02):** the PosterBoard sig 5 is an assert in
+  `PBFPosterExtensionDataStore` (`!_stateLock_switcherConfiguration`), because this root has no app
+  extension points: DataMigration is skipped (`LastSystemVersion` 20H392, no
+  `/private/var/datamigrator/migrate` sentinel; sailfish observed 1 of 524 appex registered) and
+  ExtensionKit's code-signing check needs AMFI syscall 0x60 (our sweet_amfi does not answer). assetsd
+  sig 6 is the missing sandbox extension for `kTCCServicePhotos` (topaz patch 1001 implements op 5/6
+  tokens). Wallpaper HEIC has no decoder; sailfish converts to PNG and fixes CAML. Widget hang is
+  backboardd inside `libOSMesa` (render server), not GPU/kernel. Root fixes (later): move
+  `staged_system_apps` to `/Applications`, DataMigration sentinel, ExtensionKit feature flag
+  `enforce_xpc_cache_code_signing=false`, LS cache; kernel: AMFI 0x60 + sandbox tokens.
 - **0103 `ca_vbl=1` probe result: WORSE, discard.** `logs/xnu-0103p.txt`, same 619 one-second samples as
   the 0097-60 probe: **avg 6.82 swaps/s vs 17.19** (idle included), 302 vs 473 nonzero seconds, 88 vs 421
   seconds >=20, max 34 both. CA_FORCE_TIMER makes CoreAnimation follow our IOTimerEventSource vsync
@@ -155,6 +165,29 @@ display-surface leak, 0086 zombie views keep `ref->surface`; from L3001 (frame 1
   presenter; do not put `ca_vbl=1` in a daily image.
 - **Daily is 0101s0** (`shim-boot-0101s0.img`): 0099+0101, 60 Hz, serial=0, no sweetfix. Active periods
   ~24-30 swaps/s (the 0097-60 log), 30-32 ms frames. `shim-boot-0103d.img` has `ca_vbl=1`; do not use.
+- **WI-FI WORKS on the DC28088 branch kernel + our root (2026-11-02).** WCN3990 `wland` brings the radio
+  up and joins WPA2. `logs/wland-connected.log`: firmware chip `0x140 family 0x4002`, BDF
+  `/var/local/fw/modem/bdwlan.b00` (copy of `bdwlan.bin`; without it `net: WLFW bring-up failed`), scan
+  40 networks, `bridge: join 'casa j' (PMK) -> 0`, auth/assoc, 4-way, `*** joined 'casa j' ***`,
+  `bridge: link up 'casa j'`, radio `state 5`, rx 833, htt msdus 835. The spinner after joining is
+  DHCP/configd; the link is up. Battery is detected on this kernel too.
+- **Wi-Fi deployment without reflash:** the branch kernel has `sweet_files` (0168); boot it with
+  `sweetusb=2 sweetfiles=1 sweetpmem=1 sweetsmmuwlan=1 sweetwifi=1`, pass the CDC-ECM device to WSL
+  with `usbipd attach --wsl --busid 2-3`, `ip addr add 192.168.7.1/24 dev enx02005e77ee01`, and use
+  `DC28088_ios-sweet/tools/sweet-files.py put/get/mkdir/rm` at 192.168.7.2:2223. Installed:
+  `/var/local/bin/{wland,netsvc}` (hash verified), `/var/local/fw/modem` (322 files, ~80 MB from the
+  phone's FAT `modem` partition; `tools/sweet-pull-modem.ps1` tars/splits 8 MB parts because raw
+  `adb pull` dies at ~15 MB), `/var/local/fw/rmtfs/{modemst1,modemst2,fsg,fsc}.img`, the launchd job
+  `org.ios-sweet.wland` in `/System/Library/xpc/launchd.plist` (531 jobs), and the network
+  `preferences.plist` moved to `.pre-wifi` so configd creates the Wi-Fi service. The files persist in
+  the root for later kernels.
+- **Wi-Fi images:** `shim-boot-wifi-auto.img` = DC28088 kernel + wlan ADT + `sweetgpu=2 sweetusb=2
+  sweetfiles=1 sweetpmem=1 sweetsmmuprobe=1 sweetsmmuwlan=1 sweetwifi=1 sweetgpu_reboot=600`;
+  `shim-boot-wifi-test.img` = same without auto-reboot. The branch kernel's GPU is NativeAdreno/Metal
+  and falls back/lags with our topaz userland (red clock, CPU-like); **0101s0** still has the fast
+  topaz GPU but no Wi-Fi. Next big project: merge the Wi-Fi kernel patches (`0138`, `0141`,
+  `0149`-`0153`, `0166`) into our fast 0101/0102 kernel, or port the topaz GPU to the branch kernel,
+  for one super image (GPU + Wi-Fi + battery).
 - Previous run 0099e = ~21 ms a frame (was ~400 ms). Kernel 0099 (CI 41365060398, image
   `shim/out/shim-boot-0099e.img`, boot-args `sweetgpu=2 sweetgpu_swipe=90 cpus=8`, log `logs/xnu-0099e.txt`):
   frames 7-21 ms in glFinish-free mode; GPU wait ~2 ms. What changed vs 0098e: xnu 0095 (AppleCLCD sets
