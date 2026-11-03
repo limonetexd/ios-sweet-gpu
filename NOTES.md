@@ -2,7 +2,75 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> GPU 2026-11-01 (limonetexd/ios-sweet-gpu, another M2101K6G; read first) <<<
+### >>> 2026-11-03: super 0104/0105, panic forensics, 5 notas (leer primero) <<<
+
+**Estado del teléfono (2026-11-03, última observación):** en fastboot. Se lanzó
+`fastboot -S 512M flash userdata ...\ios16-root-gpu2.simg`, pero el comando fue
+**interrumpido**; no hay confirmación de que terminara. No se arrancó después. El
+contenido actual de `userdata` es **desconocido** (root anterior, nuevo o mezcla).
+No bootear ni reflashear a ciegas; el usuario no volverá a entrar en fastboot
+manualmente. Si el ABL se cuelga tras un flash grande, hace falta Power+Vol- físico.
+
+**Notas de los 5 agentes (2026-11-03, material bruto; entry point
+`notes/agents/INDEX.md`):**
+- `notes/agents/xnu-gpu-kernel.md` — 9.723 palabras. GPU/kernel/shim, ring, SMMU/RPMH.
+- `notes/agents/root-launchd-panic.md` — 9.847. Root, sparse, flash, launchd, hipótesis.
+- `notes/agents/wifi-battery-branch.md` — 9.187. WCN3990/wland/netsvc, configd/DHCP, batería.
+- `notes/agents/build-ci-artifacts.md` — 9.693. CI, artefactos, hashes, reproducibilidad.
+- `notes/agents/usb-vfs-super-compat.md` — 10.244. 0105, stubs, VFS, `sweet_files`.
+
+**Conclusiones que convergen (verificar en las notas):**
+1. **La GPU no es el panic.** El ring muestra GMU `0xbabeface`, `CP_MEM_WRITE
+   0x5ee7c0de`, IB desde memoria XNU, `IB FROM XNU MEMORY RAN`, fence 1; después
+   0 swaps/0 presents, 1 surface, 0 MB wired. Kernel/GPU vivos.
+2. **La ring `logs/xnu-super-panic.txt` no es del super actual.** Es byte-idéntica a
+   `logs/xnu-0101s0reboot.txt` (SHA256
+   `576cdb1aca91c3975ce4c2bcfcea0360abc2d43eaed55894462c050d2ffeb99f`), no contiene
+   la línea del panic, tiene 302 boot-args frente a 346 del super y contiene strings
+   de 0104 que el payload 0101 no tiene; tampoco se puede atribuir sin más a 0101.
+   Los boot-args de la ring no incluyen `sweetfiles=1`/`sweetusb=2`. El texto
+   `initproc exited -- exit reason namespace 2 subcode 0x8 -- code 0x1` es la
+   transcripción del usuario, no un artefacto de la ring.
+3. **El bloqueo es `launchd`/`launchd_cache_loader`.** Tras `exec
+   launchd_cache_loader` hay ~24 líneas `SWEET FPS` (una por segundo; ~24 s), **no
+   3 s**, y ninguna de las 9 líneas que el helper imprime en la rama. La rama, con
+   el mismo root/ADT, sí las imprime y llega a SpringBoard. El delta es 0104/0105
+   (IOKit quiesce, AKS, servicios nuevos) o un parche de rama no importado; no es GPU.
+4. **Wi-Fi/batería kernel-side listos, userland no arrancado bajo el super:**
+   `/dev/wlan` major 20, SMMU WLAN SID `0x240` -> CB4/SMR6, RPMH SN15/CN0, DDR
+   16383, QG SDAM 58% / 4031 mV. Bajo el super ningún proceso abrió `/dev/wlan`:
+   no hubo `wland`, `wifid`, `en0` ni `RedwoodWLAN`. En la rama sí: WCN3990
+   descarga firmware/BDF, escanea, asocia `casa j`, link up, rx 833; el spinner es
+   configd/DHCP (servicio estándar en0/AirPort/DHCP en `preferences.plist`;
+   `netsvc` como fallback).
+5. **Build 0105 confirmado:** runs `41501352880` (macos-15-intel) y `41502238106`
+   (macos-latest, rama `ci-macos-latest`) OK en `limonetexd/ios-sweet-gpu`;
+   `41494548855` falló por los 7 símbolos. Kernel 0105 `d22c5aad...`; super
+   `67ff470f24acc5d3a92919fc8fbfde00e9f485e7e46c30aa8ab894bad24b5f3f`; contiene
+   los 7 símbolos + Wi-Fi/batería/topaz; 0101 no tiene Wi-Fi. `mkadt.py` usa
+   `os.urandom(64)` sin seed: la reproducibilidad byte a byte no está garantizada.
+   El par `__LINKINFO/__LINKEDIT` del brief anterior pertenece al payload branch,
+   no a 0105.
+6. **USB/VFS:** 0105 linkea, pero `_sweet_files_start` tiene cero xrefs `B`/`BL`;
+   el servidor USB queda enlazado e inalcanzable y los wrappers solo los llama
+   `_sf_thread`. Stubs: `sweet_gpu_probe` -> `sweet_gpu_init`; BT/haptic -> `RET`;
+   NativeAdreno -> `MOV W0,#0; RET`.
+
+**Correcciones/conflictos resueltos:**
+- La nota de Wi-Fi decía que 0105 no estaba confirmado; build demuestra que sí
+  (runs/hash). Gana build.
+- Root decía “~3 s”; la ring tiene 24 `SWEET FPS` tras el `exec` -> ~24 s. Gana XNU.
+- SHA256 de `gpu2.simg`: `FB86997E0D15DE3BA198834955C0FC64ACA95037C9E64CDFDB1FB69268393579`
+  (12.159.682.532 bytes), calculado sobre la copia del workspace
+  `OPENCODE/deepseek/iOS on sweet/ipsw/ios16-root-gpu2.simg` (no la carpeta de Claude).
+
+**Siguiente paso seguro (no ejecutado):** no bootear ni reflashear. Primero, una ring
+nueva del artefacto actual con tag único y SHA registrado; después A/B controlados
+(ADT wlan, 0101 vs super, IOKit/AKS). Solo si la ring nueva confirma el fallo se
+justifica tocar `userdata`. Cualquier reflash completo requiere confirmación
+explícita del usuario.
+
+### >>> GPU 2026-11-01 (limonetexd/ios-sweet-gpu, another M2101K6G; history) <<<
 
 **Latest (evening):** CoreAnimation is composited on the GPU. xnu 0086 (topaz 0131-0139 SweetSurface:
 values, bulk attachments at state page +0x30, IOSurfaceAddress/wrap-client surfaces, detach/zombie views,
