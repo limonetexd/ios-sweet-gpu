@@ -14,3 +14,6 @@ reports/
 logs/
 userland/out/
 userland/out2/
+firmware-modem/
+.tmp-hfsplus/
+xnu/out-*/
