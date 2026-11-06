@@ -113,7 +113,7 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        ('display-scale', u32(2)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -193,8 +193,8 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(750)),
+            ('canvas-height', u32(1624)),
         ])])
 
     fbcon = node('sweet-fbcon', [

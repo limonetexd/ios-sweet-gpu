@@ -1,0 +1,224 @@
+From: HakiOS
+Subject: [PATCH 0129] sweet: render 750x1624 and scale to the 1080x2400 panel
+
+The only option whose p95 crosses 16.7 ms (reports/research-2026-11-06-fps-next.md):
+render at the iPhone X's real @2x size, cut the CA attach/blit/clean pixel work
+2.25x, and scale the 720x1600 centre of the 750x1624 frame 1.5x to the panel.
+Nearest for now; bilinear after 40 ms still if needed.
+
+mkadt.py: display-scale 2, canvas 750x1624 (separate host change). SweetFramebuffer
+reports 750x1624, crops 15,12 720x1600, and the band copy maps every destination
+pixel to its source; SweetHID maps panel touches through the same crop. The 1:1
+1125x2436 path stays with sweetfb_scale=1 (old ADT) or sweetfb_native=1.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -175,6 +175,8 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScale;                 /* 0129: present a 750x1624 frame scaled to the panel */
++	uint32_t      fSrcX, fSrcY, fSrcW, fSrcH;   /* 0129: the source crop of that frame */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -302,6 +304,23 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fScale = false;
++	fSrcX = fSrcY = 0;
++	fSrcW = fLogicalW;
++	fSrcH = fLogicalH;
++	uint32_t scale = 2;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (scale >= 2 && !native && fWidth <= 1080 && fHeight <= 2400) {
++		/* 0129: iPhone X @2x in points, cropped 720x1600 and scaled 1.5x to the panel */
++		fLogicalW = 750;
++		fLogicalH = 1624;
++		fOffX = fOffY = 0;
++		fScale = true;
++		fSrcX = 15;
++		fSrcY = 12;
++		fSrcW = 720;
++		fSrcH = 1600;
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -843,6 +862,8 @@
+ 	uint32_t  srcRowBytes, dstRowBytes;
+ 	uint32_t  bytes;                /* bytes of each row */
+ 	uint32_t  rows, bands;
++	bool      scale;                /* 0129: source rect -> destination rect */
++	uint32_t  scaleSrcW, scaleSrcH, scaleDstW, scaleDstH;
+ 	int32_t   dy;                   /* panel row of the first row */
+ 	bool      invalidate;           /* dc civac each band first */
+ 	uint32_t  next;                 /* next band to take (atomic) */
+@@ -873,12 +894,31 @@
+ 		}
+ 	}
+ 	if (job->invalidate) {
+-		redwood_gpu_to_memory((void *)src, (uint64_t)(y1 - y0) * job->srcRowBytes);
++		if (job->scale) {
++			uint32_t sy0 = (uint32_t)((uint64_t)y0 * job->scaleSrcH / job->scaleDstH);
++			uint32_t sy1 = (uint32_t)((uint64_t)y1 * job->scaleSrcH / job->scaleDstH) + 1;
++			redwood_gpu_to_memory((void *)(job->srcRows + (uint64_t)sy0 * job->srcRowBytes),
++			    (uint64_t)(sy1 - sy0) * job->srcRowBytes);
++		} else {
++			redwood_gpu_to_memory((void *)src, (uint64_t)(y1 - y0) * job->srcRowBytes);
++		}
+ 	}
+-	for (uint32_t y = y0; y < y1; y++) {
+-		memcpy((void *)dst, (const void *)(src + job->srcColumn), job->bytes);
+-		src += job->srcRowBytes;
+-		dst += job->dstRowBytes;
++	if (job->scale) {
++		for (uint32_t y = y0; y < y1; y++) {
++			uint32_t sy = (uint32_t)((uint64_t)y * job->scaleSrcH / job->scaleDstH);
++			uintptr_t srow = job->srcRows + (uint64_t)sy * job->srcRowBytes + job->srcColumn;
++			uint32_t *drow = (uint32_t *)(job->dst + (uint64_t)(y - y0) * job->dstRowBytes);
++			for (uint32_t x = 0; x < job->scaleDstW; x++) {
++				uint32_t sx = (uint32_t)((uint64_t)x * job->scaleSrcW / job->scaleDstW);
++				drow[x] = *(const uint32_t *)(srow + (uint64_t)sx * 4);
++			}
++		}
++	} else {
++		for (uint32_t y = y0; y < y1; y++) {
++			memcpy((void *)dst, (const void *)(src + job->srcColumn), job->bytes);
++			src += job->srcRowBytes;
++			dst += job->dstRowBytes;
++		}
+ 	}
+ 	if (job->scan != 0 &&
+ 	    mach_absolute_time() > job->scan + job->period + job->period * ((uint64_t)job->dy + y0 + job->blank) / job->lines) {
+@@ -1299,6 +1339,11 @@
+ 		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
+ 		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
+ 		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++		int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++		if (sw <= 0 || sh <= 0) {
++			sw = w;
++			sh = h;
++		}
+ 
+ 		if (!(mask & (1u << layer)) || id == 0) {
+ 			continue;
+@@ -1327,6 +1372,57 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScale) {
++			/* 0129: source crop 15,12 720x1600 -> panel 1080x2400, nearest for now */
++			int32_t x0 = sx, y0 = sy, x1 = sx + sw, y1 = sy + sh;
++			if (x0 < (int32_t)fSrcX) x0 = fSrcX;
++			if (y0 < (int32_t)fSrcY) y0 = fSrcY;
++			if (x1 > (int32_t)(fSrcX + fSrcW)) x1 = fSrcX + fSrcW;
++			if (y1 > (int32_t)(fSrcY + fSrcH)) y1 = fSrcY + fSrcH;
++			int32_t pdx = (int32_t)(((int64_t)(dx + (x0 - sx) - (int32_t)fSrcX) * fWidth) / (int32_t)fSrcW);
++			int32_t pdy = (int32_t)(((int64_t)(dy + (y0 - sy) - (int32_t)fSrcY) * fHeight) / (int32_t)fSrcH);
++			int32_t pdw = (int32_t)(((int64_t)(x1 - x0) * fWidth) / (int32_t)fSrcW);
++			int32_t pdh = (int32_t)(((int64_t)(y1 - y0) * fHeight) / (int32_t)fSrcH);
++			if (x1 > x0 && y1 > y0 && pdw > 0 && pdh > 0) {
++				if (pdx < 0) { pdw += pdx; pdx = 0; }
++				if (pdy < 0) { pdh += pdy; pdy = 0; }
++				if (pdx + pdw > (int32_t)fWidth) pdw = (int32_t)fWidth - pdx;
++				if (pdy + pdh > (int32_t)fHeight) pdh = (int32_t)fHeight - pdy;
++			}
++			if (x1 > x0 && y1 > y0 && pdw > 0 && pdh > 0) {
++				SweetCopyJob job;
++				job.srcRows = src + s->offset + (uint64_t)y0 * s->bytesPerRow + (uint64_t)x0 * 4;
++				job.srcColumn = 0;
++				job.dst = fPixels + (uint64_t)pdy * fRowBytes + (uint64_t)pdx * 4;
++				job.srcRowBytes = s->bytesPerRow;
++				job.dstRowBytes = fRowBytes;
++				job.bytes = (uint32_t)pdw * 4;
++				job.rows = (uint32_t)pdh;
++				job.bands = (job.rows + SWEET_FB_BAND_ROWS - 1) / SWEET_FB_BAND_ROWS;
++				job.dy = pdy;
++				job.invalidate = s->drawn != 0 && !s->gpuPool;
++				job.next = 0;
++				job.scan = scan;
++				job.period = fBeamPeriod;
++				job.lines = fBeamLines;
++				job.blank = fBeamLines > fHeight ? fBeamLines - fHeight : 0;
++				job.torn = 0;
++				job.scale = true;
++				job.scaleSrcW = (uint32_t)(x1 - x0);
++				job.scaleSrcH = (uint32_t)(y1 - y0);
++				job.scaleDstW = (uint32_t)pdw;
++				job.scaleDstH = (uint32_t)pdh;
++				copy(&job);
++				if (scan != 0 && fStatLock != NULL) {
++					IOLockLock(fStatLock);
++					fStatBeamFrames++;
++					fStatBeamTorn += job.torn != 0;
++					IOLockUnlock(fStatLock);
++				}
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+@@ -1352,8 +1448,8 @@
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+-		    (uint64_t)(sx + w) * 4;
++		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow +
++		    (uint64_t)(sx + sw) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+@@ -1382,6 +1478,7 @@
+ 			job.lines = fBeamLines;
+ 			job.blank = fBeamLines > fHeight ? fBeamLines - fHeight : 0;
+ 			job.torn = 0;
++			job.scale = false;
+ 			copy(&job);
+ 			if (scan != 0 && fStatLock != NULL) {
+ 				IOLockLock(fStatLock);
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -368,6 +368,7 @@
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	bool fScale;                    /* 0129: 750x1624 frame scaled to the panel */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -434,10 +435,13 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	int scale = 2;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	fScale = scale >= 2 && !native;
++	fLogicalW = fScale ? 750 : (native ? 1080 : 1125);
++	fLogicalH = fScale ? 1624 : (native ? 2400 : 2436);
++	fOffX = fScale ? 0 : (fLogicalW - 1080) / 2;
++	fOffY = fScale ? 0 : (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -464,8 +468,10 @@
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	IOFixed nx = fScale ? (IOFixed)(((int64_t)(15 + x * 720 / 1080) << 16) / fLogicalW)
++	    : (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++	IOFixed ny = fScale ? (IOFixed)(((int64_t)(12 + y * 1600 / 2400) << 16) / fLogicalH)
++	    : (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
