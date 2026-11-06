@@ -2,6 +2,19 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-07: render scale 750x1624 (0129), presenter retention (0128) <<<
+
+**0129 render scale (pushed, not booted).** [decision from `reports/research-2026-11-06-fps-next.md`]
+The report measures GL frame median 10.6 ms / p90 16.1 / p95 20.1 and says the only option whose
+p95 crosses 16.7 is rendering at the iPhone X's real @2x size. `xnu/patches/0129-sweet-fb-render-scale.patch`:
+`SweetFramebuffer` reports 750x1624, crops 15,12 720x1600, and the band copy maps each destination
+pixel to its source (nearest); `SweetHID` maps panel touches through the same crop; default
+`sweetfb_scale=2`, `=1` old. `tools/mkadt.py`: `display-scale` 2, canvas 750x1624. 0128 retains
+each presenter surface until the copy (`fPresentRef`). CI 42309983037 = batch 0125-0129 (beam probe,
+presenter priority 92, beam order, retention, scale). Not booted yet; fallback = old ADT image
+(0123/0128). The SpringBoard `dl_max`/`anim_max` + status bar + MG cache root work is still needed
+for the commit rate; without it the scale may lower frame time but not raise swaps/s.
+
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
 **2026-11-06 (later, opencode): 120 Hz worse; presenter retention 0128; fps-next says render scale
