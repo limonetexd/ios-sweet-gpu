@@ -1,0 +1,19 @@
+From: HakiOS
+Subject: [PATCH 0130] sweet: start the presenter with kernel_thread_start (0130 build fix)
+
+0126 used kernel_thread_start_priority; the xnu-8796 build says "use of
+undeclared identifier" in SweetFramebuffer.cpp even though kern/thread.h
+declares it (the C++/KEXT visibility differs). Use kernel_thread_start, as
+0145 did; the priority-92 tweak can come back as a separate, compiled change.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -412,7 +412,7 @@
+ 	PE_parse_boot_argn("sweetfb_presenter", &presenterOn, sizeof(presenterOn));
+ 	if (presenterOn != 0 || fBeamMode >= 2) {
+ 		thread_t thread;
+-		if (kernel_thread_start_priority(&AppleCLCD::presenterMain, this, 92, &thread) == KERN_SUCCESS) {
++		if (kernel_thread_start(&AppleCLCD::presenterMain, this, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+ 			fPresenter = true;
+ 			IOLog("SWEET FB: frames put on the panel by a presenter thread\n");
