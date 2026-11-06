@@ -1,0 +1,6 @@
+# Scripts and patches run in WSL/CI: keep LF in the Windows working copy
+# (core.autocrlf=true turned tools/sweet-gpu-image.sh into CRLF: "/bin/bash^M").
+*.sh    text eol=lf
+*.py    text eol=lf
+*.patch text eol=lf
+*.diff  text eol=lf
