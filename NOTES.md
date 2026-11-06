@@ -58,6 +58,7 @@
   picker lagged and then the phone restarted by itself (respring or reboot; no ring pulled, phone left
   running). Wallpaper/battery UI not reported. Next: ring pull at the next fastboot to see whether it was a
   respring (SpringBoard/backboardd CRASH) or a kernel panic/watchdog.
+- User on 0108s0: frame rate felt like before, "30-40 FPS", far from HackiOS's 110+ (120 Hz panel there).
 - **FPS patches promoted (from the fb-copy agent drafts; comments inside still say 0140..0143):**
   0109 (=0140) vsync timer on a fixed 16.667 ms grid (`wakeAtTime`; the old re-arm after the copy made a
   ~37 ms cycle = ~27 fps; `sweetfb_vgrid=0` = old); 0110 (=0141) copy split in 64-row bands, no behaviour
