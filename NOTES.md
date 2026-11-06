@@ -4,6 +4,17 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): 0122r unattended (observed): no GEM_NEW freeze, pool inside the real
+window.** [O] Kernel 0122 (CI 42299757109), image `0122r` (`95454c81…4642`, `sweetgpu_reboot=420
+sweetgpu_swipe=60`), log `logs/xnu-0122r.txt`. Boot line `SWEET GPU POOL: 11 x 16 MiB ranges at
+0x1f1000000..0x1fc000000, reserved pool ends 0x1fcb00000`; slots 0-6 mapped in 493-638 us each, no
+high slot; no `SWEET FREEZE: RedwoodGPU`, no `zeroing … took` line over 50 ms, no `refused` /
+`cannot be entered`. Active period (after `synthetic swipes start`): nonzero swaps avg 21.7/s,
+p50 23, p90 33, max 44 (0121s120: avg 22.9, max 38). Boot had the known PosterBoard sig 5 and a
+24 s no-frame stall before the UI, not the pool freeze. The swipes do not open the widget picker;
+manual `0122s0` test next. Also built `0122b` (`sweetfb_bind=1`, `272e102d…b1a7`) and `0122g`
+(`sweetgpu_gestures=60`, `623cf9e4…2da9`).
+
 **2026-11-06 (later, opencode): 0122 built (CI 42299757109, 15m22s) and images made.** [O]
 `xnu/out-0122` downloaded; the CI log shows `Applying patch ... 0122-sweet-gpu-pool-real-window.patch`
 (no Skipping), and the kernel contains the four new `SWEET GPU POOL` strings, so the patch compiled.
