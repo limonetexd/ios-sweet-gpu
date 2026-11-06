@@ -1,0 +1,72 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a21b517..f8eef91 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -103,8 +103,11 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
++	uint64_t            fVsyncPeriod;       /* 0140: mach ticks per refresh; 0: re-armed after the work (old way) */
++	uint64_t            fVsyncDeadline;     /* 0140: when the next tick is due */
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	void vsyncRearm(IOTimerEventSource *sender);
+ 	void publishModes(void);
+ 	static void statsMain(void *self, wait_result_t result);
+ 	void statsReport(void);
+@@ -230,6 +233,16 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	/*
++	 * 0140: boot-arg sweetfb_vgrid=0 re-arms the vsync timer 16.7 ms after each tick's work, as
++	 * before; by default ticks keep a fixed 60 Hz grid (with a 4 ms panel copy in the tick the
++	 * old way gave 20-26 ms between vsyncs: "vsync timer N ms longest" in SWEET FPS).
++	 */
++	uint32_t vgrid = 1;
++	PE_parse_boot_argn("sweetfb_vgrid", &vgrid, sizeof(vgrid));
++	if (vgrid != 0) {
++		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * NSEC_PER_USEC, &fVsyncPeriod);
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	/* 0097: a thread that says what the display and the GPU did, once a second. */
+@@ -323,7 +336,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->vsyncRearm(sender);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -366,7 +379,28 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->vsyncRearm(sender);
++}
++
++/*
++ * 0140: the next tick one period after the last one was due, not after this one's work
++ * (a panel copy in the tick delayed every vsync by its length); a tick missed altogether
++ * goes to the next point of the grid after now (no burst of late ticks).
++ */
++void
++AppleCLCD::vsyncRearm(IOTimerEventSource *sender)
++{
++	uint64_t now = mach_absolute_time();
++
++	if (fVsyncPeriod == 0) {
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
++	fVsyncDeadline = fVsyncDeadline != 0 ? fVsyncDeadline + fVsyncPeriod : now + fVsyncPeriod;
++	if (fVsyncDeadline <= now) {
++		fVsyncDeadline += ((now - fVsyncDeadline) / fVsyncPeriod + 1) * fVsyncPeriod;
++	}
++	sender->wakeAtTime(fVsyncDeadline);
+ }
+ 
+ void

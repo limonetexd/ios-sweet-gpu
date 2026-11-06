@@ -47,6 +47,17 @@
 - CI gotcha: a push to main already starts `xnu.yml`; an extra `gh workflow run` makes the two cancel each
   other (concurrency group). Run 42244939772 = 0106 build.
 - `.gitattributes` (c3a6178): LF for *.sh/*.py/*.patch (core.autocrlf had made sweet-gpu-image.sh CRLF).
+- **0106r unattended (observed):** kernel 0106 (CI 42244939772, `xnu/out-0106`), image `shim-boot-0106r.img`
+  (23e5a38d...96a6, `sweetgpu_reboot=600`), log `logs/xnu-0106r.txt`: battery real by default
+  (`PM6150 / estimated SOC, 88% 4149mV`), no panic, back to fastboot. PosterBoard sig 5 still (expected:
+  no 0107/0108 yet).
+- **Kernel 0108** (CI 42247405787 success; 0106/0107/0108 applied, `xnu/out-0108`). Images:
+  `shim-boot-0108s0.img` (c4c76950...71a6, manual, no reboot) and `shim-boot-0108r.img`
+  (d667bcd4...80, `sweetgpu_reboot=600`). Not booted yet.
+- User (back): freezes still happen "sometimes, suddenly, for no reason" (image not recorded; 0101s0 or 0106).
+- Sub-agents hit the usage limit mid-task; freeze and Wi-Fi drafts were lost and relaunched. The framebuffer
+  agent left drafts `xnu/patches-pending/0140..0146-sweet-fb-*.patch` + `reports/research-2026-11-06-fbcopy.md`:
+  UNVALIDATED, not applied by CI. `tools/sweet-root-fixes.py` committed (untested on a real image).
   First boot after the flash: expect 15-30 min of datamigrator.
 - **New image `shim-boot-0101s0b.img`** = 0101s0 + `sweetbattery=1` (kernel `xnu/out-0101`,
   SWEETFB_HZ=60, serial=0; SHA-256 6a38dc18134b9be8091426fdc14d6ca09222e28c41f5882a0f95b962d6c74a7c).

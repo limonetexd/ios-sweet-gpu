@@ -1,0 +1,110 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 48886d8..d9b6739 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -187,6 +187,7 @@ public:
+ 	vm_offset_t   fBeamIntf;              /* the interface's registers, once they were seen to count; else 0 */
+ 	uint32_t      fBeamLines;             /* lines a scan, blanking included */
+ 	uint64_t      fBeamPeriod;            /* mach ticks a scan */
++	uint32_t      fStatBeamFrames, fStatBeamTorn;  /* 0146: frames written behind the scan, and torn ones */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -639,6 +640,17 @@ AppleCLCD::statsReport(void)
+ 		    swaps, window / 1000000,
+ 		    swapgap / 1000000, late, presents, presents ? psum / 1000 / presents : 0, pmax / 1000, stale,
+ 		    vsyncgap / 1000000, pending, redwood_gpu_last(), live, zombies, wired >> 20, failed, repeats);
++		if (fBeamIntf != 0) {
++			uint32_t beamFrames, beamTorn;
++			IOLockLock(fStatLock);
++			beamFrames = fStatBeamFrames;
++			beamTorn = fStatBeamTorn;
++			fStatBeamFrames = fStatBeamTorn = 0;
++			IOLockUnlock(fStatLock);
++			if (beamFrames != 0) {
++				IOLog("SWEET BEAM: %u frames written behind the scan, %u torn\n", beamFrames, beamTorn);
++			}
++		}
+ 		if (pending > 1000) {
+ 			IOLockLock(fStatLock);
+ 			stalls = ++fStatStalls;
+@@ -696,16 +708,32 @@ struct SweetCopyJob {
+ 	int32_t   dy;                   /* panel row of the first row */
+ 	bool      invalidate;           /* dc civac each band first */
+ 	uint32_t  next;                 /* next band to take (atomic) */
++	/* 0146: write each band once the panel's scan has passed it (scan 0: at once) */
++	uint64_t  scan;                 /* mach time the scan going on when the frame came began */
++	uint64_t  period;               /* mach ticks a scan */
++	uint32_t  lines, blank;         /* lines a scan; those before the first row (taken as all blanking) */
++	uint32_t  torn;                 /* bands written too late for the next scan (atomic) */
+ };
+ 
+ static void
+-sweet_fb_copy_band(const SweetCopyJob *job, uint32_t band)
++sweet_fb_copy_band(SweetCopyJob *job, uint32_t band)
+ {
+ 	uint32_t y0 = band * SWEET_FB_BAND_ROWS;
+ 	uint32_t y1 = y0 + SWEET_FB_BAND_ROWS < job->rows ? y0 + SWEET_FB_BAND_ROWS : job->rows;
+ 	uintptr_t src = job->srcRows + (uint64_t)y0 * job->srcRowBytes;
+ 	uintptr_t dst = job->dst + (uint64_t)y0 * job->dstRowBytes;
+ 
++	if (job->scan != 0) {
++		/*
++		 * 0146: the panel reads this very memory as it scans it (one buffer). Written just behind
++		 * the line being read, the band is whole in the next scan; all bands are, as each is
++		 * written in far less time than the scan takes to come round to it again.
++		 */
++		uint64_t passed = job->scan + job->period * ((uint64_t)job->dy + y1 + job->blank) / job->lines;
++		if (mach_absolute_time() < passed) {
++			clock_delay_until(passed);
++		}
++	}
+ 	if (job->invalidate) {
+ 		redwood_gpu_to_memory((void *)src, (uint64_t)(y1 - y0) * job->srcRowBytes);
+ 	}
+@@ -714,6 +742,10 @@ sweet_fb_copy_band(const SweetCopyJob *job, uint32_t band)
+ 		src += job->srcRowBytes;
+ 		dst += job->dstRowBytes;
+ 	}
++	if (job->scan != 0 &&
++	    mach_absolute_time() > job->scan + job->period + job->period * ((uint64_t)job->dy + y0 + job->blank) / job->lines) {
++		__atomic_fetch_add(&job->torn, 1, __ATOMIC_RELAXED);
++	}
+ }
+ 
+ /* Takes bands until none is left; returns how many this processor did. */
+@@ -1061,6 +1093,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (shownAgain(rec)) {
+ 		return false;
+ 	}
++	/* 0146: where the panel's scan is (sweetfb_beam=2 and counters that were seen to count) */
++	uint64_t scan = 0;
++	vm_offset_t intf = __atomic_load_n(&fBeamIntf, __ATOMIC_ACQUIRE);
++	if (intf != 0) {
++		uint64_t now = mach_absolute_time();
++		uint32_t line = *(volatile uint32_t *)(intf + INTF_LINE_COUNT);
++		line = line < fBeamLines ? line : fBeamLines - 1;
++		scan = now - fBeamPeriod * line / fBeamLines;
++	}
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -1157,7 +1198,18 @@ AppleCLCD::present(const uint8_t *rec)
+ 			 */
+ 			job.invalidate = s->drawn != 0 && !s->gpuPool;
+ 			job.next = 0;
++			job.scan = scan;
++			job.period = fBeamPeriod;
++			job.lines = fBeamLines;
++			job.blank = fBeamLines > fHeight ? fBeamLines - fHeight : 0;
++			job.torn = 0;
+ 			copy(&job);
++			if (scan != 0 && fStatLock != NULL) {
++				IOLockLock(fStatLock);
++				fStatBeamFrames++;
++				fStatBeamTorn += job.torn != 0;
++				IOLockUnlock(fStatLock);
++			}
+ 		}
+ 		s->release();
+ 	}

@@ -1,0 +1,168 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e0a1ed8..51731fa 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -150,12 +150,18 @@ public:
+ 	uint32_t      fCopyGeneration;        /* one more for each copy shared out */
+ 	uint32_t      fCopyHelpers;           /* helpers waiting for copies */
+ 	uint32_t      fCopyBusy;              /* helpers not done with the current copy */
++	/* 0143: what the panel shows, to leave a swap of the very same frame uncopied (sweetfb_skip) */
++	bool          fSkipRepeats;
++	bool          fShownValid;            /* fShown is on the panel (false before any, after a fade) */
++	uint8_t       fShown[4 + SWEET_FB_LAYERS * 44];
++	uint32_t      fStatRepeats;           /* swaps left uncopied: the panel had them already */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	bool present(const uint8_t *rec);
++	bool shownAgain(const uint8_t *rec);
+ 	void copy(SweetCopyJob *job);
+ 	bool drawn(const uint8_t *rec);
+ };
+@@ -268,6 +274,13 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 
++	/*
++	 * 0143: boot-arg sweetfb_skip=0 copies every swap; by default a swap of exactly the frame the
++	 * panel shows already (same GPU-drawn surfaces, fences, unlock seeds and rectangles) is not.
++	 */
++	uint32_t skip = 1;
++	PE_parse_boot_argn("sweetfb_skip", &skip, sizeof(skip));
++	fSkipRepeats = skip != 0;
+ 	/*
+ 	 * 0142: boot-arg sweetfb_threads=N (1 to 8, default 3): N processors share each copy into the
+ 	 * panel, the vsync tick and N-1 helper threads; 1 is the single copy of before. One processor
+@@ -383,9 +396,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		uint64_t began = mach_absolute_time();
+-		bool drawn = fb->drawn(rec);
++		bool drawn = fb->drawn(rec), copied = false;
+ 		if (drawn) {
+-			fb->present(rec);
++			copied = fb->present(rec);
+ 		} else {
+ 			IOLockLock(fb->fLock);
+ 			if (!fb->fDirty) {              /* (no newer frame meanwhile: this one again next tick) */
+@@ -398,7 +411,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			uint64_t ns = 0;
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 			IOLockLock(fb->fStatLock);
+-			if (drawn) {
++			if (drawn && !copied) {
++				fb->fStatRepeats++;
++			} else if (drawn) {
+ 				fb->fStatPresents++;
+ 				fb->fStatPresentSum += ns;
+ 				if (ns > fb->fStatPresentMax) {
+@@ -481,7 +496,7 @@ AppleCLCD::statsReport(void)
+ 		IOSleep(1000);
+ 		uint64_t now = mach_absolute_time();
+ 		uint64_t window = 0, swapgap, vsyncgap, psum, pmax;
+-		uint32_t swaps, late, presents, stale, stalls;
++		uint32_t swaps, late, presents, stale, stalls, repeats;
+ 		uint64_t wired = 0;
+ 		uint32_t live = 0, zombies = 0, failed = 0;
+ 
+@@ -498,6 +513,8 @@ AppleCLCD::statsReport(void)
+ 		late = fStatLateSwaps;
+ 		presents = fStatPresents;
+ 		stale = fStatStale;
++		repeats = fStatRepeats;
++		fStatRepeats = 0;
+ 		fStatWindow = now;
+ 		fStatSwapGapMax = 0;
+ 		fStatVsyncGapMax = 0;
+@@ -512,9 +529,10 @@ AppleCLCD::statsReport(void)
+ 		uint32_t pending = redwood_gpu_pending_ms();
+ 		IOLog("SWEET FPS: %u swaps in %llu ms (%llu ms longest, %u late), %u presents (%llu us average, "
+ 		    "%llu us longest, %u waited for the GPU), vsync timer %llu ms longest; GPU %u ms pending (fence %u); "
+-		    "%u surfaces, %u zombies, %llu MB wired, %u creates failed\n", swaps, window / 1000000,
++		    "%u surfaces, %u zombies, %llu MB wired, %u creates failed; %u repeats not copied\n",
++		    swaps, window / 1000000,
+ 		    swapgap / 1000000, late, presents, presents ? psum / 1000 / presents : 0, pmax / 1000, stale,
+-		    vsyncgap / 1000000, pending, redwood_gpu_last(), live, zombies, wired >> 20, failed);
++		    vsyncgap / 1000000, pending, redwood_gpu_last(), live, zombies, wired >> 20, failed, repeats);
+ 		if (pending > 1000) {
+ 			IOLockLock(fStatLock);
+ 			stalls = ++fStatStalls;
+@@ -798,11 +816,58 @@ AppleCLCD::publishModes(void)
+ 	OSSafeReleaseNULL(color);
+ }
+ 
+-void
++/*
++ * 0143: whether the swap shows what the panel has already: the same layers, rectangles and
++ * surfaces, each drawn by the GPU (a CPU drawing gives no sign of a change but its unlock seed)
++ * with neither a GPU submission naming it nor a write unlock since. The key is kept for the next.
++ */
++bool
++AppleCLCD::shownAgain(const uint8_t *rec)
++{
++	uint8_t key[sizeof(fShown)];
++	uint32_t mask = get32(rec, 0x104) & ((1u << SWEET_FB_LAYERS) - 1);
++	bool usable = fSkipRepeats, again;
++
++	bzero(key, sizeof(key));
++	memcpy(key, &mask, 4);
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && usable; layer++) {
++		uint8_t *k = key + 4 + 44 * layer;
++		uint32_t id = get32(rec, 0x54 + 4 * layer), fence, seed;
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s == NULL || s == fSurface || s->drawn == 0 || s->state == NULL) {
++			usable = false;
++		} else {
++			fence = s->drawn;
++			/* SWEET_SURFACE_STATE_SEED: bumped by every unlock for writing (SweetSurface.cpp) */
++			seed = *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc);
++			memcpy(k, &id, 4);
++			memcpy(k + 4, &fence, 4);
++			memcpy(k + 8, &seed, 4);
++			memcpy(k + 12, rec + 0x64 + 16 * layer, 16);
++			memcpy(k + 28, rec + 0xc4 + 16 * layer, 16);
++		}
++		OSSafeReleaseNULL(s);
++	}
++	IOLockLock(fLock);
++	again = usable && fShownValid && memcmp(key, fShown, sizeof(key)) == 0;
++	memcpy(fShown, key, sizeof(key));
++	fShownValid = usable;
++	IOLockUnlock(fLock);
++	return again;
++}
++
++/* Puts the swap on the panel; false: left as it was (0143: it showed that very frame already). */
++bool
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	if (shownAgain(rec)) {
++		return false;
++	}
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -903,6 +968,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	return true;
+ }
+ 
+ bool
+@@ -1055,6 +1121,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				fFB->fShownValid = false;       /* 0143: (fading changes the panel) */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");

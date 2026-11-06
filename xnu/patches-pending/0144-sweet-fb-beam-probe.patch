@@ -1,0 +1,162 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 51731fa..1374a28 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,22 @@ extern "C" uint32_t redwood_gpu_last(void);
+ extern "C" void redwood_gpu_report(const char *why);
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/*
++ * 0144: the display interface the panel is scanned out through (read only). sweet's DT (LineageOS
++ * boot.img): mdss_mdp@ae00000, qcom,sde-intf-off = <0x6b000 0x6b800 0x6c000 0x6c800>, types
++ * "dp", "dsi", "dsi", "dp": INTF_1 (DSI0) at 0x0ae6b800, INTF_2 (DSI1) at 0x0ae6c000. Register
++ * offsets as Linux's dpu_hw_intf.c / downstream sde_hw_intf.c. The panel is a DSC video-mode one
++ * (NOTES.md), so the timing engine left on by ABL counts frames and lines by itself.
++ */
++#define SWEET_INTF1_PA                  0x0ae6b800ULL
++#define SWEET_INTF2_PA                  0x0ae6c000ULL
++#define SWEET_INTF_WINDOW               0x4000ULL       /* one 16 KiB page per interface */
++#define INTF_TIMING_ENGINE_EN           0x000
++#define INTF_FRAME_LINE_COUNT_EN        0x0a8
++#define INTF_FRAME_COUNT                0x0ac
++#define INTF_LINE_COUNT                 0x0b0
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -114,6 +130,9 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	void statsReport(void);
+ 	static void copyHelperMain(void *self, wait_result_t result);
+ 	void copyHelper(void);
++	static void beamProbeMain(void *self, wait_result_t result);
++	void beamProbe(void);
++	bool beamMeasure(vm_offset_t intf);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -155,6 +174,11 @@ public:
+ 	bool          fShownValid;            /* fShown is on the panel (false before any, after a fade) */
+ 	uint8_t       fShown[4 + SWEET_FB_LAYERS * 44];
+ 	uint32_t      fStatRepeats;           /* swaps left uncopied: the panel had them already */
++	/* 0144: the panel's scan, from the display interface's counters (boot-arg sweetfb_beam) */
++	uint32_t      fBeamMode;              /* 0 off, 1 measure and log only, 2 also write behind the scan (0146) */
++	vm_offset_t   fBeamIntf;              /* the interface's registers, once they were seen to count; else 0 */
++	uint32_t      fBeamLines;             /* lines a scan, blanking included */
++	uint64_t      fBeamPeriod;            /* mach ticks a scan */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -274,6 +298,18 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 
++	/*
++	 * 0144: boot-arg sweetfb_beam=1 reads the display interface's frame and line counters once,
++	 * ten seconds after start, and logs the panel's real refresh rate and lines ("SWEET BEAM:");
++	 * reads only. sweetfb_intf=PHYS names the interface's registers instead of INTF_1/INTF_2.
++	 */
++	PE_parse_boot_argn("sweetfb_beam", &fBeamMode, sizeof(fBeamMode));
++	if (fBeamMode != 0) {
++		thread_t thread;
++		if (kernel_thread_start(&AppleCLCD::beamProbeMain, this, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
+ 	/*
+ 	 * 0143: boot-arg sweetfb_skip=0 copies every swap; by default a swap of exactly the frame the
+ 	 * panel shows already (same GPU-drawn surfaces, fences, unlock seeds and rectangles) is not.
+@@ -656,6 +692,93 @@ AppleCLCD::copy(SweetCopyJob *job)
+ 	IOLockUnlock(fCopyLock);
+ }
+ 
++void
++AppleCLCD::beamProbeMain(void *self, wait_result_t result __unused)
++{
++	((AppleCLCD *)self)->beamProbe();
++}
++
++/* 0144: which interface scans the panel out, and whether its counters count as they should. */
++void
++AppleCLCD::beamProbe(void)
++{
++	uint64_t named = 0, candidates[2] = { SWEET_INTF1_PA, SWEET_INTF2_PA };
++	unsigned count = 2;
++
++	IOSleep(10000);
++	if (PE_parse_boot_argn("sweetfb_intf", &named, sizeof(named)) && named != 0) {
++		candidates[0] = named;
++		count = 1;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		uint64_t pa = candidates[i];
++		vm_offset_t base = ml_io_map((vm_offset_t)(pa & ~(SWEET_INTF_WINDOW - 1)), (vm_size_t)SWEET_INTF_WINDOW);
++		if (base == 0) {
++			IOLog("SWEET BEAM: no mapping for 0x%llx\n", pa);
++			continue;
++		}
++		vm_offset_t intf = base + (vm_offset_t)(pa & (SWEET_INTF_WINDOW - 1));
++		uint32_t on = *(volatile uint32_t *)(intf + INTF_TIMING_ENGINE_EN);
++		IOLog("SWEET BEAM: INTF 0x%llx: timing engine 0x%x, count enable 0x%x, frame %u, line %u\n", pa, on,
++		    *(volatile uint32_t *)(intf + INTF_FRAME_LINE_COUNT_EN), *(volatile uint32_t *)(intf + INTF_FRAME_COUNT),
++		    *(volatile uint32_t *)(intf + INTF_LINE_COUNT));
++		if ((on & 1) && beamMeasure(intf)) {
++			return;
++		}
++	}
++	IOLog("SWEET BEAM: no interface counts the panel's scan: frames stay on the vsync timer\n");
++}
++
++/*
++ * 0144: lines a scan (the largest line seen in 50 ms, at least the panel's height, less than
++ * twice it) and the scan's length (from frame counts over half a second); the interface is
++ * used (fBeamIntf) only with sweetfb_beam=2 and only if both look right.
++ */
++bool
++AppleCLCD::beamMeasure(vm_offset_t intf)
++{
++	uint32_t first, frames, line, lines = 0, smallest = ~0u;
++	uint64_t began, ended, until, ns;
++
++	first = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &until);
++	until += mach_absolute_time();
++	while (*(volatile uint32_t *)(intf + INTF_FRAME_COUNT) == first && mach_absolute_time() < until) {
++	}
++	began = mach_absolute_time();
++	first = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
++	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &until);
++	until += began;
++	while (mach_absolute_time() < until) {
++		line = *(volatile uint32_t *)(intf + INTF_LINE_COUNT);
++		lines = line > lines ? line : lines;
++		smallest = line < smallest ? line : smallest;
++	}
++	IOSleep(450);
++	frames = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &until);
++	until += mach_absolute_time();
++	while (*(volatile uint32_t *)(intf + INTF_FRAME_COUNT) == frames && mach_absolute_time() < until) {
++	}
++	ended = mach_absolute_time();
++	frames = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT) - first;
++	if (frames == 0 || lines < fHeight || lines >= fHeight * 2 || smallest > fHeight / 4) {
++		IOLog("SWEET BEAM: counters do not count a scan (%u frames, lines %u to %u)\n", frames, smallest, lines);
++		return false;
++	}
++	fBeamLines = lines + 1;
++	fBeamPeriod = (ended - began) / frames;
++	absolutetime_to_nanoseconds(fBeamPeriod, &ns);
++	IOLog("SWEET BEAM: the panel's scan is %u lines, %llu us (%llu.%01llu Hz)%s\n", fBeamLines, ns / 1000,
++	    ns ? 1000000000ULL / ns : 0, ns ? (10000000000ULL / ns) % 10 : 0,
++	    fBeamMode >= 2 ? ": frames are written behind it from now on" : "");
++	if (fBeamMode >= 2) {
++		__atomic_thread_fence(__ATOMIC_RELEASE);
++		fBeamIntf = intf;
++	}
++	return true;
++}
++
+ void
+ AppleCLCD::copyHelperMain(void *self, wait_result_t result __unused)
+ {

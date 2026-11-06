@@ -1,0 +1,122 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f8eef91..6efc921 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -96,6 +96,7 @@ class IOMobileFramebuffer : public IOService {
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
++struct SweetCopyJob;			/* 0141 */
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+@@ -147,6 +148,7 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void copy(SweetCopyJob *job);
+ 	bool drawn(const uint8_t *rec);
+ };
+ 
+@@ -523,6 +525,64 @@ AppleCLCD::statsReport(void)
+ 	}
+ }
+ 
++/*
++ * 0141: one layer's copy into the panel, cut into bands of rows taken in order, top first, by
++ * whoever does the copy (the vsync tick; with 0142 helper threads too). A band is pushed out of
++ * the caches (when the GPU drew it) just before it is read, by whoever copies it.
++ */
++#define SWEET_FB_BAND_ROWS      64      /* ~290 KB of source a band at 1125x2436 */
++
++struct SweetCopyJob {
++	uintptr_t srcRows;              /* source: start of its first row */
++	uintptr_t dst;                  /* panel: first byte written */
++	uint32_t  srcColumn;            /* bytes into a source row the copy begins at */
++	uint32_t  srcRowBytes, dstRowBytes;
++	uint32_t  bytes;                /* bytes of each row */
++	uint32_t  rows, bands;
++	int32_t   dy;                   /* panel row of the first row */
++	bool      invalidate;           /* dc civac each band first */
++	uint32_t  next;                 /* next band to take (atomic) */
++};
++
++static void
++sweet_fb_copy_band(const SweetCopyJob *job, uint32_t band)
++{
++	uint32_t y0 = band * SWEET_FB_BAND_ROWS;
++	uint32_t y1 = y0 + SWEET_FB_BAND_ROWS < job->rows ? y0 + SWEET_FB_BAND_ROWS : job->rows;
++	uintptr_t src = job->srcRows + (uint64_t)y0 * job->srcRowBytes;
++	uintptr_t dst = job->dst + (uint64_t)y0 * job->dstRowBytes;
++
++	if (job->invalidate) {
++		redwood_gpu_to_memory((void *)src, (uint64_t)(y1 - y0) * job->srcRowBytes);
++	}
++	for (uint32_t y = y0; y < y1; y++) {
++		memcpy((void *)dst, (const void *)(src + job->srcColumn), job->bytes);
++		src += job->srcRowBytes;
++		dst += job->dstRowBytes;
++	}
++}
++
++/* Takes bands until none is left; returns how many this processor did. */
++static uint32_t
++sweet_fb_copy_bands(SweetCopyJob *job)
++{
++	uint32_t done = 0, band;
++
++	while ((band = __atomic_fetch_add(&job->next, 1, __ATOMIC_RELAXED)) < job->bands) {
++		sweet_fb_copy_band(job, band);
++		done++;
++	}
++	/* the panel is write-combined memory: this processor's writes out of its buffers */
++	__asm__ volatile ("dsb st" ::: "memory");
++	return done;
++}
++
++void
++AppleCLCD::copy(SweetCopyJob *job)
++{
++	(void)sweet_fb_copy_bands(job);
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -735,20 +795,26 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4 && s->drawn != 0 && !s->gpuPool) {
++		if (src != 0 && bpe == 4) {
++			SweetCopyJob job;
++			job.srcRows = src + s->offset + (uint64_t)sy * s->bytesPerRow;
++			job.srcColumn = (uint32_t)sx * 4;
++			job.dst = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++			job.srcRowBytes = s->bytesPerRow;
++			job.dstRowBytes = fRowBytes;
++			job.bytes = (uint32_t)w * 4;
++			job.rows = (uint32_t)h;
++			job.bands = (job.rows + SWEET_FB_BAND_ROWS - 1) / SWEET_FB_BAND_ROWS;
++			job.dy = dy;
+ 			/*
+ 			 * Drawn by the GPU, which writes memory behind this processor's caches, and RedwoodGPU
+ 			 * no longer cleans the whole surface out of them at every submission (only written
+-			 * pages): lines left from an earlier copy of this surface go before it is read again.
++			 * pages): lines left from an earlier copy of this surface go before it is read again
++			 * (0141: band by band, just before the band is read).
+ 			 */
+-			redwood_gpu_to_memory((void *)(src + s->offset + (uint64_t)sy * s->bytesPerRow), (uint64_t)h * s->bytesPerRow);
+-		}
+-		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
+-			}
++			job.invalidate = s->drawn != 0 && !s->gpuPool;
++			job.next = 0;
++			copy(&job);
+ 		}
+ 		s->release();
+ 	}

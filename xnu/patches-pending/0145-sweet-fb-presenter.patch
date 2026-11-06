@@ -1,0 +1,178 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1374a28..48886d8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -130,6 +130,9 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	void statsReport(void);
+ 	static void copyHelperMain(void *self, wait_result_t result);
+ 	void copyHelper(void);
++	static void presenterMain(void *self, wait_result_t result);
++	void presenter(void);
++	void notePresent(bool drawn, bool copied, uint64_t began);
+ 	static void beamProbeMain(void *self, wait_result_t result);
+ 	void beamProbe(void);
+ 	bool beamMeasure(vm_offset_t intf);
+@@ -174,6 +177,11 @@ public:
+ 	bool          fShownValid;            /* fShown is on the panel (false before any, after a fade) */
+ 	uint8_t       fShown[4 + SWEET_FB_LAYERS * 44];
+ 	uint32_t      fStatRepeats;           /* swaps left uncopied: the panel had them already */
++	/* 0145: frames put on the panel by a thread of their own (boot-arg sweetfb_presenter) */
++	bool          fPresenter;
++	bool          fPresentBusy;           /* the presenter has a frame (fLock) */
++	uint32_t      fPresentGeneration;     /* one more for each frame handed over (fLock) */
++	uint8_t       fPresentRec[SWEET_FB_SWAP_REC_SIZE];
+ 	/* 0144: the panel's scan, from the display interface's counters (boot-arg sweetfb_beam) */
+ 	uint32_t      fBeamMode;              /* 0 off, 1 measure and log only, 2 also write behind the scan (0146) */
+ 	vm_offset_t   fBeamIntf;              /* the interface's registers, once they were seen to count; else 0 */
+@@ -310,6 +318,21 @@ AppleCLCD::start(IOService *provider)
+ 			thread_deallocate(thread);
+ 		}
+ 	}
++	/*
++	 * 0145: boot-arg sweetfb_presenter=1 (default 0; on with sweetfb_beam=2): the vsync tick hands
++	 * a frame the GPU is done with to a presenter thread and goes on, so a copy that waits for the
++	 * panel's scan (0146) never delays a vsync. A tick does not hand over while one is copied.
++	 */
++	uint32_t presenterOn = 0;
++	PE_parse_boot_argn("sweetfb_presenter", &presenterOn, sizeof(presenterOn));
++	if (presenterOn != 0 || fBeamMode >= 2) {
++		thread_t thread;
++		if (kernel_thread_start(&AppleCLCD::presenterMain, this, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			fPresenter = true;
++			IOLog("SWEET FB: frames put on the panel by a presenter thread\n");
++		}
++	}
+ 	/*
+ 	 * 0143: boot-arg sweetfb_skip=0 copies every swap; by default a swap of exactly the frame the
+ 	 * panel shows already (same GPU-drawn surfaces, fences, unlock seeds and rectangles) is not.
+@@ -405,11 +428,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
++		bool copying = fb->fPresentBusy;        /* 0145: (not under the presenter's last copy) */
++		if (step <= 6 && !copying) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (step <= 6 && !copying) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+@@ -420,7 +444,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->vsyncRearm(sender);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && !fb->fPresentBusy;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -432,9 +456,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		uint64_t began = mach_absolute_time();
+-		bool drawn = fb->drawn(rec), copied = false;
+-		if (drawn) {
+-			copied = fb->present(rec);
++		bool drawn = fb->drawn(rec);
++		if (drawn && fb->fPresenter) {
++			/* 0145: to the presenter (counted there) */
++			IOLockLock(fb->fLock);
++			memcpy(fb->fPresentRec, rec, SWEET_FB_SWAP_REC_SIZE);
++			fb->fPresentBusy = true;
++			fb->fPresentGeneration++;
++			IOLockWakeup(fb->fLock, &fb->fPresentGeneration, true);
++			IOLockUnlock(fb->fLock);
++		} else if (drawn) {
++			bool copied = fb->present(rec);
++			fb->notePresent(true, copied, began);
+ 		} else {
+ 			IOLockLock(fb->fLock);
+ 			if (!fb->fDirty) {              /* (no newer frame meanwhile: this one again next tick) */
+@@ -442,29 +475,66 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				fb->fDirty = true;
+ 			}
+ 			IOLockUnlock(fb->fLock);
+-		}
+-		if (fb->fStatLock != NULL) {
+-			uint64_t ns = 0;
+-			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+-			IOLockLock(fb->fStatLock);
+-			if (drawn && !copied) {
+-				fb->fStatRepeats++;
+-			} else if (drawn) {
+-				fb->fStatPresents++;
+-				fb->fStatPresentSum += ns;
+-				if (ns > fb->fStatPresentMax) {
+-					fb->fStatPresentMax = ns;
+-				}
+-			} else {
+-				fb->fStatStale++;
+-			}
+-			IOLockUnlock(fb->fStatLock);
++			fb->notePresent(false, false, began);
+ 		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	fb->vsyncRearm(sender);
+ }
+ 
++/* A frame put on the panel (or left as it was: copied false), or one the GPU was not done with. */
++void
++AppleCLCD::notePresent(bool drawn, bool copied, uint64_t began)
++{
++	if (fStatLock != NULL) {
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		IOLockLock(fStatLock);
++		if (drawn && !copied) {
++			fStatRepeats++;
++		} else if (drawn) {
++			fStatPresents++;
++			fStatPresentSum += ns;
++			if (ns > fStatPresentMax) {
++				fStatPresentMax = ns;
++			}
++		} else {
++			fStatStale++;
++		}
++		IOLockUnlock(fStatLock);
++	}
++}
++
++void
++AppleCLCD::presenterMain(void *self, wait_result_t result __unused)
++{
++	((AppleCLCD *)self)->presenter();
++}
++
++/* 0145: puts each frame handed over on the panel (from generation 1: none is missed at start). */
++void
++AppleCLCD::presenter(void)
++{
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	uint32_t seen = 0;
++
++	for (;;) {
++		IOLockLock(fLock);
++		while (fPresentGeneration == seen) {
++			IOLockSleep(fLock, &fPresentGeneration, THREAD_UNINT);
++		}
++		seen = fPresentGeneration;
++		memcpy(rec, fPresentRec, sizeof(rec));
++		IOLockUnlock(fLock);
++		uint64_t began = mach_absolute_time();
++		bool copied = present(rec);
++		notePresent(true, copied, began);
++		IOLockLock(fLock);
++		fPresentBusy = false;
++		IOLockUnlock(fLock);
++	}
++}
++
+ /*
+  * 0140: the next tick one period after the last one was due, not after this one's work
+  * (a panel copy in the tick delayed every vsync by its length); a tick missed altogether

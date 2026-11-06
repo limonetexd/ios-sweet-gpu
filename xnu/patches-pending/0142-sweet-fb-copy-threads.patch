@@ -1,0 +1,121 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6efc921..e0a1ed8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -112,6 +112,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	void publishModes(void);
+ 	static void statsMain(void *self, wait_result_t result);
+ 	void statsReport(void);
++	static void copyHelperMain(void *self, wait_result_t result);
++	void copyHelper(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -142,6 +144,12 @@ public:
+ 	uint32_t      fStatSwaps, fStatLateSwaps;
+ 	uint32_t      fStatPresents, fStatStale;      /* presents and those the GPU was not done for */
+ 	uint32_t      fStatStalls;            /* GPU-not-done reports made */
++	/* 0142: the helpers of the panel copy (boot-arg sweetfb_threads) */
++	IOLock       *fCopyLock;
++	SweetCopyJob *fCopyJob;               /* the copy being shared out */
++	uint32_t      fCopyGeneration;        /* one more for each copy shared out */
++	uint32_t      fCopyHelpers;           /* helpers waiting for copies */
++	uint32_t      fCopyBusy;              /* helpers not done with the current copy */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -260,6 +268,28 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 
++	/*
++	 * 0142: boot-arg sweetfb_threads=N (1 to 8, default 3): N processors share each copy into the
++	 * panel, the vsync tick and N-1 helper threads; 1 is the single copy of before. One processor
++	 * took 3.5-4 ms (up to 8.6) for a 1080x2400 frame (SWEET FPS "us average", 0101 runs).
++	 */
++	uint32_t threads = 3;
++	PE_parse_boot_argn("sweetfb_threads", &threads, sizeof(threads));
++	if (threads > 8) {
++		threads = 8;
++	}
++	if (threads > 1 && (fCopyLock = IOLockAlloc()) != NULL) {
++		uint32_t started = 0;
++		for (uint32_t i = 1; i < threads; i++) {
++			thread_t thread;
++			if (kernel_thread_start(&AppleCLCD::copyHelperMain, this, &thread) == KERN_SUCCESS) {
++				thread_deallocate(thread);
++				started++;
++			}
++		}
++		IOLog("SWEET FB: panel copy shared by %u processors (sweetfb_threads)\n", started + 1);
++	}
++
+ 	publishModes();
+ 	/*
+ 	 * (ios-topaz 0902) The GPU is waited for here, not by eagl.c's glFinish: a frame is put on the
+@@ -577,10 +607,65 @@ sweet_fb_copy_bands(SweetCopyJob *job)
+ 	return done;
+ }
+ 
++/*
++ * 0142: the copy shared with the helpers that wait for one: each takes bands until none is left,
++ * this thread too; done when every helper counted in is back (the job is on this stack).
++ */
+ void
+ AppleCLCD::copy(SweetCopyJob *job)
+ {
++	if (fCopyLock == NULL || job->bands < 2) {
++		(void)sweet_fb_copy_bands(job);
++		return;
++	}
++	IOLockLock(fCopyLock);
++	if (fCopyHelpers == 0) {
++		IOLockUnlock(fCopyLock);
++		(void)sweet_fb_copy_bands(job);
++		return;
++	}
++	fCopyJob = job;
++	fCopyBusy = fCopyHelpers;
++	fCopyGeneration++;
++	IOLockWakeup(fCopyLock, &fCopyGeneration, false);
++	IOLockUnlock(fCopyLock);
+ 	(void)sweet_fb_copy_bands(job);
++	IOLockLock(fCopyLock);
++	while (fCopyBusy != 0) {
++		IOLockSleep(fCopyLock, &fCopyBusy, THREAD_UNINT);
++	}
++	fCopyJob = NULL;
++	IOLockUnlock(fCopyLock);
++}
++
++void
++AppleCLCD::copyHelperMain(void *self, wait_result_t result __unused)
++{
++	((AppleCLCD *)self)->copyHelper();
++}
++
++/* 0142: a helper of the copy; counted in from the next copy shared out after it started. */
++void
++AppleCLCD::copyHelper(void)
++{
++	IOLockLock(fCopyLock);
++	uint32_t seen = fCopyGeneration;
++	fCopyHelpers++;
++	for (;;) {
++		while (fCopyGeneration == seen) {
++			IOLockSleep(fCopyLock, &fCopyGeneration, THREAD_UNINT);
++		}
++		seen = fCopyGeneration;
++		SweetCopyJob *job = fCopyJob;
++		IOLockUnlock(fCopyLock);
++		if (job != NULL) {
++			(void)sweet_fb_copy_bands(job);
++		}
++		IOLockLock(fCopyLock);
++		if (fCopyBusy != 0 && --fCopyBusy == 0) {
++			IOLockWakeup(fCopyLock, &fCopyBusy, true);
++		}
++	}
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
