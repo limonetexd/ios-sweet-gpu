@@ -78,6 +78,9 @@
 - **0114/0115 promoted** (agent drafts 0120/0122, 8566363): freeze probe ON by default (`sweetfreeze=0` off),
   respring after the 2nd dump only with `sweetfreeze=2`. Next: reproduce the widget-picker freeze on a 0115
   kernel and `grep -a "SWEET FREEZE\|^FRZ"` the ring.
+- **Wi-Fi drafts compile (observed):** CI 42278088612 on branch `wifi-ci` (base 0001..0112 + Wi-Fi as
+  0113-0120) succeeded; all 8 applied, no `Skipping patch`, no sweet errors (only stock ctf-tool warnings).
+  Not booted. To merge into main they need renumbering after 0115.
 - User stopped the remaining agents (usage). Work continues without sub-agents.
 - **eagl reuse agent (Sonnet) finding [O in logs]:** backboardd attaches a NEW IOSurface and a NEW texture
   every frame (ids 2,4,6,7,8...), so per-surface reuse cannot hit today. Attach ~5.7 ms/frame + delete
