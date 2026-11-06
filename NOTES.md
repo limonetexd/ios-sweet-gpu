@@ -5,7 +5,7 @@
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
 **NEXT (paused at ~90% usage, user OK to do later):**
-1. CI 42283741879 (series 0001..0121 with the 0117-0119 string fix): download to `xnu/out-0121`, build images
+1. CI 42283741879 succeeded; kernel in `xnu/out-0121`; images `shim-boot-0121s0.img` (1cdef9aa...93c0) and `shim-boot-0121s120.img` (`sweetfb_rate=120`, 23c7ce74...123b) built, not booted. Further images:
    `0121s0` (manual) and A/B variants: `sweetfb_rate=120`, `+ sweetfb_bind=1`, `+ ca_vbl=1`; freeze probe 0114
    is on: reproduce the widget-picker freeze, pull the ring, `grep -a "SWEET FREEZE\|^FRZ"`.
 2. **Port frokfrdk/ios-sweet `sunfish` a0b076c (xnu 0118, 512 MiB GPU window, 256 L3 tables in XNU memory)**
