@@ -81,6 +81,22 @@
 - **Wi-Fi drafts compile (observed):** CI 42278088612 on branch `wifi-ci` (base 0001..0112 + Wi-Fi as
   0113-0120) succeeded; all 8 applied, no `Skipping patch`, no sweet errors (only stock ctf-tool warnings).
   Not booted. To merge into main they need renumbering after 0115.
+- **frokfrdk/ios-sweet branch `sunfish` (Pixel 4a = same SM7150 + Adreno 618; own GL stack
+  tools/sweetgl: sweeteagl/sweetdrm/sweetgl, not topaz), active to 2026-11-03.** Read by hand:
+  - a0b076c `xnu 0118`: 512 MiB GPU window, 256 L3 tables (1 MiB) from contiguous XNU memory (zeroed, cleaned
+    to PoC, `ml_io_map_wcomb`), fallback to the 64 in GPU-GMU-MEM. Their symptom = ours: "bo new 7340032
+    bytes refused" with 116-123/128 MiB used -> GL_OUT_OF_MEMORY, half-drawn switcher. => our 0113 only
+    recycles kept buffers; a bigger window is the real fix (port candidate).
+  - 7b131f9: one recursive mutex around EVERY GL entry in their EAGL (CA runs one context on several threads;
+    Mesa crashed in `_mesa_hash_table_search` under fd_submit_append_bo). Candidate for our eagl.
+  - 748b7c2: one Mesa pipe_resource per IOSurface (48-entry cache, LRU, 2 s idle drop): freedreno orders
+    batches per resource; two imports of one surface = stale/half-drawn layers.
+  - 3572fed: bound IOSurfaces count as "in use" until the GPU retires the next submit (Apple semantics;
+    CA checks IOSurfaceIsInUse) -> fixes torn labels/widgets/blurred materials.
+  - also: 7eed45f/e52e78e `sweetwall` layered iOS 16 wallpaper dylib, sweetgl G7-G9 series on CA shaders.
+  - Wide fork survey prepared for opencode/DeepSeek (prompt in session scratchpad); Claude Code auto mode
+    refused to start opencode with `--auto`, so the user runs it by hand ->
+    `reports/research-2026-11-06-forks-deepseek.md`.
 - User stopped the remaining agents (usage). Work continues without sub-agents.
 - **eagl reuse agent (Sonnet) finding [O in logs]:** backboardd attaches a NEW IOSurface and a NEW texture
   every frame (ids 2,4,6,7,8...), so per-surface reuse cannot hit today. Attach ~5.7 ms/frame + delete
