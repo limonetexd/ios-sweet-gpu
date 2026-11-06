@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..0a051d1 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -10,6 +10,8 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -86,11 +88,12 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery blocks; keys retain their own lanes.
++	 * 0x60: the PM6150 RTC counter, read once to set the calendar (Wi-Fi 0133). */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -123,4 +126,60 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * Wi-Fi port 0133 (DC28088 0166): set the calendar from the PM6150 RTC
++ * (Linux rtc-pm8xxx, pm8941 layout: control 0x6046 bit 7 = enabled, seconds
++ * 0x6048-0x604b little endian; re-read when the low byte moved). Without it
++ * every boot's calendar starts at the epoch and kern.boottime is the same
++ * ~40 s each boot; wland's auto start compares it with /var/local/wland.boot
++ * and exits "already started in this boot" whenever it repeats (no Wi-Fi on
++ * the second boot). Only when the calendar is still before 2001. Disable with
++ * sweetrtc=0. Called from SweetBattery::start after sweet_spmi_init().
++ */
++void sweet_rtc_set_calendar(void);
++void
++sweet_rtc_set_calendar(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetrtc", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	clock_sec_t now = 0;
++	clock_usec_t us = 0;
++	clock_get_calendar_microtime(&now, &us);
++	if (now > 978307200) {
++		return;
++	}
++	uint8_t ctl = 0, b[4] = {0, 0, 0, 0}, low = 0;
++	if (sweet_spmi_read(0, 0x6046, &ctl) || !(ctl & 0x80u)) {
++		printf("SWEET RTC: PM6150 RTC not readable or disabled (ctl %#x)\n", ctl);
++		return;
++	}
++	for (int attempt = 0; attempt < 3; attempt++) {
++		bool ok = true;
++		for (unsigned i = 0; i < 4 && ok; i++) {
++			ok = !sweet_spmi_read(0, 0x6048 + i, &b[i]);
++		}
++		if (!ok || sweet_spmi_read(0, 0x6048, &low)) {
++			printf("SWEET RTC: PM6150 RTC read failed\n");
++			return;
++		}
++		if (low == b[0]) {
++			uint32_t secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			if (secs < 86400u) {
++				printf("SWEET RTC: PM6150 RTC %u s: too small, calendar left alone\n", secs);
++				return;
++			}
++			clock_set_calendar_microtime((clock_sec_t)secs, 0);
++			clock_sec_t bs = 0;
++			clock_usec_t bus = 0;
++			clock_get_boottime_microtime(&bs, &bus);
++			printf("SWEET RTC: calendar set from the PM6150 RTC: %u s (boot time now %lu)\n", secs, (unsigned long)bs);
++			return;
++		}
++	}
++	printf("SWEET RTC: PM6150 RTC kept moving while read\n");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 42adf3d..4339dac 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -16,6 +16,7 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" void sweet_rtc_set_calendar(void);    /* Wi-Fi 0133 */
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -278,6 +279,9 @@ SweetBattery::start(IOService *provider)
+ 	int real = 1;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	if (sweet_spmi_init() == 0) {
++		sweet_rtc_set_calendar();       /* calendar from the PMIC RTC (sweetrtc=0 disables) */
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
