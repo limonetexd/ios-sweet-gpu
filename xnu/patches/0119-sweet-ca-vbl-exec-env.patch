@@ -13,7 +13,7 @@ frames follow the vsync timer of 0109/0151 (sweetfb_vhz).
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5741,6 +5741,43 @@
+@@ -5741,6 +5741,42 @@
  		imgp->ip_envc++;
  	}
  
@@ -49,8 +49,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			}
 +			imgp->ip_argspace -= new_ptr_size;
 +			imgp->ip_envc++;
-+			printf("SWEET CA: CA_FORCE_TIMER=1 for %s (ca_vbl=1)
-+", path);
++			printf("SWEET CA: CA_FORCE_TIMER=1 for %s (ca_vbl=1)\n", path);
 +		}
 +	}
 +

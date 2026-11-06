@@ -48,7 +48,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	 * 0140: boot-arg sweetfb_vgrid=0 re-arms the vsync timer 16.7 ms after each tick's work, as
  	 * before; by default ticks keep a fixed 60 Hz grid (with a 4 ms panel copy in the tick the
  	 * old way gave 20-26 ms between vsyncs: "vsync timer N ms longest" in SWEET FPS).
-@@ -270,9 +284,12 @@
+@@ -270,9 +284,11 @@
  	uint32_t vgrid = 1;
  	PE_parse_boot_argn("sweetfb_vgrid", &vgrid, sizeof(vgrid));
  	if (vgrid != 0) {
@@ -57,8 +57,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
 -	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
 +	fVsync->setTimeoutUS(fVsyncUS);
-+	IOLog("SWEET FB: vsync %u Hz%s, a frame put on the panel every %u ticks at most (sweetfb_vhz, sweetfb_hz)
-+",
++	IOLog("SWEET FB: vsync %u Hz%s, a frame put on the panel every %u ticks at most (sweetfb_vhz, sweetfb_hz)\n",
 +	    fVsyncHz, vgrid != 0 ? " on a fixed grid" : "", fFlushTicks);
  
  	/* 0097: a thread that says what the display and the GPU did, once a second. */

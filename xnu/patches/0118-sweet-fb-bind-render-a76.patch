@@ -62,7 +62,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	bool          fShownValid;            /* fShown is on the panel (false before any, after a fade) */
  	uint8_t       fShown[4 + SWEET_FB_LAYERS * 44];
  	uint32_t      fStatRepeats;           /* swaps left uncopied: the panel had them already */
-@@ -316,6 +345,20 @@
+@@ -316,6 +345,19 @@
  	 * panel, the vsync tick and N-1 helper threads; 1 is the single copy of before. One processor
  	 * took 3.5-4 ms (up to 8.6) for a 1080x2400 frame (SWEET FPS "us average", 0101 runs).
  	 */
@@ -76,8 +76,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	PE_parse_boot_argn("sweetfb_bind", &fBind, sizeof(fBind));
 +	PE_parse_boot_argn("sweetfb_render_cpu", &fRenderCPU, sizeof(fRenderCPU));
 +	if (fBind != 0 && fRenderCPU > ml_get_max_cpu_number()) {
-+		IOLog("SWEET FB: sweetfb_bind: no processor %d, nothing bound
-+", fRenderCPU);
++		IOLog("SWEET FB: sweetfb_bind: no processor %d, nothing bound\n", fRenderCPU);
 +		fBind = 0;
 +	}
  	uint32_t threads = 3;
@@ -108,7 +107,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockLock(fCopyLock);
  	uint32_t seen = fCopyGeneration;
  	fCopyHelpers++;
-@@ -1135,6 +1189,17 @@
+@@ -1135,6 +1189,16 @@
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
  		fFB->swap(rec);
@@ -118,8 +117,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			proc_selfname(name, sizeof(name));
 +			if (strcmp(name, "backboardd") == 0 && sweet_fb_bind_self(fFB->fRenderCPU)) {
 +				fFB->fBoundRender = (void *)current_thread();
-+				IOLog("SWEET FB: backboardd's swapping thread %p bound to cpu %d (sweetfb_bind)
-+",
++				IOLog("SWEET FB: backboardd's swapping thread %p bound to cpu %d (sweetfb_bind)\n",
 +				    fFB->fBoundRender, fFB->fRenderCPU);
 +			}
 +		}
