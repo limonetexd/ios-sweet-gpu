@@ -1,0 +1,38 @@
+From: HakiOS
+Subject: [PATCH 0131] sweet: precompute the scaled copy's source columns (present 11.4 -> target 4-5 ms)
+
+The 750x1624 render scale cut the GL frame to p50 7.2 ms / p95 9.6, but the
+scaled present costs 11.4 ms because every destination pixel does an integer
+multiply/divide. 0131 fills a 16-bit source-column map once per layer; the
+band loop becomes a table lookup + load + store. Same nearest result.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -864,6 +864,7 @@
+ 	uint32_t  rows, bands;
+ 	bool      scale;                /* 0129: source rect -> destination rect */
+ 	uint32_t  scaleSrcW, scaleSrcH, scaleDstW, scaleDstH;
++	uint16_t  scaleX[SWEET_FB_LOGICAL_W];   /* 0131: source column for each destination pixel */
+ 	int32_t   dy;                   /* panel row of the first row */
+ 	bool      invalidate;           /* dc civac each band first */
+ 	uint32_t  next;                 /* next band to take (atomic) */
+@@ -909,8 +910,7 @@
+ 			uintptr_t srow = job->srcRows + (uint64_t)sy * job->srcRowBytes + job->srcColumn;
+ 			uint32_t *drow = (uint32_t *)(job->dst + (uint64_t)(y - y0) * job->dstRowBytes);
+ 			for (uint32_t x = 0; x < job->scaleDstW; x++) {
+-				uint32_t sx = (uint32_t)((uint64_t)x * job->scaleSrcW / job->scaleDstW);
+-				drow[x] = *(const uint32_t *)(srow + (uint64_t)sx * 4);
++					drow[x] = *(const uint32_t *)(srow + (uint64_t)job->scaleX[x] * 4);
+ 			}
+ 		}
+ 	} else {
+@@ -1412,6 +1412,9 @@
+ 				job.scaleSrcH = (uint32_t)(y1 - y0);
+ 				job.scaleDstW = (uint32_t)pdw;
+ 				job.scaleDstH = (uint32_t)pdh;
++				for (int32_t x = 0; x < pdw; x++) {
++					job.scaleX[x] = (uint16_t)(((int64_t)x * job.scaleSrcW) / job.scaleDstW);
++				}
+ 				copy(&job);
+ 				if (scan != 0 && fStatLock != NULL) {
+ 					IOLockLock(fStatLock);
