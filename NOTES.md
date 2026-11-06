@@ -4,6 +4,16 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**0121s120 user test (observed):** `sweetfb_rate=120` boots (`IOMFBDisplayRefresh 120 Hz`, vsync 120 Hz grid);
+user: "did not even reach 60". Log `logs/xnu-0121s120-widgetfreeze.txt`: 28 active s, avg 22.9 swaps/s, max 38,
+present 3620 us; 0120 surface reuse works (`from kept memory ... reused`). **Widget picker froze again and the
+0114 probe caught it:** `SWEET FREEZE: RedwoodGPU GEM_NEW (0x42, 12582912 bytes) in here for 3900 ms, at
+zeroing the pool range`; thread 0x...2c10 = backboardd t4 RUNNING (state 0x4), gGPULock free, GPU idle, kernel
+lr = machine_idle (stale). => stuck in the CPU zero loop over a GPU-pool range (RedwoodGPU.cpp gemNew stage 3).
+Lead, not proven: first writes into a lazily mapped pool slot (`md->map(kIOMapWriteCombineCache)` in
+`sweet_gpu_pool_range`) fault forever/very slowly. Handoff prompt for DeepSeek/opencode:
+`notes/deepseek/PROMPT-2026-11-06-next.md`.
+
 **NEXT (paused at ~90% usage, user OK to do later):**
 1. CI 42283741879 succeeded; kernel in `xnu/out-0121`; images `shim-boot-0121s0.img` (1cdef9aa...93c0) and `shim-boot-0121s120.img` (`sweetfb_rate=120`, 23c7ce74...123b) built, not booted. Further images:
    `0121s0` (manual) and A/B variants: `sweetfb_rate=120`, `+ sweetfb_bind=1`, `+ ca_vbl=1`; freeze probe 0114
