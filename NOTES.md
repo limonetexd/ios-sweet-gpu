@@ -10,7 +10,19 @@
 - **Boot of `shim-boot-0101s0.img`** (SHA-256 193c287e7b1cd1df28e8f6bc72504275ff2555f559ab049e110fed38f99fc2d2,
   hash re-verified): `fastboot boot` hung at upload (no output after >120 s; known ABL quirk after a
   large flash); `fastboot devices` then showed serial `????????????`. After the user's Power+Vol-,
-  retry: Sending OKAY 0.395 s, Booting OKAY. First-boot result: pending (user watching the screen).
+  retry: Sending OKAY 0.395 s, Booting OKAY.
+- **0101s0 on fresh gpu2 root, user test (observed):** boots to home; user judged it smooth ("~60 fps,
+  sometimes 40"; the FPS monitor shows 16-30 swaps/s). Froze while playing with blurs in the App Library.
+  Ring `logs/xnu-0101s0-20261106-blurfreeze.txt` (pulled via `sweet-pull-ring.ps1 -BootRecovery`; the
+  wsl `NativeCommandError` line is just the decoder's header on stderr): last frames 30/30/16 swaps, then
+  `0 swaps ... GPU 0 ms pending (fence 787)` forever; touches still arrive (`SWEET HID`), launchd still
+  spawns (bluetoothd/fairplayd respawning). No `CRASH backboardd`, no panic. => backboardd's render path
+  hung in userland (not a GPU hang: no pending work, fence frozen). 68 surfaces, 187 zombies at freeze.
+  `CoreAnimation's GL renderer has no function 40` appears shortly before (also present in earlier
+  freeze logs xnu-0101d-freeze, xnu-0101s0-freeze, but also in non-freeze runs: suspect, not proven).
+- **Unattended test 0101s0br** = 0101s0 + `sweetbattery=1 sweetgpu_reboot=600`
+  (SHA-256 41431fba466e833f952268c6dacc11b755316456f28f417973302cd8e3bcbcd0), run via
+  `sweet-probe-loop.ps1 -Xnu -ProbeSeconds 720` -> `logs/xnu-0101s0br.txt`.
   First boot after the flash: expect 15-30 min of datamigrator.
 - **New image `shim-boot-0101s0b.img`** = 0101s0 + `sweetbattery=1` (kernel `xnu/out-0101`,
   SWEETFB_HZ=60, serial=0; SHA-256 6a38dc18134b9be8091426fdc14d6ca09222e28c41f5882a0f95b962d6c74a7c).
