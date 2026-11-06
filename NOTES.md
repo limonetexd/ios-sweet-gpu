@@ -27,7 +27,26 @@
   both worked unattended. `SWEET BATTERY: SPMI arb=0x50000000 APIDs=512, observer reads only`, then
   `PM6150 / estimated SOC, 85% 4105mV external=1 charging=1` (USB attached). One transient
   `static fallback, 100% 4200mV` mid-run, next poll real again (85% 4107mV). Not seen on screen.
-  => `sweetbattery=1` is safe on kernel 0101; candidate for the default daily boot-args.
+  => `sweetbattery=1` is safe on kernel 0101.
+- **Direction from the user (2026-11-06):** not a daily-use project: make fixes the default in new
+  numbered patches (boot-args only for really experimental paths), keep advancing, test unattended.
+- **Series changes (commits 0d5f6c3, b29496b, 89c45cf):**
+  - 0104/0105 (super) moved to `xnu/patches-pending/`: CI builds 0001..0103 + new patches.
+  - **0106** SweetBattery: real PM6150 polling by default (`sweetbattery=0` opts out); a failed sample
+    keeps the last good one for up to 4 polls (2 min) instead of flipping to the 100% fallback.
+  - **0107** Sandbox op 4 (container path) returns `/private/var/mobile` for uid 501 executables inside
+    `.appex` (port of joranv1/ios-sailfish 0110, same file and xnu): PlugInKit stops aborting extensions.
+  - **0108** `security.mac.amfi.developer_mode_status`=1 sysctl + `AppleMobileFileIntegrity` IOService with
+    an always-trusting user client (port of MakrSas/ios-topaz 0150/0151; matched on IOResources from
+    KernelConfigTables instead of topaz's AppleCLCD hook). Expected log: `SWEET AMFI: AppleMobileFileIntegrity
+    service published`, `SWEET AMFI: user client selector 6 from ...`.
+  - 0107/0108 dry-run applied cleanly on a copy of the patched tree (xnu-8796 + 0001..0106).
+  - Root-side counterpart: `tools/sweet-root-fixes.py` (new, untested on a real image; report
+    `reports/research-2026-11-06-root-fixes.md`): ExtensionKit flag, datamigrator sentinel, staged apps,
+    HEIC->PNG wallpapers, en0 netprefs, wland.boot. Needs a new root (gpu3) + userdata flash (user OK).
+- CI gotcha: a push to main already starts `xnu.yml`; an extra `gh workflow run` makes the two cancel each
+  other (concurrency group). Run 42244939772 = 0106 build.
+- `.gitattributes` (c3a6178): LF for *.sh/*.py/*.patch (core.autocrlf had made sweet-gpu-image.sh CRLF).
   First boot after the flash: expect 15-30 min of datamigrator.
 - **New image `shim-boot-0101s0b.img`** = 0101s0 + `sweetbattery=1` (kernel `xnu/out-0101`,
   SWEETFB_HZ=60, serial=0; SHA-256 6a38dc18134b9be8091426fdc14d6ca09222e28c41f5882a0f95b962d6c74a7c).
