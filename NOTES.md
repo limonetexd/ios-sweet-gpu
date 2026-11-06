@@ -71,6 +71,13 @@
     exception.c, sweet_sample.c, SweetHID), 0122 opt-in `sweetfreeze=2` respring after 24 s frozen,
     `userland/proposed-freeze-fix.diff` (eagl GL-call watchdog).
   - Note: branch `wifi-ci` reuses numbers 0113-0120 for the Wi-Fi compile test only; renumber when merging.
+- **0112 A/B (observed, unattended + `sweetgpu_swipe=60`):** `xnu-0112e.txt` (new path: vgrid, 3 threads,
+  skip) 93 active s, 20.2 swaps/s, present 3173 us avg; `xnu-0112eold.txt` (`sweetfb_vgrid=0 threads=1 skip=0`)
+  48 active s (run cut short: user used the phone, widget picker froze -> Power+Vol-), 19.2 swaps/s, present
+  4175 us. => copy is ~24% cheaper, frame rate unchanged: the limit is CoreAnimation/eagl, not the copy.
+- **0114/0115 promoted** (agent drafts 0120/0122, 8566363): freeze probe ON by default (`sweetfreeze=0` off),
+  respring after the 2nd dump only with `sweetfreeze=2`. Next: reproduce the widget-picker freeze on a 0115
+  kernel and `grep -a "SWEET FREEZE\|^FRZ"` the ring.
 - User stopped the remaining agents (usage). Work continues without sub-agents.
 - **eagl reuse agent (Sonnet) finding [O in logs]:** backboardd attaches a NEW IOSurface and a NEW texture
   every frame (ids 2,4,6,7,8...), so per-surface reuse cannot hit today. Attach ~5.7 ms/frame + delete
