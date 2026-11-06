@@ -53,7 +53,20 @@
   no 0107/0108 yet).
 - **Kernel 0108** (CI 42247405787 success; 0106/0107/0108 applied, `xnu/out-0108`). Images:
   `shim-boot-0108s0.img` (c4c76950...71a6, manual, no reboot) and `shim-boot-0108r.img`
-  (d667bcd4...80, `sweetgpu_reboot=600`). Not booted yet.
+  (d667bcd4...80, `sweetgpu_reboot=600`).
+  **0108s0 booted by hand (observed by user):** "booted super well", used normally; opening the widget
+  picker lagged and then the phone restarted by itself (respring or reboot; no ring pulled, phone left
+  running). Wallpaper/battery UI not reported. Next: ring pull at the next fastboot to see whether it was a
+  respring (SpringBoard/backboardd CRASH) or a kernel panic/watchdog.
+- **FPS patches promoted (from the fb-copy agent drafts; comments inside still say 0140..0143):**
+  0109 (=0140) vsync timer on a fixed 16.667 ms grid (`wakeAtTime`; the old re-arm after the copy made a
+  ~37 ms cycle = ~27 fps; `sweetfb_vgrid=0` = old); 0110 (=0141) copy split in 64-row bands, no behaviour
+  change; 0111 (=0142) `sweetfb_threads=3` default (1 = old single copy; helpers on IOLockSleep, lock logic
+  reviewed); 0112 (=0143) `sweetfb_skip=1` skip copying a swap identical to what the panel shows (0 = old).
+  All four applied cleanly in order on SweetFramebuffer.cpp rebuilt from 0001..0108. 0144-0146 (INTF line
+  counter probe, presenter thread, beam ordering) stay in patches-pending. Report:
+  `reports/research-2026-11-06-fbcopy.md`. A/B without rebuild: `sweetfb_vgrid=0`, `sweetfb_threads=1`,
+  `sweetfb_skip=0`.
 - User (back): freezes still happen "sometimes, suddenly, for no reason" (image not recorded; 0101s0 or 0106).
 - Sub-agents hit the usage limit mid-task; freeze and Wi-Fi drafts were lost and relaunched. The framebuffer
   agent left drafts `xnu/patches-pending/0140..0146-sweet-fb-*.patch` + `reports/research-2026-11-06-fbcopy.md`:

@@ -1,0 +1,313 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 8a694dc..0b2fd3e 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -65,6 +65,15 @@ struct pmem_list {
+ #define PMEM_FREE       _IOW('P', 2, uint64_t)
+ #define PMEM_SMC        _IOWR('P', 3, struct pmem_smc)
+ #define PMEM_LIST       _IOR('P', 4, struct pmem_list)
++/* Wi-Fi 0131 (ios-flame 0102): one RPMh active vote for wland; sweet_rpmh.c checks it. */
++struct pmem_rpmh {
++	char res[16];           /* cmd-db name */
++	uint32_t n;             /* 1..4 commands */
++	uint32_t offset[4];     /* from the resource address */
++	uint32_t value[4];
++};
++#define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+ 
+ #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
+ #define PMEM_WIN        0x200000ULL
+@@ -272,6 +281,14 @@ static int
+ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+ {
+ 	int err = 0;
++	if (cmd == PMEM_RPMH) {
++		/* Waits for the TCS: not under the pmem lock. */
++		struct pmem_rpmh *r = (struct pmem_rpmh *)data;
++		r->res[sizeof(r->res) - 1] = 0;
++		err = sweet_rpmh_write(r->res, r->n, r->offset, r->value);
++		printf("SWEET PMEM: rpmh %s %u cmds (%#x=%u ...) -> %d\n", r->res, r->n, r->offset[0], r->value[0], err);
++		return err;
++	}
+ 	lck_mtx_lock(&sweet_pmem_lock);
+ 	switch (cmd) {
+ 	case PMEM_ALLOC:
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..1ae3874 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -119,8 +119,11 @@ rh_map(void)
+ 	unsigned major = (id >> 16) & 0xffu;
+ 	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+ 	rh_ncpt = (config >> 27) & 0x1fu;
+-	printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+-	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
++	static bool geometry_logged;    /* Wi-Fi votes call rh_map() many times */
++	if (!geometry_logged) {
++		printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
++		    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
++	}
+ 	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+ 	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+ 	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+@@ -148,8 +151,11 @@ rh_map(void)
+ 	uint32_t db_version = rh_read(rh_db, 0);
+ 	uint32_t magic = rh_read(rh_db, 4);
+ 	uint32_t flags = rh_read(rh_db, 140);
+-	printf("SWEET RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
+-	    db_version, magic, rh_read(rh_db, 136), flags);
++	if (!geometry_logged) {
++		printf("SWEET RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
++		    db_version, magic, rh_read(rh_db, 136), flags);
++	}
++	geometry_logged = true;
+ 	/* Linux only checks magic; version 1 is an intentionally stricter policy. */
+ 	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+ 		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
+@@ -355,4 +361,245 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * Wi-Fi/modem votes for wland (Wi-Fi port 0131, behaviour from DC28088
++ * 0141/0149 but written in this file's own rh_lookup/rh_send style; none of
++ * the branch's Adreno ARC code is used). Reached only through /dev/pmem
++ * PMEM_RPMH (root, sweetpmem=1) and the in-kernel BCM votes of 0132. Same
++ * safety model as the touch L11C vote: ACTIVE TCS only, one TCS, its own IRQ
++ * source masked while busy, a timeout poisons the driver for this boot.
++ */
++#define RH_ARC          3u
++#define RH_BCM          5u
++#define RH_ARC_LEVEL_SIZE 2u
++#define RH_ARC_MAX_LEVELS 16u
++#define RH_MAXCMD       4u
++#define RH_ARC_TIMEOUT_US 200000u
++
++/* Like rh_lookup, but for a given slave type (VRM rails/clocks, ARC, BCM). */
++static int
++rh_lookup_ex(const char *res, unsigned want_slave, uint32_t *address, unsigned *aux_len)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			unsigned len = rh_db16(e + 20);
++			bool addr_ok = want_slave == RH_VRM ?
++			    ((addr >> 16) == RH_VRM && !(addr & 15u)) : !(addr & 3u);
++			if (slave != want_slave || !addr_ok ||
++			    !rh_range(aux + rh_db16(e + 22), len)) {
++				printf("SWEET RPMH: invalid entry for %s (slave %u, want %u)\n", res, slave, want_slave);
++				return EINVAL;
++			}
++			*address = addr;
++			*aux_len = len;
++			++matches;
++		}
++	}
++	if (matches != 1) {
++		printf("SWEET RPMH: %s lookup matches=%u; refusing\n", res, matches);
++		return ENODEV;
++	}
++	return 0;
++}
++
++/*
++ * n (1..4) commands to base+offset[i] in one ACTIVE TCS, rh_send's protocol
++ * (rh_send itself stays untouched: it is the touch vote). 0 only if all n
++ * commands were issued and completed.
++ */
++static int
++rh_send_n(uint32_t address, uint32_t align_mask, unsigned n, const uint32_t *offsets,
++    const uint32_t *values, unsigned timeout_us)
++{
++	static unsigned logged;
++	if (n == 0 || n > RH_MAXCMD || n > rh_ncpt) {
++		return EINVAL;
++	}
++	int chosen = -1;
++	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++		uint32_t b = t * RH_TCS_STRIDE;
++		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
++		if (enabled & ~((1u << rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		for (unsigned c = 0; c < rh_ncpt; ++c) {
++			if ((enabled & (1u << c)) &&
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~align_mask) == address) {
++				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
++				return EBUSY;
++			}
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("SWEET RPMH: no empty idle ACTIVE TCS; vote for %#x not sent\n", address);
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t, mask = (1u << n) - 1u;
++	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t)) {
++		return EBUSY;
++	}
++	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		rh_poisoned = true;
++		return EIO;
++	}
++	if (!rh_free(t)) {
++		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++			rh_poisoned = true;
++		}
++		return EBUSY;
++	}
++	rh_poisoned = true;     /* cleared below only on proven completion */
++	for (unsigned c = 0; c < n; ++c) {
++		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
++		    !rh_sync(cmd + RH_DATA, values[c])) {
++			return EIO;
++		}
++	}
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
++	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	uint32_t irq = 0, idle = 0, status[RH_MAXCMD] = {0, 0, 0, 0};
++	bool done = false, progress = false;
++	for (unsigned us = 0; us < timeout_us; ++us) {
++		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++		idle = rh_read(rh_tcs, b + RH_STATUS);
++		bool complete = true;
++		for (unsigned c = 0; c < n; ++c) {
++			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++			complete &= status[c] != 0xffffffffu &&
++			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++		}
++		progress |= idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
++		    ((irq & bit) || progress) && complete) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || logged++ < 40) {
++		printf("SWEET RPMH: TCS%u %#x x%u first=%#x@%u done=%d irq=%#x idle=%#x cmd-status=%#x/%#x\n",
++		    t, address, n, values[0], offsets[0], done, irq, idle, status[0], status[1]);
++	}
++	if (!done) {
++		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
++		return ETIMEDOUT;
++	}
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
++	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	rh_poisoned = false;
++	return 0;
++}
++
++/*
++ * Userland votes for wland, limited to what Sweet's WCN3990 and modem bring-up
++ * need (FDT ranges): icnss rails L9A (cx-mx 624-760 mV), L1C (1.8-xo
++ * 1616-1984), L2C (1.3-rfa 1200-1352), L10C (3.3-ch0 3200-3312) as
++ * {voltage@0, mode@8 (HPM 7), enable@4}; rfclka2 enable@4; modem proxy votes
++ * on cx.lvl/mss.lvl (one table index at offset 0). Everything else,
++ * including Sweet's touch supply L11C, is refused.
++ */
++int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++int
++sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
++{
++	static const struct { const char *name; unsigned min_mv, max_mv; } rails[] = {
++		{ "ldoa9", 624, 760 }, { "ldoc1", 1616, 1984 },
++		{ "ldoc2", 1200, 1352 }, { "ldoc10", 3200, 3312 },
++	};
++	if (!res || !offsets || !values || n == 0 || n > RH_MAXCMD) {
++		return EINVAL;
++	}
++	int rail = -1;
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		if (!strcmp(res, rails[i].name)) {
++			rail = (int)i;
++		}
++	}
++	const bool clock = !strcmp(res, "rfclka2");
++	const bool arc = !strcmp(res, "cx.lvl") || !strcmp(res, "mss.lvl");
++	if (rail < 0 && !clock && !arc) {
++		printf("SWEET RPMH: userland vote for %s refused (not a Wi-Fi/modem resource)\n", res);
++		return EPERM;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		const uint32_t o = offsets[i], v = values[i];
++		const bool ok = arc ? (o == 0 && v < RH_ARC_MAX_LEVELS) :
++		    clock ? (o == 4 && v <= 1) :
++		    ((o == 0 && v >= rails[rail].min_mv && v <= rails[rail].max_mv) ||
++		    (o == 4 && v <= 1) || (o == 8 && v == 7));
++		if (!ok) {
++			printf("SWEET RPMH: userland vote %s offset %#x value %u refused\n", res, o, v);
++			return EPERM;
++		}
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	unsigned aux_len = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing userland vote\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_ex(res, arc ? RH_ARC : RH_VRM, &address, &aux_len);
++	}
++	if (!error && arc) {
++		/* The vote is a level-table index; the table is the entry's aux data. */
++		unsigned levels = aux_len / RH_ARC_LEVEL_SIZE;
++		if (levels == 0 || levels > RH_ARC_MAX_LEVELS || values[0] >= levels) {
++			error = ERANGE;
++		}
++	}
++	if (!error) {
++		error = rh_send_n(address, arc ? 3u : 15u, n, offsets, values,
++		    arc ? RH_ARC_TIMEOUT_US : RH_TIMEOUT_US);
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
