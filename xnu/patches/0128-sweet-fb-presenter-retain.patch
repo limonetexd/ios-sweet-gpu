@@ -1,0 +1,49 @@
+From: HakiOS
+Subject: [PATCH 0128] sweet: keep the presenter's surfaces alive until it copied them
+
+0145 hands the swap record (surface IDs) to the presenter thread and lets the
+client go on. If the client releases a surface before the presenter looks it up,
+the frame loses that layer (or worse, a reused ID). 0128 retains each named
+surface at hand-over (sweet_surface_copy) and releases it after present().
+No behaviour change when the presenter is off.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -141,6 +141,8 @@
+ class IOMobileFramebufferUserClient;
+ struct SweetCopyJob;			/* 0141 */
+ 
++static uint32_t get32(const uint8_t *p, uint32_t off);   /* 0128: used by the presenter hand-over */
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -218,6 +220,7 @@
+ 	bool          fPresentBusy;           /* the presenter has a frame (fLock) */
+ 	uint32_t      fPresentGeneration;     /* one more for each frame handed over (fLock) */
+ 	uint8_t       fPresentRec[SWEET_FB_SWAP_REC_SIZE];
++	SweetSurface *fPresentRef[SWEET_FB_LAYERS];   /* 0128: kept until the presenter copied them */
+ 	/* 0144: the panel's scan, from the display interface's counters (boot-arg sweetfb_beam) */
+ 	uint32_t      fBeamMode;              /* 0 off, 1 measure and log only, 2 also write behind the scan (0146) */
+ 	vm_offset_t   fBeamIntf;              /* the interface's registers, once they were seen to count; else 0 */
+@@ -545,6 +548,10 @@
+ 			/* 0145: to the presenter (counted there) */
+ 			IOLockLock(fb->fLock);
+ 			memcpy(fb->fPresentRec, rec, SWEET_FB_SWAP_REC_SIZE);
++			for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++				uint32_t id = get32(rec, 0x54 + 4 * i);
++				fb->fPresentRef[i] = (id != 0 && (get32(rec, 0x104) & (1u << i))) ? sweet_surface_copy(id) : NULL;
++			}
+ 			fb->fPresentBusy = true;
+ 			fb->fPresentGeneration++;
+ 			IOLockWakeup(fb->fLock, &fb->fPresentGeneration, true);
+@@ -614,6 +621,9 @@
+ 		bool copied = present(rec);
+ 		notePresent(true, copied, began);
+ 		IOLockLock(fLock);
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			OSSafeReleaseNULL(fPresentRef[i]);
++		}
+ 		fPresentBusy = false;
+ 		IOLockUnlock(fLock);
+ 	}
