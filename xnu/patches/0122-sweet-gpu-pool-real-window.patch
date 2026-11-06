@@ -1,0 +1,131 @@
+From: HakiOS
+Subject: [PATCH 0122] sweet: keep the GPU range pool inside the ADT's carve-out (widget-picker freeze)
+
+The pool range allocator handed out 15 slots of 16 MiB from GMEM+16 MiB, i.e.
+0x1f1000000..0x200000000. The ADT's GPU carve-out is only 0x1ecb00000..
+0x1fcb00000 (256 MiB below the 1 MiB panic log), so the last 53 MiB of the
+range area were outside it: slots 11-14 run over the panic log and memory the
+ADT does not describe at all (highmem ends at 0x1fcc00000).
+
+Observed in logs/xnu-0121s120-widgetfreeze.txt: a 12 MiB GEM_NEW in "zeroing
+the pool range" for 3.9 s and still there at 144 s, thread RUNNING, 0 swaps;
+other buffers were made in ~283 us. The CPU zero loop writes the range through
+its write-combined mapping and the following dsb sy then waits for stores to
+physical addresses that never complete. First fit with fragmented low slots
+makes a new 12 MiB run land in a high slot.
+
+0122: POOL_END = 0x1fcb00000, 11 slots (176 MiB, 0x1f1000000..0x1fc000000),
+a compile-time check that the slot layout stays inside the carve-out, and a
+runtime end guard. Diagnostics: one line per slot the first time it is mapped
+(PA + time), a line at GPU start with the real window, and a line when zeroing
+a pool buffer takes 50 ms or more.
+
+Log: "SWEET GPU POOL: 11 x 16 MiB ranges at ...", "... slot N ... mapped in
+... us", "... zeroing ... took ... ms".
+---
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -62,6 +62,15 @@
+ #define SMMU_CB1        (SMMU_OFF + 0x8000 + 0x1000)
+ #define POOL_PA         0x1f0000000ull
+ /*
++ * 0122: end of what the ADT reserves for the GPU. tools/mkadt.py --gpupool
++ * cuts 256 MiB below the 1 MiB panic log: 0x1ecb00000..0x1fcb00000. GMEM
++ * (POOL_PA) is 53 MiB into that, so only 203 MiB are left above it; the
++ * range area below used 15 slots from GMEM+16 MiB and ran 53 MiB past the
++ * carve-out, over the panic log and memory the ADT does not describe (the
++ * 12 MiB zero loop in logs/xnu-0121s120-widgetfreeze.txt never completed).
++ */
++#define POOL_END        0x1fcb00000ull
++/*
+  * XNU has little room for I/O mappings (20 MiB and then 4 MiB maps of the
+  * pool panicked in kmem_alloc): the GPU registers, ring and fence page come
+  * from bsd/dev/sweet_gpu.c's mappings; here only the shim's L1 table page
+@@ -223,16 +232,20 @@
+ /*
+  * Memory from the pool for screen-sized surfaces (SweetSurface.cpp, ios-topaz
+  * 0924) and programs' big buffers (RedwoodGPU.cpp, topaz 0910): pool +16 MiB
+- * to its end, 15 slots of 16 MiB handed out in 64 KiB units, no range across
+- * two slots. The pool is not XNU's RAM and is only ever mapped write-combined
+- * (each slot once in the kernel, on first use), so the GPU's view of it
+- * needs no cache maintenance (RedwoodGPU.cpp skips it).
++ * up to POOL_END, 11 slots of 16 MiB handed out in 64 KiB units, no range
++ * across two slots. 0122: 15 slots reached 0x200000000, but the ADT's
++ * carve-out ends at 0x1fcb00000 (see POOL_END); the last 53 MiB were outside
++ * it. The pool is not XNU's RAM and is only ever mapped write-combined (each
++ * slot once in the kernel, on first use), so the GPU's view of it needs no
++ * cache maintenance (RedwoodGPU.cpp skips it).
+  */
+ #define OFF_RANGES      0x01000000ull
+ #define RANGE_SLOT      0x01000000ull
+-#define RANGE_SLOTS     15
++#define RANGE_SLOTS     11
+ #define RANGE_UNIT      0x10000ull
+ #define SLOT_UNITS      (RANGE_SLOT / RANGE_UNIT)
++/* (a slot change that runs past the ADT's GPU carve-out must not compile) */
++typedef char pool_ranges_fit_check[((POOL_PA + OFF_RANGES + RANGE_SLOTS * RANGE_SLOT) <= POOL_END) ? 1 : -1];
+ static uint64_t range_used[RANGE_SLOTS][SLOT_UNITS / 64];
+ static uint8_t *range_kva[RANGE_SLOTS];
+ static IOLock *range_lock;
+@@ -281,6 +294,7 @@
+ 				continue;
+ 			}
+ 			if (range_kva[s] == NULL) {
++				uint64_t map_began = mach_absolute_time(), map_ns;
+ 				IOMemoryDescriptor *md = sweet_gpu_pool_md(POOL_PA + OFF_RANGES + s * RANGE_SLOT, RANGE_SLOT);
+ 				IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+ 				OSSafeReleaseNULL(md);  /* (the map holds it, for good) */
+@@ -289,13 +303,22 @@
+ 					return 0;
+ 				}
+ 				range_kva[s] = (uint8_t *)map->getVirtualAddress();
++				absolutetime_to_nanoseconds(mach_absolute_time() - map_began, &map_ns);
++				IOLog("SWEET GPU POOL: slot %d at %#llx mapped in %llu us\n", s,
++				    (unsigned long long)(POOL_PA + OFF_RANGES + s * RANGE_SLOT), (unsigned long long)(map_ns / 1000));
++			}
++			uint64_t pa = POOL_PA + OFF_RANGES + s * RANGE_SLOT + u * RANGE_UNIT;
++			if (pa + size > POOL_END) {     /* (cannot happen while POOL_RANGES_FIT holds) */
++				IOLog("SWEET GPU POOL: %llu bytes at %#llx would pass the pool end %#llx\n",
++				    (unsigned long long) size, (unsigned long long) pa, (unsigned long long) POOL_END);
++				continue;
+ 			}
+ 			units_mark(s, u, n, true);
+ 			IOLockUnlock(range_lock);
+ 			if (kernel != NULL) {
+ 				*kernel = range_kva[s] + u * RANGE_UNIT;
+ 			}
+-			return POOL_PA + OFF_RANGES + s * RANGE_SLOT + u * RANGE_UNIT;
++			return pa;
+ 		}
+ 	}
+ 	IOLockUnlock(range_lock);
+@@ -678,6 +701,9 @@
+ 	}
+ 	hw_lock = IOLockAlloc();
+ 	range_lock = IOLockAlloc();
++	IOLog("SWEET GPU POOL: %d x %llu MiB ranges at %#llx..%#llx, reserved pool ends %#llx\n",
++	    RANGE_SLOTS, (unsigned long long)(RANGE_SLOT >> 20), (unsigned long long)(POOL_PA + OFF_RANGES),
++	    (unsigned long long)(POOL_PA + OFF_RANGES + RANGE_SLOTS * RANGE_SLOT), (unsigned long long) POOL_END);
+ 	table_next = 0;
+ 	va_free_count = 0;
+ 	redwood_gpu_address_free(VA_USER_START, VA_USER_END - VA_USER_START);
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -971,10 +971,17 @@
+ 			sweet_gpu_pool_range_free(pool_pa, size);
+ 		} else {
+ 			inflightStage(3);
++			uint64_t zero_began = mach_absolute_time(), zero_ns;
+ 			for (uint64_t i = 0; i < size / 8; i++) {
+ 				((volatile uint64_t *) pool_kva)[i] = 0;
+ 			}
+ 			__asm__ volatile ("dsb sy" ::: "memory");
++			absolutetime_to_nanoseconds(mach_absolute_time() - zero_began, &zero_ns);
++			if (zero_ns >= 50 * NSEC_PER_MSEC) {
++				IOLog("SWEET GPU POOL: zeroing %llu bytes at %#llx took %llu ms\n",
++				    (unsigned long long) size, (unsigned long long) pool_pa,
++				    (unsigned long long)(zero_ns / NSEC_PER_MSEC));
++			}
+ 			inflightStage(4);
+ 			gpuLock();
+ 			b = newBuffer(md, 0, size, request->flags, &request->handle);

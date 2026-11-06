@@ -4,6 +4,18 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): the widget freeze is the range pool running past the ADT carve-out
+(0122).** [O in source and ADT] `tools/mkadt.py --gpupool` cuts 256 MiB below the 1 MiB panic log:
+`0x1ecb00000..0x1fcb00000`. But `POOL_PA` is GMEM `0x1f0000000` (53 MiB into that) and the range
+area was 15 x 16 MiB from GMEM+16 MiB: `0x1f1000000..0x200000000`, i.e. 53 MiB past the carve-out;
+slots 11-14 cover the panic log and memory the ADT does not describe at all (highmem ends
+`0x1fcc00000`). In `logs/xnu-0121s120-widgetfreeze.txt` the 12 MiB GEM_NEW sits in "zeroing the
+pool range" from 3.9 s to 144 s with its thread RUNNING and 0 swaps, while the other buffers were
+made in ~283 us: the zero loop writes that hole and the following `dsb sy` never completes (guess:
+the stores never ack). Patch `xnu/patches/0122-sweet-gpu-pool-real-window.patch`: `POOL_END`,
+11 slots (176 MiB, ends `0x1fc000000`), compile-time + runtime end guards, slot-map and zero
+timings. CI and boot pending.
+
 **0121s120 user test (observed):** `sweetfb_rate=120` boots (`IOMFBDisplayRefresh 120 Hz`, vsync 120 Hz grid);
 user: "did not even reach 60". Log `logs/xnu-0121s120-widgetfreeze.txt`: 28 active s, avg 22.9 swaps/s, max 38,
 present 3620 us; 0120 surface reuse works (`from kept memory ... reused`). **Widget picker froze again and the
