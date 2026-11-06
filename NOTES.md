@@ -4,6 +4,19 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): 120 Hz worse; presenter retention 0128; fps-next says render scale
+750x1624 is the only path under 16.7 ms.** [O]
+`logs/xnu-0122b120.txt` (bind + `sweetfb_rate=120`, panel/vsync 120 Hz logged): nonzero swaps avg
+25.4 vs 26.0, p50 28, p90 38 vs 41, p95 40 vs 43, max 48 vs 50. 120 stays off. `0122bt6`: 25.7,
+p90 40; 6 threads off. `reports/research-2026-11-06-fps-next.md`: GL frame median 10.6 ms, p90
+16.1, p95 20.1; attach 3.5, handing 4.7, waiting 1.6, present 3.4; 87.3% of swaps late. It ranks
+presenter+priority+beam (our 0125-0127, now with 0128 surface retention) first, then **render scale
+750x1624 @2x** as the only option whose p95 crosses 16.7 ms (GL 6.5-8.0, p95 12-14). Surface-ID
+pool rejected: 0120 already reuses memory (4000 reused / 18 made) and eagl texture names stay
+monotonic. 0128 retains each presenter surface at hand-over and releases it after `present()`.
+Batch 0125-0128 CI 42309493217. Wi-Fi plan ready (`reports/research-2026-11-06-wifi-current.md`):
+drafts 0130-0137 -> 0129-0136 now that 0128 is taken; wland patch 0002 mandatory.
+
 **2026-11-06 (later, opencode): bt6 no gain; 0123 built (bind default); 0125-0127 pushed.** [O]
 `logs/xnu-0122bt6.txt` (bind + `sweetfb_threads=6`): nonzero swaps avg 25.7 vs 26.0, p50 29,
 p90 40 vs 41, p95 42 vs 43, max 44 vs 50; 6 copy threads do not help. 0123 (bind default) CI
