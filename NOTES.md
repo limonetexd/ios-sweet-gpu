@@ -23,6 +23,11 @@
 - **Unattended test 0101s0br** = 0101s0 + `sweetbattery=1 sweetgpu_reboot=600`
   (SHA-256 41431fba466e833f952268c6dacc11b755316456f28f417973302cd8e3bcbcd0), run via
   `sweet-probe-loop.ps1 -Xnu -ProbeSeconds 720` -> `logs/xnu-0101s0br.txt`.
+  **Result (observed): works.** No panic; GPU alive; timed reboot to fastboot (pon rc 0) and the ring pull
+  both worked unattended. `SWEET BATTERY: SPMI arb=0x50000000 APIDs=512, observer reads only`, then
+  `PM6150 / estimated SOC, 85% 4105mV external=1 charging=1` (USB attached). One transient
+  `static fallback, 100% 4200mV` mid-run, next poll real again (85% 4107mV). Not seen on screen.
+  => `sweetbattery=1` is safe on kernel 0101; candidate for the default daily boot-args.
   First boot after the flash: expect 15-30 min of datamigrator.
 - **New image `shim-boot-0101s0b.img`** = 0101s0 + `sweetbattery=1` (kernel `xnu/out-0101`,
   SWEETFB_HZ=60, serial=0; SHA-256 6a38dc18134b9be8091426fdc14d6ca09222e28c41f5882a0f95b962d6c74a7c).
