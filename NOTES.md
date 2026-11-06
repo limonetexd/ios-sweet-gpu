@@ -4,6 +4,22 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): three research reports (forks, smooth-web, adreno-web); 0122
+confirmed as the root fix, 0123 audit fixed.** [O in sources and logs]
+- `reports/research-2026-11-06-forks-deepseek.md`: no port has a 60 fps A618 iPhone-X-sized UI;
+  measured bests are 21-35 presents/s. The structural gap is the presenter: page flip latched at the
+  next START (apollo 0156) beats the CPU copy; two 10.45 MB frames fit the 24 MiB splash carve-out.
+  frokfrdk froze on the same SoC and cured it with cacheable-alias zeroing. Wi-Fi: recast SN15/CN0
+  before each apps-SMMU access; WLAN stream SID 0x240, SMR mask 0.
+- `reports/research-2026-11-06-smooth-web.md`: median frame 13.1 ms, p90 21.5; 60 Hz needs p95
+  < 16.7. attachImage 4.3, flush/submit 3.7, wait 1.9, present 3.9; `submit()` cleans 5.8 MB /
+  717 us every submit. Next: `sweetfb_bind=1`, clean only CPU-written BOs, one resource per surface.
+- `reports/research-2026-11-06-adreno-web.md`: 0122 is correct: slots 12-14 are above the DRAM end
+  `0x1fcc00000`, a store there never completes. 0123 audit: 1 MiB is 256 tables *total*, not 512 MiB;
+  now 1.25 MiB / 320 tables; `KMA_PERMANENT`+`kmem_free` panic fixed; `table_off` range-checked;
+  table-arena-full log added. Before promoting: NC outer-shareable SMMU walks (TCR 0x802020) +
+  `SCTLR.HUPCF`, and the ext-block leak on the CB-check failure.
+
 **2026-11-06 (later, opencode): 0122r unattended (observed): no GEM_NEW freeze, pool inside the real
 window.** [O] Kernel 0122 (CI 42299757109), image `0122r` (`95454c81…4642`, `sweetgpu_reboot=420
 sweetgpu_swipe=60`), log `logs/xnu-0122r.txt`. Boot line `SWEET GPU POOL: 11 x 16 MiB ranges at

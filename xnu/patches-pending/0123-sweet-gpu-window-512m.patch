@@ -8,14 +8,15 @@ POOL_PA+0x400000. That is 128 tables, i.e. 256 MiB of GPU VA ever mapped; with
 big textures the window fills and Mesa gets "bo new ... refused"
 (GL_OUT_OF_MEMORY, half-drawn layers).
 
-0123: take 1 MiB of contiguous XNU memory (kmem_alloc_contig, KMA_ZERO),
+0123: take 1.25 MiB of contiguous XNU memory (kmem_alloc_contig, KMA_ZERO),
 clean it to PoC, map it write-combined with ml_io_map_wcomb and use it as the
-table arena: 256 tables, up to 512 MiB of GPU VA (253 L3 + 3 L2). L1 stays in
-the pool; table_pa()/table_off() translate both arenas. If the allocation or
-the WC map fails, the old 128 pool tables are used unchanged.
+table arena: 320 tables, 512 MiB of GPU VA (256 L3 + L2 + slack). L1 stays in
+the pool; table_pa()/table_off() translate both arenas and reject a PA outside
+them. If the allocation or the WC map fails, the old 128 pool tables are used
+unchanged.
 
-Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
-"no 1 MiB contiguous XNU memory for tables: 128 in the pool".
+Log: "SWEET GPU: VA window 512 MiB: 320 tables in XNU memory at ...", or
+"no 1.25 MiB contiguous XNU memory for tables: 128 in the pool".
 ---
 --- a/iokit/Kernel/arm/SweetAdreno.cpp
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
@@ -36,7 +37,7 @@ Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
  #define GVA_FENCE       0x10020000ull
  #define OFF_TABLES      0x400000
  #define TABLES_SIZE     0x00080000      /* 128 tables: up to 256 MiB of GPU VA mapped */
-+#define TABLES_EXT_SIZE 0x00100000      /* 0123: 256 tables in XNU memory: up to 512 MiB (a0b076c) */
++#define TABLES_EXT_SIZE 0x00140000      /* 0123: 320 tables in XNU memory: 512 MiB + L2 + slack (a0b076c) */
  #define RB_DWORDS       (0x8000 / 4)
  #define VA_USER_START   0x40000000ull
  #define VA_USER_END     0x100000000ull
@@ -50,7 +51,7 @@ Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
  static bool ready;
  static uint32_t wptr, seqno;
  static IOLock *hw_lock;
-@@ -110,7 +117,28 @@
+@@ -110,7 +117,31 @@
  pool64(uint32_t off)
  {
  	/* only the L1 page and the table area are ever addressed through here */
@@ -76,20 +77,27 @@ Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
 +	if (ext_tables != NULL && pa >= ext_tables_pa && pa < ext_tables_pa + tables_size) {
 +		return OFF_TABLES + (uint32_t)(pa - ext_tables_pa);
 +	}
-+	return (uint32_t)(pa - POOL_PA);
++	if (pa >= POOL_PA + OFF_TABLES && pa < POOL_PA + OFF_TABLES + TABLES_SIZE) {
++		return (uint32_t)(pa - POOL_PA);
++	}
++	return 0;                               /* (not a table of either arena: fail the map) */
  }
  
  static inline volatile uint32_t *
-@@ -124,7 +152,7 @@
+@@ -124,7 +155,11 @@
  static uint32_t
  table_alloc(void)
  {
 -	if (table_next + 0x1000 > TABLES_SIZE) {
 +	if (table_next + 0x1000 > tables_size) {
++		static uint32_t table_full_told;
++		if (table_full_told++ < 8) {
++			IOLog("SWEET GPU: table arena full (%u KiB, %u tables)\n", tables_size >> 10, tables_size / 0x1000);
++		}
  		return 0;
  	}
  	uint32_t off = OFF_TABLES + table_next;
-@@ -149,20 +177,20 @@
+@@ -149,20 +184,23 @@
  		if (!create || (t = table_alloc()) == 0) {
  			return 0;
  		}
@@ -99,6 +107,9 @@ Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
  	}
 -	uint32_t l2 = (uint32_t)((e1 & 0xfffffff000ull) - POOL_PA);
 +	uint32_t l2 = table_off(e1 & 0xfffffff000ull);
++	if (l2 == 0) {
++		return 0;
++	}
  	uint64_t e2 = pool64(l2)[i2];
  	if (!(e2 & 1)) {
  		uint32_t t;
@@ -114,7 +125,7 @@ Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
  }
  
  static void
-@@ -694,6 +722,32 @@
+@@ -694,6 +732,32 @@
  		IOLog("SWEET GPU: map failed\n");
  		return -1;
  	}
@@ -127,8 +138,8 @@ Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
 +	 */
 +	vm_offset_t ext_kva = 0;
 +	if (kmem_alloc_contig(kernel_map, &ext_kva, TABLES_EXT_SIZE, PAGE_MASK, 0, 0,
-+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+		IOLog("SWEET GPU: no 1 MiB contiguous XNU memory for tables: 128 in the pool\n");
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		IOLog("SWEET GPU: no 1.25 MiB contiguous XNU memory for tables: 128 in the pool\n");
 +	} else {
 +		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ext_kva);
 +		vm_offset_t ext_map = pn != 0 ? ml_io_map_wcomb((vm_offset_t)((uint64_t)pn << PAGE_SHIFT), TABLES_EXT_SIZE) : 0;
