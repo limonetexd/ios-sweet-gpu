@@ -1,0 +1,149 @@
+From: HakiOS
+Subject: [PATCH 0123] sweet: 512 MiB GPU VA window (L3 tables from XNU memory, sunfish a0b076c)
+
+Port of frokfrdk/ios-sweet branch sunfish commit a0b076c to our SweetAdreno.cpp.
+The GPU context bank 1 walks 4 KiB tables from the shim's L1 page at
+POOL_PA+0x200000; level 2 and level 3 tables come from a 512 KiB bump arena at
+POOL_PA+0x400000. That is 128 tables, i.e. 256 MiB of GPU VA ever mapped; with
+big textures the window fills and Mesa gets "bo new ... refused"
+(GL_OUT_OF_MEMORY, half-drawn layers).
+
+0123: take 1 MiB of contiguous XNU memory (kmem_alloc_contig, KMA_ZERO),
+clean it to PoC, map it write-combined with ml_io_map_wcomb and use it as the
+table arena: 256 tables, up to 512 MiB of GPU VA (253 L3 + 3 L2). L1 stays in
+the pool; table_pa()/table_off() translate both arenas. If the allocation or
+the WC map fails, the old 128 pool tables are used unchanged.
+
+Log: "SWEET GPU: VA window 512 MiB: 256 tables in XNU memory at ...", or
+"no 1 MiB contiguous XNU memory for tables: 128 in the pool".
+---
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -28,9 +28,12 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern "C" {
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
+ vm_offset_t sweet_gpu_regs(void);       /* bsd/dev/sweet_gpu.c */
+ vm_offset_t sweet_gpu_shared(void);
+@@ -82,6 +85,7 @@
+ #define GVA_FENCE       0x10020000ull
+ #define OFF_TABLES      0x400000
+ #define TABLES_SIZE     0x00080000      /* 128 tables: up to 256 MiB of GPU VA mapped */
++#define TABLES_EXT_SIZE 0x00100000      /* 0123: 256 tables in XNU memory: up to 512 MiB (a0b076c) */
+ #define RB_DWORDS       (0x8000 / 4)
+ #define VA_USER_START   0x40000000ull
+ #define VA_USER_END     0x100000000ull
+@@ -95,6 +99,9 @@
+ #define PTE_TABLE       3ull
+ 
+ static volatile uint8_t *gpu, *shared, *l1page, *tables;
++static volatile uint8_t *ext_tables;      /* 0123: table area in XNU memory, write-combined */
++static uint64_t ext_tables_pa;
++static uint32_t tables_size = TABLES_SIZE;
+ static bool ready;
+ static uint32_t wptr, seqno;
+ static IOLock *hw_lock;
+@@ -110,7 +117,28 @@
+ pool64(uint32_t off)
+ {
+ 	/* only the L1 page and the table area are ever addressed through here */
+-	return (volatile uint64_t *)(off >= OFF_TABLES ? tables + (off - OFF_TABLES) : l1page + (off - OFF_L1));
++	if (off >= OFF_TABLES) {
++		return (volatile uint64_t *)(ext_tables != NULL ? ext_tables + (off - OFF_TABLES)
++		    : tables + (off - OFF_TABLES));
++	}
++	return (volatile uint64_t *)(l1page + (off - OFF_L1));
++}
++
++/* 0123: physical address of a table in the arena (the pool or the XNU block). */
++static inline uint64_t
++table_pa(uint32_t off)
++{
++	return ext_tables != NULL ? ext_tables_pa + (off - OFF_TABLES) : POOL_PA + off;
++}
++
++/* 0123: arena offset of a table from its physical address. */
++static inline uint32_t
++table_off(uint64_t pa)
++{
++	if (ext_tables != NULL && pa >= ext_tables_pa && pa < ext_tables_pa + tables_size) {
++		return OFF_TABLES + (uint32_t)(pa - ext_tables_pa);
++	}
++	return (uint32_t)(pa - POOL_PA);
+ }
+ 
+ static inline volatile uint32_t *
+@@ -124,7 +152,7 @@
+ static uint32_t
+ table_alloc(void)
+ {
+-	if (table_next + 0x1000 > TABLES_SIZE) {
++	if (table_next + 0x1000 > tables_size) {
+ 		return 0;
+ 	}
+ 	uint32_t off = OFF_TABLES + table_next;
+@@ -149,20 +177,20 @@
+ 		if (!create || (t = table_alloc()) == 0) {
+ 			return 0;
+ 		}
+-		pool64(OFF_L1)[i1] = (POOL_PA + t) | PTE_TABLE;
++		pool64(OFF_L1)[i1] = table_pa(t) | PTE_TABLE;
+ 		e1 = pool64(OFF_L1)[i1];
+ 	}
+-	uint32_t l2 = (uint32_t)((e1 & 0xfffffff000ull) - POOL_PA);
++	uint32_t l2 = table_off(e1 & 0xfffffff000ull);
+ 	uint64_t e2 = pool64(l2)[i2];
+ 	if (!(e2 & 1)) {
+ 		uint32_t t;
+ 		if (!create || (t = table_alloc()) == 0) {
+ 			return 0;
+ 		}
+-		pool64(l2)[i2] = (POOL_PA + t) | PTE_TABLE;
++		pool64(l2)[i2] = table_pa(t) | PTE_TABLE;
+ 		e2 = pool64(l2)[i2];
+ 	}
+-	return (uint32_t)((e2 & 0xfffffff000ull) - POOL_PA);
++	return table_off(e2 & 0xfffffff000ull);
+ }
+ 
+ static void
+@@ -694,6 +722,32 @@
+ 		IOLog("SWEET GPU: map failed\n");
+ 		return -1;
+ 	}
++	/*
++	 * 0123 (frokfrdk/ios-sweet sunfish a0b076c): the pool's table area holds 128
++	 * tables = 256 MiB of GPU VA. A 512 MiB window needs 256, so take 1 MiB of
++	 * contiguous XNU memory, zeroed (KMA_ZERO) and cleaned to PoC, and write the
++	 * tables through a write-combined mapping as GPU-GMU-MEM. The 128 in the
++	 * pool stay the fallback.
++	 */
++	vm_offset_t ext_kva = 0;
++	if (kmem_alloc_contig(kernel_map, &ext_kva, TABLES_EXT_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		IOLog("SWEET GPU: no 1 MiB contiguous XNU memory for tables: 128 in the pool\n");
++	} else {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ext_kva);
++		vm_offset_t ext_map = pn != 0 ? ml_io_map_wcomb((vm_offset_t)((uint64_t)pn << PAGE_SHIFT), TABLES_EXT_SIZE) : 0;
++		if (ext_map != 0) {
++			dcache_civac(ext_kva, TABLES_EXT_SIZE);         /* (KMA_ZERO wrote it cached) */
++			ext_tables = (volatile uint8_t *)ext_map;
++			ext_tables_pa = (uint64_t)pn << PAGE_SHIFT;
++			tables_size = TABLES_EXT_SIZE;
++			IOLog("SWEET GPU: VA window 512 MiB: %u tables in XNU memory at %#llx\n",
++			    TABLES_EXT_SIZE / 0x1000, (unsigned long long)ext_tables_pa);
++		} else {
++			kmem_free(kernel_map, ext_kva, TABLES_EXT_SIZE);
++			IOLog("SWEET GPU: no WC map for the table block: 128 tables in the pool\n");
++		}
++	}
+ 	uint64_t ttbr = (uint64_t)rd(SMMU_CB1 + 0x20) | ((uint64_t)rd(SMMU_CB1 + 0x24) << 32);
+ 	if ((ttbr & 0xfffffff000ull) != POOL_PA + OFF_L1 || !(rd(SMMU_CB1) & 1)) {
+ 		IOLog("SWEET GPU: CB1 is not the shim's (ttbr %llx sctlr %x)\n", ttbr, rd(SMMU_CB1));

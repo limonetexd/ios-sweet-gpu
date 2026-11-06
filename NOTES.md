@@ -4,6 +4,15 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): 0122 built (CI 42299757109, 15m22s) and images made.** [O]
+`xnu/out-0122` downloaded; the CI log shows `Applying patch ... 0122-sweet-gpu-pool-real-window.patch`
+(no Skipping), and the kernel contains the four new `SWEET GPU POOL` strings, so the patch compiled.
+Images (SWEETFB_HZ=60, serial=0): `shim-boot-0122r.img` SHA-256 `95454c8117f13005b1e4812cbd775fa6d90787e7fd74eb22d5ee1a5d18674642`
+with `sweetgpu_reboot=420 sweetgpu_swipe=60`; `shim-boot-0122s0.img` SHA-256
+`84e068473ac4a79ad466e44ba903c24fbc6be8de1049464f50415dacec218c38` (manual). Unattended run started
+-> `logs/xnu-0122r.txt`. Draft of the 512 MiB window port (a0b076c) is in
+`xnu/patches-pending/0123-sweet-gpu-window-512m.patch`, applied/dry-run on top of 0122, untested.
+
 **2026-11-06 (later, opencode): the widget freeze is the range pool running past the ADT carve-out
 (0122).** [O in source and ADT] `tools/mkadt.py --gpupool` cuts 256 MiB below the 1 MiB panic log:
 `0x1ecb00000..0x1fcb00000`. But `POOL_PA` is GMEM `0x1f0000000` (53 MiB into that) and the range
