@@ -9,7 +9,8 @@
   This replaces the interrupted 2026-11-03 flash: root is now a clean gpu2 (no Wi-Fi deploy edits).
 - **Boot of `shim-boot-0101s0.img`** (SHA-256 193c287e7b1cd1df28e8f6bc72504275ff2555f559ab049e110fed38f99fc2d2,
   hash re-verified): `fastboot boot` hung at upload (no output after >120 s; known ABL quirk after a
-  large flash); `fastboot devices` then showed serial `????????????`. Needs Power+Vol- from the user.
+  large flash); `fastboot devices` then showed serial `????????????`. After the user's Power+Vol-,
+  retry: Sending OKAY 0.395 s, Booting OKAY. First-boot result: pending (user watching the screen).
   First boot after the flash: expect 15-30 min of datamigrator.
 - **New image `shim-boot-0101s0b.img`** = 0101s0 + `sweetbattery=1` (kernel `xnu/out-0101`,
   SWEETFB_HZ=60, serial=0; SHA-256 6a38dc18134b9be8091426fdc14d6ca09222e28c41f5882a0f95b962d6c74a7c).
