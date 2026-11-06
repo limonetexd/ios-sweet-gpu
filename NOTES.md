@@ -4,6 +4,13 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): 0122bc A/B (observed): `ca_vbl=1` adds nothing.** [O]
+`logs/xnu-0122bc.txt`: nonzero swaps avg 26.2 vs 26.0 for bind alone, p50 29 vs 28, p90 39 vs 41,
+p95 41 vs 43, max 48 vs 50. `SWEET CA: CA_FORCE_TIMER=1 for /usr/libexec/backboardd (ca_vbl=1)`
+present, so the path ran. Bind only; `ca_vbl` stays off. User (after a restart): widgets no longer
+restart, stability good; fps still low. `0122bt6` (bind + `sweetfb_threads=6`) running; `0122b120`
+(bind + `sweetfb_rate=120`) built (`5c8e0b75…9cec`).
+
 **2026-11-06 (later, opencode): 0122b A/B (observed): `sweetfb_bind=1` wins.** [O]
 `logs/xnu-0122b.txt` (same kernel 0122, 60 Hz, synthetic swipes): nonzero swaps/s avg **26.0** vs
 21.7, p50 **28** vs 23, p90 **41** vs 33, p95 **43** vs 35, max **50** vs 44; log confirms
