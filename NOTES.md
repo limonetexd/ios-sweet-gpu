@@ -4,6 +4,19 @@
 
 ### >>> 2026-11-07: render scale 750x1624 (0129), presenter retention (0128) <<<
 
+**0130r unattended (observed): render scale works; the scaled present is the new bottleneck.** [O]
+Kernel 0130 (batch 0125-0130, CI 42311771101 success 12m15s), image `0130r`
+(`9c0bb0d2e1706eb3774932a5787f714085de7b4df1caf98c21acb65a28e82c1c`, reboot 420 + swipe 60,
+ADT `display-scale=2`, canvas 750x1624), log `logs/xnu-0130r.txt`. Boot:
+`SWEET FB: modes published: 750x1624 at 60 Hz`, `IOMFBDisplayRefresh 60 Hz`, panel presented as
+750x1624; CA surfaces 750x1624 bpr 3008, alloc 6,144,000 B; wired 47 MB (was 135 MB). The GL frame:
+median **7.21 ms**, p90 **8.64**, p95 **9.59** (was 13.1/21.5); attach 1.94 ms, handing 4.04,
+waiting 0.83. But `present` is **11.4 ms** average (was 3.4): the per-pixel integer divide in the
+scaled copy. Swaps active: avg 29.2, p50 30, p90 **51**, max 53. No `SWEET FREEZE: RedwoodGPU`, no
+pool zeroing; the known driverkitd sig 9 boot crash only. 0131 precomputes the source-column map
+(table lookup instead of divide) and is pushed; CI 42314190705. Target present 4-5 ms, then the
+root `dl_max`/`anim_max` for the commit rate.
+
 **0129 render scale (pushed, not booted).** [decision from `reports/research-2026-11-06-fps-next.md`]
 The report measures GL frame median 10.6 ms / p90 16.1 / p95 20.1 and says the only option whose
 p95 crosses 16.7 is rendering at the iPhone X's real @2x size. `xnu/patches/0129-sweet-fb-render-scale.patch`:
