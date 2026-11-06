@@ -4,6 +4,11 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): 0122s0 user test: widget picker works, no freeze.** [O, user]
+User opened the widget picker and played with widgets on `0122s0` (`84e06847…8c38`): no freeze, no
+respring. Still slow (subjective). Probe did not dump a RedwoodGPU request. This closes the 0122
+hypothesis: the range pool past the ADT carve-out caused the widget-picker freeze. Next: FPS.
+
 **2026-11-06 (later, opencode): three research reports (forks, smooth-web, adreno-web); 0122
 confirmed as the root fix, 0123 audit fixed.** [O in sources and logs]
 - `reports/research-2026-11-06-forks-deepseek.md`: no port has a 60 fps A618 iPhone-X-sized UI;
