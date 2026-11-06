@@ -4,6 +4,14 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): 0122b A/B (observed): `sweetfb_bind=1` wins.** [O]
+`logs/xnu-0122b.txt` (same kernel 0122, 60 Hz, synthetic swipes): nonzero swaps/s avg **26.0** vs
+21.7, p50 **28** vs 23, p90 **41** vs 33, p95 **43** vs 35, max **50** vs 44; log confirms
+`backboardd's swapping thread ... bound to cpu 7`. User: visibly better, still lags/glitches.
+Draft `xnu/patches-pending/0123-sweet-fb-bind-default.patch` (on by default, `sweetfb_bind=0` =
+old). The 512 MiB window draft is renumbered `0124-sweet-gpu-window-512m.patch` (all `0123`
+references in its text updated). `0122bc` (bind + `ca_vbl=1`) running.
+
 **2026-11-06 (later, opencode): 0122s0 user test: widget picker works, no freeze.** [O, user]
 User opened the widget picker and played with widgets on `0122s0` (`84e06847…8c38`): no freeze, no
 respring. Still slow (subjective). Probe did not dump a RedwoodGPU request. This closes the 0122

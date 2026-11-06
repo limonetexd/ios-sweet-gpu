@@ -1,5 +1,5 @@
 From: HakiOS
-Subject: [PATCH 0123] sweet: 512 MiB GPU VA window (L3 tables from XNU memory, sunfish a0b076c)
+Subject: [PATCH 0124] sweet: 512 MiB GPU VA window (L3 tables from XNU memory, sunfish a0b076c)
 
 Port of frokfrdk/ios-sweet branch sunfish commit a0b076c to our SweetAdreno.cpp.
 The GPU context bank 1 walks 4 KiB tables from the shim's L1 page at
@@ -8,7 +8,7 @@ POOL_PA+0x400000. That is 128 tables, i.e. 256 MiB of GPU VA ever mapped; with
 big textures the window fills and Mesa gets "bo new ... refused"
 (GL_OUT_OF_MEMORY, half-drawn layers).
 
-0123: take 1.25 MiB of contiguous XNU memory (kmem_alloc_contig, KMA_ZERO),
+0124: take 1.25 MiB of contiguous XNU memory (kmem_alloc_contig, KMA_ZERO),
 clean it to PoC, map it write-combined with ml_io_map_wcomb and use it as the
 table arena: 320 tables, 512 MiB of GPU VA (256 L3 + L2 + slack). L1 stays in
 the pool; table_pa()/table_off() translate both arenas and reject a PA outside
@@ -37,7 +37,7 @@ Log: "SWEET GPU: VA window 512 MiB: 320 tables in XNU memory at ...", or
  #define GVA_FENCE       0x10020000ull
  #define OFF_TABLES      0x400000
  #define TABLES_SIZE     0x00080000      /* 128 tables: up to 256 MiB of GPU VA mapped */
-+#define TABLES_EXT_SIZE 0x00140000      /* 0123: 320 tables in XNU memory: 512 MiB + L2 + slack (a0b076c) */
++#define TABLES_EXT_SIZE 0x00140000      /* 0124: 320 tables in XNU memory: 512 MiB + L2 + slack (a0b076c) */
  #define RB_DWORDS       (0x8000 / 4)
  #define VA_USER_START   0x40000000ull
  #define VA_USER_END     0x100000000ull
@@ -45,7 +45,7 @@ Log: "SWEET GPU: VA window 512 MiB: 320 tables in XNU memory at ...", or
  #define PTE_TABLE       3ull
  
  static volatile uint8_t *gpu, *shared, *l1page, *tables;
-+static volatile uint8_t *ext_tables;      /* 0123: table area in XNU memory, write-combined */
++static volatile uint8_t *ext_tables;      /* 0124: table area in XNU memory, write-combined */
 +static uint64_t ext_tables_pa;
 +static uint32_t tables_size = TABLES_SIZE;
  static bool ready;
@@ -63,14 +63,14 @@ Log: "SWEET GPU: VA window 512 MiB: 320 tables in XNU memory at ...", or
 +	return (volatile uint64_t *)(l1page + (off - OFF_L1));
 +}
 +
-+/* 0123: physical address of a table in the arena (the pool or the XNU block). */
++/* 0124: physical address of a table in the arena (the pool or the XNU block). */
 +static inline uint64_t
 +table_pa(uint32_t off)
 +{
 +	return ext_tables != NULL ? ext_tables_pa + (off - OFF_TABLES) : POOL_PA + off;
 +}
 +
-+/* 0123: arena offset of a table from its physical address. */
++/* 0124: arena offset of a table from its physical address. */
 +static inline uint32_t
 +table_off(uint64_t pa)
 +{
@@ -130,7 +130,7 @@ Log: "SWEET GPU: VA window 512 MiB: 320 tables in XNU memory at ...", or
  		return -1;
  	}
 +	/*
-+	 * 0123 (frokfrdk/ios-sweet sunfish a0b076c): the pool's table area holds 128
++	 * 0124 (frokfrdk/ios-sweet sunfish a0b076c): the pool's table area holds 128
 +	 * tables = 256 MiB of GPU VA. A 512 MiB window needs 256, so take 1 MiB of
 +	 * contiguous XNU memory, zeroed (KMA_ZERO) and cleaned to PoC, and write the
 +	 * tables through a write-combined mapping as GPU-GMU-MEM. The 128 in the

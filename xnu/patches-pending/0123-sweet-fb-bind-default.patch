@@ -1,0 +1,30 @@
+From: HakiOS
+Subject: [PATCH 0123] sweet: bind backboardd's render thread to an A76 by default (sweetfb_bind)
+
+0118/0152 added sweetfb_bind: the backboardd thread that draws through eagl/Mesa
+and calls SwapEnd is bound to cpu 7 (A76), and the panel copy's helpers and the
+vsync tick to A55s. It was off by default and only tested with the boot arg.
+
+0122b A/B (kernel 0122, 60 Hz, synthetic swipes, logs/xnu-0122r.txt and
+xnu-0122b.txt): nonzero swaps/s avg 26.0 vs 21.7, p50 28 vs 23, p90 41 vs 33,
+p95 43 vs 35, max 50 vs 44; the log confirms "backboardd's swapping thread ...
+bound to cpu 7". The user judged the run visibly better.
+
+0123 makes it the default; sweetfb_bind=0 keeps the old behaviour.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -352,9 +352,12 @@
+ 	 * 0152: boot-arg sweetfb_bind=1: the thread of backboardd that swaps (CoreAnimation's render
+ 	 * server thread: it draws through eagl/Mesa and calls SwapEnd) is bound to the last processor,
+ 	 * a Cortex-A76 (sweetfb_render_cpu=N for another), and the panel copy's helpers and the vsync
+-	 * tick to Cortex-A55s (cpu 2, 3, ... and 1), so they never take the A76 from it. Off by default.
++	 * tick to Cortex-A55s (cpu 2, 3, ... and 1), so they never take the A76 from it. On by
++	 * default (0123); sweetfb_bind=0 = old.
+ 	 */
+ 	fRenderCPU = 7;
++	/* 0123: on by default (0122b A/B: avg 26.0 vs 21.7 swaps/s, p90 41 vs 33); sweetfb_bind=0 = old */
++	fBind = 1;
+ 	PE_parse_boot_argn("sweetfb_bind", &fBind, sizeof(fBind));
+ 	PE_parse_boot_argn("sweetfb_render_cpu", &fRenderCPU, sizeof(fRenderCPU));
+ 	if (fBind != 0 && fRenderCPU > ml_get_max_cpu_number()) {
