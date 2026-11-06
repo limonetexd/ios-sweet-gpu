@@ -58,6 +58,16 @@
   picker lagged and then the phone restarted by itself (respring or reboot; no ring pulled, phone left
   running). Wallpaper/battery UI not reported. Next: ring pull at the next fastboot to see whether it was a
   respring (SpringBoard/backboardd CRASH) or a kernel panic/watchdog.
+- **eagl reuse agent (Sonnet) finding [O in logs]:** backboardd attaches a NEW IOSurface and a NEW texture
+  every frame (ids 2,4,6,7,8...), so per-surface reuse cannot hit today. Attach ~5.7 ms/frame + delete
+  ~2.8 ms/frame of a ~19 ms frame go away only once surfaces recur (kernel surface pool / CA buffer ring).
+  glFlush 5.6 ms = Mesa command building; programs compile only at start-up. Draft:
+  `userland/proposed-eagl-reuse.diff` (8 env switches, counters on the `redwood-gl: frame N:` line;
+  syntax-checked with stub headers only). Report `reports/research-2026-11-06-eagl-reuse.md`.
+- Wi-Fi drafts 0130-0137 committed to patches-pending (8df0f07); compile test on branch `wifi-ci` as
+  0113-0120 (CI 42278088612). Kernel 0112 (CI 42276352429): images 0112s0 (4c57ce41...6155), 0112old
+  (097e2394...f902), 0112e (8a924dc6...5318, reboot 420 + swipe 60), 0112eold (dc7f58d4...2885, same + old
+  copy path); A/B unattended run in progress -> logs/xnu-0112e.txt, logs/xnu-0112eold.txt.
 - User on 0108s0: frame rate felt like before, "30-40 FPS", far from HackiOS's 110+ (120 Hz panel there).
 - **FPS patches promoted (from the fb-copy agent drafts; comments inside still say 0140..0143):**
   0109 (=0140) vsync timer on a fixed 16.667 ms grid (`wakeAtTime`; the old re-arm after the copy made a
