@@ -1,0 +1,107 @@
+From: HakiOS
+Subject: [PATCH 0150] sweet: IOMFBDisplayRefresh and boot-arg sweetfb_rate (refresh told to CoreAnimation)
+
+Publishes IOMFBDisplayRefresh (min/max/step interval in 2^-32 s, step in mach ticks) the way
+HackiOS MiniIOMobileFramebuffer does (b6c1f82, 0dedaec), and makes the rate in TimingElements
+and IOMFBDisplayRefresh a boot-arg: sweetfb_rate=N, 30..120, default 60 (= what CoreAnimation
+assumed without the property: no behaviour change by default). sweetfb_rate=120 tells
+CoreAnimation the panel's real 120 Hz (dtbo video-mode DSC timing@0 is 120 Hz).
+Log: "SWEET FB: IOMFBDisplayRefresh N Hz: ...", "SWEET FB: modes published: 1125x2436 at N Hz".
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -110,6 +110,8 @@
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	void vsyncRearm(IOTimerEventSource *sender);
+ 	void publishModes(void);
++	void publishRefresh(void);
++	uint32_t            fRate;              /* 0150: refresh rate told to CoreAnimation, Hz (sweetfb_rate) */
+ 	static void statsMain(void *self, wait_result_t result);
+ 	void statsReport(void);
+ 	static void copyHelperMain(void *self, wait_result_t result);
+@@ -250,6 +252,17 @@
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	/*
++	 * 0150: boot-arg sweetfb_rate=N (30 to 120, default 60): the refresh rate CoreAnimation is told,
++	 * in the modes (TimingElements) and in IOMFBDisplayRefresh. The panel itself scans at 120 Hz
++	 * (its only DSC video timing in the dtbo, "xiaomi 37/42 02 0x video mode dsc", 2464 lines;
++	 * DC28088 measured 8.333 ms on INTF_1), so 120 is no lie; 60 is what iOS assumed before.
++	 */
++	fRate = 60;
++	PE_parse_boot_argn("sweetfb_rate", &fRate, sizeof(fRate));
++	if (fRate < 30 || fRate > 120) {
++		fRate = 60;
++	}
++	/*
+ 	 * 0140: boot-arg sweetfb_vgrid=0 re-arms the vsync timer 16.7 ms after each tick's work, as
+ 	 * before; by default ticks keep a fixed 60 Hz grid (with a 4 ms panel copy in the tick the
+ 	 * old way gave 20-26 ms between vsyncs: "vsync timer N ms longest" in SWEET FPS).
+@@ -304,6 +317,7 @@
+ 	}
+ 
+ 	publishModes();
++	publishRefresh();
+ 	/*
+ 	 * (ios-topaz 0902) The GPU is waited for here, not by eagl.c's glFinish: a frame is put on the
+ 	 * panel only once the GPU is done with every surface it shows (drawn(), from the vsync timer,
+@@ -776,7 +790,7 @@
+ 	OSDictionary *color = OSDictionary::withCapacity(8);
+ 	OSArray *timings = OSArray::withCapacity(1);
+ 	OSArray *colors = OSArray::withCapacity(1);
+-	const uint32_t rate = 60u << 16;        /* 16.16 */
++	const uint32_t rate = fRate << 16;      /* 16.16 (0150: sweetfb_rate) */
+ 
+ 	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
+ 		sweet_set_number(color, "ID", SWEET_FB_COLOR_ID);
+@@ -806,7 +820,7 @@
+ 		timings->setObject(timing);
+ 		setProperty("TimingElements", timings);
+ 		setProperty("ColorElements", colors);
+-		IOLog("SWEET FB: modes published: %ux%u at 60 Hz\n", fLogicalW, fLogicalH);
++		IOLog("SWEET FB: modes published: %ux%u at %u Hz\n", fLogicalW, fLogicalH, fRate);
+ 	}
+ 	OSSafeReleaseNULL(timings);
+ 	OSSafeReleaseNULL(colors);
+@@ -817,6 +831,40 @@
+ }
+ 
+ /*
++ * 0150 (HackiOS MiniIOMobileFramebuffer publishRefresh(), commits b6c1f82/0dedaec): the refresh the
++ * window server clocks its frames by, the property IOMFBDisplayRefresh: the shortest and longest
++ * interval between refreshes and the step between them, in units of 2^-32 s (32.32 fixed point;
++ * given mach ticks CoreAnimation took a panel for a 26844 Hz one), and the step in mach ticks.
++ * Without it CoreAnimation takes a built-in panel for a 60 Hz one whatever the modes say.
++ */
++void
++AppleCLCD::publishRefresh(void)
++{
++	OSDictionary *refresh = OSDictionary::withCapacity(4);
++	uint64_t interval = (1ULL << 32) / fRate, ticks = 0;
++
++	if (refresh == NULL) {
++		return;
++	}
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / fRate, &ticks);
++	OSNumber *n;
++	const char *keys[3] = { "displayMinRefreshInterval", "displayMaxRefreshInterval", "displayRefreshStep" };
++	for (int i = 0; i < 3; i++) {
++		if ((n = OSNumber::withNumber(interval, 64)) != NULL) {
++			refresh->setObject(keys[i], n);
++			n->release();
++		}
++	}
++	if ((n = OSNumber::withNumber(ticks, 64)) != NULL) {
++		refresh->setObject("displayRefreshStepMachTime", n);
++		n->release();
++	}
++	setProperty("IOMFBDisplayRefresh", refresh);
++	refresh->release();
++	IOLog("SWEET FB: IOMFBDisplayRefresh %u Hz: interval %llu (2^-32 s), %llu ticks\n", fRate, interval, ticks);
++}
++
++/*
+  * 0143: whether the swap shows what the panel has already: the same layers, rectangles and
+  * surfaces, each drawn by the GPU (a CPU drawing gives no sign of a change but its unlock seed)
+  * with neither a GPU submission naming it nor a write unlock since. The key is kept for the next.

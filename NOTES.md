@@ -81,6 +81,22 @@
 - **Wi-Fi drafts compile (observed):** CI 42278088612 on branch `wifi-ci` (base 0001..0112 + Wi-Fi as
   0113-0120) succeeded; all 8 applied, no `Skipping patch`, no sweet errors (only stock ctf-tool warnings).
   Not booted. To merge into main they need renumbering after 0115.
+- **Smoothness agent (Opus) result, report `reports/research-2026-11-06-smooth-kernel.md`:**
+  - [O in logs] backboardd never enables IOMFB vsync notifications (no sel 72 in any log): CA on iPhone X runs
+    its own CADisplayTimer at the rate from `IOMFBDisplayRefresh` (2^-32 s units), 60 Hz assumed without it;
+    frames > 16.7 ms land on every 2nd tick = 30/s (0106r even sat at exactly 24/s).
+  - **0103 superseded:** it put CA_FORCE_TIMER into launchd's env, which backboardd never got; no sel 72 in
+    xnu-0103p; the "worse" fps compared different sessions. Old explanation (CA follows jittery vsync) is wrong.
+  - Panel: LineageOS dtbo has one timing for sweet's DSC video panels, **120 Hz** (2464 lines), DC28088
+    measured 8.333 ms: ABL already runs it at 120 Hz.
+  - Promoted as **0116** `IOMFBDisplayRefresh` + modes from `sweetfb_rate` (default 60 = no change), **0117**
+    vsync timer rate `sweetfb_vhz` (follows rate), **0118** `sweetfb_bind=1` binds backboardd's SwapEnd thread
+    to cpu 7 (A76), copy helpers to A55s (default off), **0119** `ca_vbl=1` puts CA_FORCE_TIMER=1 in
+    backboardd's env at exec (kern_exec.c, default off), **0120** keep up to 4 freed screen-sized surface
+    buffers for reuse (`sweet_surfkeep=0` off), **0121** IOSurface use-count probe (log only).
+    Series 0001..0121 (minus kern_exec.c) applied cleanly on rebuilt files.
+  - Test order: `sweetfb_rate=120`, then + `sweetfb_bind=1`, then `ca_vbl=1`. Past 60 fps needs userland
+    (`dl_max`, eagl reuse, CADisableMinimumFrameDurationOnPhone).
 - **frokfrdk/ios-sweet branch `sunfish` (Pixel 4a = same SM7150 + Adreno 618; own GL stack
   tools/sweetgl: sweeteagl/sweetdrm/sweetgl, not topaz), active to 2026-11-03.** Read by hand:
   - a0b076c `xnu 0118`: 512 MiB GPU window, 256 L3 tables (1 MiB) from contiguous XNU memory (zeroed, cleaned

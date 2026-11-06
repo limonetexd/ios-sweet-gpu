@@ -1,0 +1,128 @@
+From: HakiOS
+Subject: [PATCH 0152] sweet: boot-arg sweetfb_bind=1, CoreAnimation's render thread on a Cortex-A76
+
+The ADT is one homogeneous SMP cluster (cpu0-5 A55 @1709 MHz, cpu6-7 A76 @1939 MHz), so the
+scheduler puts backboardd's render-server thread (draws via eagl/Mesa, calls SwapEnd) on any
+core; on an A55 its ~16-25 ms of CPU per frame takes roughly twice as long as on an A76.
+With sweetfb_bind=1 the thread that calls SwapEnd in backboardd is thread_bind()ed to cpu 7
+(sweetfb_render_cpu=N), the panel copy helpers to cpu 2.. and the vsync work loop to cpu 1.
+Off by default (hard binding is experimental; HackiOS saw its best GL numbers with only big
+cores, cpus=4). Log: "SWEET FB: backboardd's swapping thread ... bound to cpu 7".
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -42,6 +42,29 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
++/*
++ * 0152: osfmk/kern/sched_prim.c, osfmk/arm/cpu_common.c, osfmk/arm/machine_routines.h. The
++ * ADT presents the eight cores as one homogeneous cluster (tools/mkadt.py: cpu0-5 Cortex-A55,
++ * cpu6-7 Cortex-A76), so the scheduler puts the window server's render thread on any of them;
++ * an A55 runs it at roughly half the speed of an A76.
++ */
++extern "C" struct processor *thread_bind(struct processor *processor);
++extern "C" struct processor *cpu_to_processor(int cpu);
++extern "C" int ml_get_max_cpu_number(void);
++
++/* Binds the calling thread to processor cpu (from its next block on); false if there is none. */
++static bool
++sweet_fb_bind_self(int cpu)
++{
++	struct processor *processor;
++
++	if (cpu < 0 || cpu > ml_get_max_cpu_number() || (processor = cpu_to_processor(cpu)) == NULL) {
++		return false;
++	}
++	(void)thread_bind(processor);
++	return true;
++}
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -113,6 +136,7 @@
+ 	void publishRefresh(void);
+ 	uint32_t            fRate;              /* 0150: refresh rate told to CoreAnimation, Hz (sweetfb_rate) */
+ 	uint32_t            fVsyncHz, fVsyncUS; /* 0151: vsync timer rate (sweetfb_vhz) */
++	bool                fTickBound;         /* 0152: the vsync tick's thread is on its processor */
+ 	static void statsMain(void *self, wait_result_t result);
+ 	void statsReport(void);
+ 	static void copyHelperMain(void *self, wait_result_t result);
+@@ -155,6 +179,11 @@
+ 	uint32_t      fCopyBusy;              /* helpers not done with the current copy */
+ 	/* 0143: what the panel shows, to leave a swap of the very same frame uncopied (sweetfb_skip) */
+ 	bool          fSkipRepeats;
++	/* 0152: boot-arg sweetfb_bind */
++	uint32_t      fBind;                  /* 0: off; 1: render thread on the last A76, panel work on A55s */
++	int           fRenderCPU;             /* the processor the window server's swapping thread is bound to */
++	void         *fBoundRender;           /* the last thread bound there */
++	uint32_t      fHelperCPUs;            /* helpers bound so far */
+ 	bool          fShownValid;            /* fShown is on the panel (false before any, after a fade) */
+ 	uint8_t       fShown[4 + SWEET_FB_LAYERS * 44];
+ 	uint32_t      fStatRepeats;           /* swaps left uncopied: the panel had them already */
+@@ -316,6 +345,20 @@
+ 	 * panel, the vsync tick and N-1 helper threads; 1 is the single copy of before. One processor
+ 	 * took 3.5-4 ms (up to 8.6) for a 1080x2400 frame (SWEET FPS "us average", 0101 runs).
+ 	 */
++	/*
++	 * 0152: boot-arg sweetfb_bind=1: the thread of backboardd that swaps (CoreAnimation's render
++	 * server thread: it draws through eagl/Mesa and calls SwapEnd) is bound to the last processor,
++	 * a Cortex-A76 (sweetfb_render_cpu=N for another), and the panel copy's helpers and the vsync
++	 * tick to Cortex-A55s (cpu 2, 3, ... and 1), so they never take the A76 from it. Off by default.
++	 */
++	fRenderCPU = 7;
++	PE_parse_boot_argn("sweetfb_bind", &fBind, sizeof(fBind));
++	PE_parse_boot_argn("sweetfb_render_cpu", &fRenderCPU, sizeof(fRenderCPU));
++	if (fBind != 0 && fRenderCPU > ml_get_max_cpu_number()) {
++		IOLog("SWEET FB: sweetfb_bind: no processor %d, nothing bound
++", fRenderCPU);
++		fBind = 0;
++	}
+ 	uint32_t threads = 3;
+ 	PE_parse_boot_argn("sweetfb_threads", &threads, sizeof(threads));
+ 	if (threads > 8) {
+@@ -367,6 +410,10 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (fb->fBind != 0 && !fb->fTickBound) {
++		fb->fTickBound = true;          /* 0152: the work loop's thread, from its next block on */
++		(void)sweet_fb_bind_self(1);
++	}
+ 	if (fb->fStatLock != NULL) {
+ 		IOLockLock(fb->fStatLock);
+ 		if (fb->fStatLastVsync != 0) {
+@@ -697,6 +744,13 @@
+ void
+ AppleCLCD::copyHelper(void)
+ {
++	if (fBind != 0) {
++		/* 0152: helper k on cpu 1 + k (A55s), below the render processor */
++		int cpu = 1 + (int)OSIncrementAtomic((volatile SInt32 *)&fHelperCPUs) + 1;
++		if (cpu < fRenderCPU && cpu <= 5) {
++			(void)sweet_fb_bind_self(cpu);
++		}
++	}
+ 	IOLockLock(fCopyLock);
+ 	uint32_t seen = fCopyGeneration;
+ 	fCopyHelpers++;
+@@ -1135,6 +1189,17 @@
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
+ 		fFB->swap(rec);
++		if (fFB->fBind != 0 && fFB->fBoundRender != (void *)current_thread()) {
++			/* 0152: the swapping thread on the render processor (a new one replaces the last) */
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			if (strcmp(name, "backboardd") == 0 && sweet_fb_bind_self(fFB->fRenderCPU)) {
++				fFB->fBoundRender = (void *)current_thread();
++				IOLog("SWEET FB: backboardd's swapping thread %p bound to cpu %d (sweetfb_bind)
++",
++				    fFB->fBoundRender, fFB->fRenderCPU);
++			}
++		}
+ 		break;
+ 	}
+ 	case kSweetFBGetID:

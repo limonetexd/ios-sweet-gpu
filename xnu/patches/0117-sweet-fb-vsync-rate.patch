@@ -1,0 +1,74 @@
+From: HakiOS
+Subject: [PATCH 0151] sweet: vsync timer at a boot-arg rate (sweetfb_vhz, default sweetfb_rate)
+
+The vsync timer (refresh notifications + the moments a frame may go to the panel) ticks at
+sweetfb_vhz Hz, 30..120, default = sweetfb_rate (0150), i.e. 60 by default: no change unless
+asked. sweetfb_hz>=60 still means "a frame at every tick"; lower values cap the copies per
+second as before. The 0140 grid uses the new period. 120 Hz ticks cost only a notification and
+a lock when there is no new frame (presents are counted in SWEET FPS as before).
+Log: "SWEET FB: vsync N Hz on a fixed grid, a frame put on the panel every K ticks at most".
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -112,6 +112,7 @@
+ 	void publishModes(void);
+ 	void publishRefresh(void);
+ 	uint32_t            fRate;              /* 0150: refresh rate told to CoreAnimation, Hz (sweetfb_rate) */
++	uint32_t            fVsyncHz, fVsyncUS; /* 0151: vsync timer rate (sweetfb_vhz) */
+ 	static void statsMain(void *self, wait_result_t result);
+ 	void statsReport(void);
+ 	static void copyHelperMain(void *self, wait_result_t result);
+@@ -250,7 +251,6 @@
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	/*
+ 	 * 0150: boot-arg sweetfb_rate=N (30 to 120, default 60): the refresh rate CoreAnimation is told,
+ 	 * in the modes (TimingElements) and in IOMFBDisplayRefresh. The panel itself scans at 120 Hz
+@@ -263,6 +263,20 @@
+ 		fRate = 60;
+ 	}
+ 	/*
++	 * 0151: boot-arg sweetfb_vhz=N (30 to 120, default sweetfb_rate): how often the vsync timer
++	 * ticks (refresh notifications, and the moments a new frame may be put on the panel). With
++	 * CoreAnimation told 120 Hz and frames coming every 3rd or 4th 8.3 ms refresh, a 60 Hz tick
++	 * would show them unevenly (16.7 and 33.3 ms apart in turn). sweetfb_hz keeps its meaning: 60
++	 * or more = a new frame at every tick, less = at most that many a second.
++	 */
++	fVsyncHz = fRate;
++	PE_parse_boot_argn("sweetfb_vhz", &fVsyncHz, sizeof(fVsyncHz));
++	if (fVsyncHz < 30 || fVsyncHz > 120) {
++		fVsyncHz = fRate;
++	}
++	fVsyncUS = 1000000 / fVsyncHz;
++	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : (fVsyncHz + hz - 1) / hz;
++	/*
+ 	 * 0140: boot-arg sweetfb_vgrid=0 re-arms the vsync timer 16.7 ms after each tick's work, as
+ 	 * before; by default ticks keep a fixed 60 Hz grid (with a 4 ms panel copy in the tick the
+ 	 * old way gave 20-26 ms between vsyncs: "vsync timer N ms longest" in SWEET FPS).
+@@ -270,9 +284,12 @@
+ 	uint32_t vgrid = 1;
+ 	PE_parse_boot_argn("sweetfb_vgrid", &vgrid, sizeof(vgrid));
+ 	if (vgrid != 0) {
+-		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * NSEC_PER_USEC, &fVsyncPeriod);
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / fVsyncHz, &fVsyncPeriod);   /* 0151 */
+ 	}
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fVsync->setTimeoutUS(fVsyncUS);
++	IOLog("SWEET FB: vsync %u Hz%s, a frame put on the panel every %u ticks at most (sweetfb_vhz, sweetfb_hz)
++",
++	    fVsyncHz, vgrid != 0 ? " on a fixed grid" : "", fFlushTicks);
+ 
+ 	/* 0097: a thread that says what the display and the GPU did, once a second. */
+ 	fStatWindow = mach_absolute_time();
+@@ -454,7 +471,7 @@
+ 	uint64_t now = mach_absolute_time();
+ 
+ 	if (fVsyncPeriod == 0) {
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(fVsyncUS);
+ 		return;
+ 	}
+ 	fVsyncDeadline = fVsyncDeadline != 0 ? fVsyncDeadline + fVsyncPeriod : now + fVsyncPeriod;

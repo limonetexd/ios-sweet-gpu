@@ -1,0 +1,77 @@
+From: HakiOS
+Subject: [PATCH 0155] sweet: log IOSurface use-count traps (why CoreAnimation never reuses a buffer)
+
+Traps 0/1 (IOSurfaceIncrementUseCount/DecrementUseCount) were one no-op handler. They get one
+each and the first 48 calls (then every 2000th) are logged with process, surface id/size and
+category. Read-only probe, no behaviour change. It answers whether backboardd counts use on its
+display buffers (then the kernel must keep the count, and the IOMFB must hold a use while a
+surface is on the panel, for CoreAnimation's ring to recur) or never calls them.
+Log: "SWEET SURF: backboardd use count +1 id N (WxH) category C; U up, D down so far".
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -724,6 +724,7 @@
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+ 	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapUseCountDown(void *id, void *category, void *, void *, void *, void *);   /* 0155 */
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -1521,10 +1522,45 @@
+ 	}
+ }
+ 
++/*
++ * 0155: what the clients do with use counts (traps 0/1), which this kernel does not keep.
++ * CoreAnimation decides whether a buffer of its ring may be drawn into again from
++ * IOSurfaceIsInUse(); if it waits for a count that never moves the way it expects, it makes a new
++ * surface every frame (the eagl-reuse finding: new ids 2, 4, 6, 7, 8 ...). The first 48 calls are
++ * logged (process, surface, size, category, +/-), then one line every 2000 of each.
++ * Behaviour unchanged.
++ */
++static uint32_t sweet_surf_use_calls[2];
++
++static void
++sweet_surf_use_log(void *id, void *category, int up)
++{
++	uint32_t n = OSIncrementAtomic((volatile SInt32 *)&sweet_surf_use_calls[up]) + 1;
++	uint32_t all = sweet_surf_use_calls[0] + sweet_surf_use_calls[1];
++	if (all <= 48 || (n % 2000) == 0) {
++		char name[32];
++		SweetSurface *s = sweet_surface_copy((uint32_t)(uintptr_t)id);
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET SURF: %s use count %s id %u (%ux%u) category %#lx; %u up, %u down so far\n",
++		    name, up ? "+1" : "-1", (uint32_t)(uintptr_t)id, s != NULL ? s->width : 0, s != NULL ? s->height : 0,
++		    (unsigned long)(uintptr_t)category, sweet_surf_use_calls[1], sweet_surf_use_calls[0]);
++		OSSafeReleaseNULL(s);
++	}
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapUseCount(void *id, void *category,
++    void *, void *, void *, void *)
++{
++	sweet_surf_use_log(id, category, 1);
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
++IOSurfaceRootUserClient::trapUseCountDown(void *id, void *category,
+     void *, void *, void *, void *)
+ {
++	sweet_surf_use_log(id, category, 0);
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -1648,7 +1684,7 @@
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+ 	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCountDown },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	/*

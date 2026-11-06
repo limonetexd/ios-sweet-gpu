@@ -1,0 +1,216 @@
+From: HakiOS
+Subject: [PATCH 0154] sweet: keep big surfaces' memory for the next surface (sweet_surfkeep, default on)
+
+backboardd makes and frees a screen-sized (~11 MB) IOSurface every frame. Port of HackiOS
+MiniIOSurface surfaceMemory()/surfaceMemoryBack(): up to 4 freed buffers of >= 4 MB that nobody
+else holds (retain count 1: no task mapping, no GPU buffer) are kept and handed to the next
+create of the same size, zeroed by a delayed thread call (40 ms) or by the creator. Not used
+for GPU-pool or wrapped surfaces. HackiOS: create+free 2.8+2 ms -> 0.3+0.05 ms on the drawing
+thread. Ids still change every frame: the eagl texture-per-id churn is not fixed by this.
+Default on; sweet_surfkeep=0 = old behaviour. Log: "SWEET SURF: N bytes from kept memory ...".
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -45,6 +45,8 @@
+ #include <libkern/c++/OSSerialize.h>
+ #include <sys/proc.h>
+ #include <pexpert/pexpert.h>
++#include <kern/thread_call.h>
++#include <mach/mach_time.h>
+ 
+ extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);   /* SweetAdreno.cpp */
+ extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
+@@ -128,6 +130,162 @@
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/*
++ * 0154 (HackiOS MiniIOSurface.cpp surfaceMemory()/surfaceMemoryBack(), APSL 2.0): the memory of
++ * big surfaces is kept when they go, a few pieces, and given to the next surface of the same
++ * size. backboardd makes a new screen-sized surface (1125x2436 BGRA, ~11 MB) for every frame and
++ * frees one (new ids every frame: eagl-reuse report); each was wired, zeroed, mapped and later
++ * unmapped and freed on the thread that draws (HackiOS measured 2.8 ms to make + 2 ms to free,
++ * 0.3 + 0.05 when kept). A kept piece is zeroed again before it is given out (a new surface is
++ * all zeroes): by a thread call SWEET_SURF_CLEAR_MS after it was kept, or by the creator if it
++ * is needed earlier. Only plain buffers (not the GPU pool, not wrapped client memory) that
++ * nobody else holds (no mapping, no GPU buffer: retain count 1) are kept.
++ * Boot-arg sweet_surfkeep=0: as before. Kept pieces are not counted in "MB wired" (at most
++ * SWEET_SURF_KEPT of them, ~45 MB).
++ */
++#define SWEET_SURF_KEEP_FROM    (4u << 20)
++#define SWEET_SURF_KEPT         4
++#define SWEET_SURF_CLEAR_MS     40
++
++static struct {
++	IOBufferMemoryDescriptor *memory;
++	bool                      clear;        /* zeroed since it was a surface's */
++	bool                      busy;         /* being zeroed now */
++	uint64_t                  since;
++} sweet_surf_kept[SWEET_SURF_KEPT];
++static IOLock        *sweet_surf_kept_lock;
++static thread_call_t  sweet_surf_clearing;
++static int            sweet_surf_keep = -1;
++static uint32_t       sweet_surf_reused, sweet_surf_made;
++
++static void
++sweet_surf_clear_kept(thread_call_param_t, thread_call_param_t)
++{
++	IOLockLock(sweet_surf_kept_lock);
++	for (unsigned i = 0; i < SWEET_SURF_KEPT; i++) {
++		IOBufferMemoryDescriptor *m = sweet_surf_kept[i].memory;
++		if (m == NULL || sweet_surf_kept[i].clear || sweet_surf_kept[i].busy) {
++			continue;
++		}
++		sweet_surf_kept[i].busy = true;
++		IOLockUnlock(sweet_surf_kept_lock);
++		bzero(m->getBytesNoCopy(), m->getCapacity());
++		IOLockLock(sweet_surf_kept_lock);
++		sweet_surf_kept[i].busy = false;
++		sweet_surf_kept[i].clear = true;
++	}
++	IOLockUnlock(sweet_surf_kept_lock);
++}
++
++/* Set up once, from the first big create (the surface lock is held by nobody here). */
++static bool
++sweet_surf_keeping(void)
++{
++	if (sweet_surf_keep < 0) {
++		int keep = 1;
++		IOLock *lock = IOLockAlloc();
++		(void)PE_parse_boot_argn("sweet_surfkeep", &keep, sizeof(keep));
++		thread_call_t call = keep ? thread_call_allocate(&sweet_surf_clear_kept, NULL) : NULL;
++		if (lock == NULL || call == NULL) {
++			keep = 0;
++		}
++		if (!OSCompareAndSwapPtr(NULL, keep ? (void *)lock : (void *)NULL, (void * volatile *)&sweet_surf_kept_lock) || !keep) {
++			if (lock != NULL) {
++				IOLockFree(lock);
++			}
++			if (call != NULL) {
++				thread_call_free(call);
++			}
++			if (sweet_surf_kept_lock == NULL) {
++				sweet_surf_keep = 0;
++			}
++			return sweet_surf_keep == 1 && sweet_surf_clearing != NULL;
++		}
++		sweet_surf_clearing = call;
++		sweet_surf_keep = 1;
++		IOLog("SWEET SURF: big surfaces' memory kept for the next (sweet_surfkeep=0: freed)\n");
++	}
++	return sweet_surf_keep == 1 && sweet_surf_clearing != NULL;
++}
++
++/* Zeroed, wired memory for a surface of `bytes`: a kept piece of that size if there is one. */
++static IOBufferMemoryDescriptor *
++sweet_surf_memory(uint32_t bytes)
++{
++	IOBufferMemoryDescriptor *m = NULL;
++	bool clear = false;
++
++	if (bytes >= SWEET_SURF_KEEP_FROM && sweet_surf_keeping()) {
++		IOLockLock(sweet_surf_kept_lock);
++		for (int pass = 0; pass < 2 && m == NULL; pass++) {
++			for (unsigned i = 0; i < SWEET_SURF_KEPT && m == NULL; i++) {
++				if (sweet_surf_kept[i].memory != NULL && !sweet_surf_kept[i].busy &&
++				    (pass == 1 || sweet_surf_kept[i].clear) && sweet_surf_kept[i].memory->getCapacity() == bytes) {
++					m = sweet_surf_kept[i].memory;
++					clear = sweet_surf_kept[i].clear;
++					sweet_surf_kept[i].memory = NULL;
++				}
++			}
++		}
++		uint32_t reused = m != NULL ? ++sweet_surf_reused : sweet_surf_reused;
++		uint32_t made = m == NULL ? ++sweet_surf_made : sweet_surf_made;
++		IOLockUnlock(sweet_surf_kept_lock);
++		if (m != NULL && (reused <= 4 || (reused % 1000) == 0)) {
++			IOLog("SWEET SURF: %u bytes from kept memory (%s): %u reused, %u made\n", bytes,
++			    clear ? "zeroed already" : "zeroed now", reused, made);
++		}
++		if (m != NULL && !clear) {
++			bzero(m->getBytesNoCopy(), bytes);
++		}
++	}
++	if (m == NULL) {
++		m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, bytes, page_size);
++		if (m != NULL) {
++			bzero(m->getBytesNoCopy(), bytes);
++		}
++	}
++	return m;
++}
++
++/* A surface's memory goes: kept for the next if it is big and nobody else has it (takes the reference). */
++static void
++sweet_surf_memory_back(IOBufferMemoryDescriptor *m)
++{
++	IOBufferMemoryDescriptor *evicted = NULL;
++
++	if (m->getCapacity() >= SWEET_SURF_KEEP_FROM && m->getRetainCount() == 1 && sweet_surf_keeping()) {
++		int oldest = -1;
++		IOLockLock(sweet_surf_kept_lock);
++		for (unsigned i = 0; i < SWEET_SURF_KEPT && m != NULL; i++) {
++			if (sweet_surf_kept[i].memory == NULL) {
++				sweet_surf_kept[i].memory = m;
++				sweet_surf_kept[i].clear = sweet_surf_kept[i].busy = false;
++				sweet_surf_kept[i].since = mach_absolute_time();
++				m = NULL;
++			} else if (!sweet_surf_kept[i].busy && (oldest < 0 || sweet_surf_kept[i].since < sweet_surf_kept[oldest].since)) {
++				oldest = (int)i;
++			}
++		}
++		if (m != NULL && oldest >= 0) {
++			evicted = sweet_surf_kept[oldest].memory;
++			sweet_surf_kept[oldest].memory = m;
++			sweet_surf_kept[oldest].clear = sweet_surf_kept[oldest].busy = false;
++			sweet_surf_kept[oldest].since = mach_absolute_time();
++			m = NULL;
++		}
++		IOLockUnlock(sweet_surf_kept_lock);
++		OSSafeReleaseNULL(evicted);
++		if (m == NULL) {
++			uint64_t deadline;
++			clock_interval_to_deadline(SWEET_SURF_CLEAR_MS, kMillisecondScale, &deadline);
++			thread_call_enter_delayed(sweet_surf_clearing, deadline);
++			return;
++		}
++	}
++	m->release();
++}
++
+ void
+ SweetSurface::free()
+ {
+@@ -145,6 +303,11 @@
+ 	if (wrapped && memory != NULL) {
+ 		memory->complete();
+ 	}
++	IOBufferMemoryDescriptor *buffer = !wrapped && !gpuPool ? OSDynamicCast(IOBufferMemoryDescriptor, memory) : NULL;
++	if (buffer != NULL) {
++		memory = NULL;
++		sweet_surf_memory_back(buffer);         /* 0154 */
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	if (gpuPool) {
+ 		sweet_gpu_pool_range_free(poolPhys, allocSize);
+@@ -882,8 +1045,7 @@
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			mem = sweet_surf_memory(s->allocSize);        /* 0154: zeroed, kept memory if any */
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+@@ -893,7 +1055,6 @@
+ 				IOLog("SWEET SURF: no memory for %u bytes, %llu MB wired\n", s->allocSize, sweet_surface_wired >> 20);
+ 			}
+ 		} else {
+-			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {

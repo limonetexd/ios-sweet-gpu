@@ -1,0 +1,59 @@
+From: HakiOS
+Subject: [PATCH 0153] sweet: ca_vbl=1 really reaches backboardd (CA_FORCE_TIMER in its exec env)
+
+0103 put CA_FORCE_TIMER=1 into launchd's own environment; launchd builds each job's environment
+itself, so backboardd never saw it: logs/xnu-0103p.txt (boot-args with ca_vbl=1) has no IOMFB
+selector 72 (EnableNotifications) and no "notifications type 5 on" line, exactly like runs
+without it. This patch adds the string in exec_extract_strings() for any image whose path ends
+in "/backboardd" (the bbd_wrap stand-in passes its environ on to /usr/libexec/real/backboardd).
+Opt-in (ca_vbl=1). Expected on success: "SWEET CA: CA_FORCE_TIMER=1 for /usr/libexec/backboardd",
+then "SWEET FB: backboardd notifications type 5 on" (sel 72), after which CoreAnimation's
+frames follow the vsync timer of 0109/0151 (sweetfb_vhz).
+---
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5741,6 +5741,43 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/*
++	 * 0153: boot-arg ca_vbl=1 adds CA_FORCE_TIMER=1 to the environment of every program whose
++	 * path ends in "/backboardd" (the bbd_wrap stand-in and the real window server it execs).
++	 * 0103 put it into launchd's environment only, and launchd does not hand its own
++	 * environment to its jobs: with 0103 + ca_vbl=1 backboardd never asked for refresh
++	 * notifications (no IOMFB selector 72 in logs/xnu-0103p.txt). QuartzCore takes the display
++	 * driver's refresh notifications instead of its CADisplayTimer only on A7-A10 phones or with
++	 * CA_FORCE_TIMER set (CADeviceUseVBL(); HackiOS/topaz inject.c set it in-process).
++	 */
++	{
++		static int sweet_ca_vbl = -1;
++		const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++		size_t plen;
++
++		if (sweet_ca_vbl < 0) {
++			int v = 0;
++			sweet_ca_vbl = (PE_parse_boot_argn("ca_vbl", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		}
++		plen = strnlen(path, MAXPATHLEN);
++		if (sweet_ca_vbl == 1 && plen >= 11 && strcmp(path + plen - 11, "/backboardd") == 0) {
++			const char *setting = "CA_FORCE_TIMER=1";
++
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(setting), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++			printf("SWEET CA: CA_FORCE_TIMER=1 for %s (ca_vbl=1)
++", path);
++		}
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
