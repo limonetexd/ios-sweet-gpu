@@ -2,6 +2,35 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
+
+- **userdata reflash done (observed):** `fastboot -S 512M flash userdata ipsw/ios16-root-gpu2.simg`,
+  24/24 sparse chunks OKAY, 339.8 s, log `../flash-userdata-gpu2-20261106.log`. Repo at 07b4dfb, clean.
+  This replaces the interrupted 2026-11-03 flash: root is now a clean gpu2 (no Wi-Fi deploy edits).
+- **Boot of `shim-boot-0101s0.img`** (SHA-256 193c287e7b1cd1df28e8f6bc72504275ff2555f559ab049e110fed38f99fc2d2,
+  hash re-verified): `fastboot boot` hung at upload (no output after >120 s; known ABL quirk after a
+  large flash); `fastboot devices` then showed serial `????????????`. Needs Power+Vol- from the user.
+  First boot after the flash: expect 15-30 min of datamigrator.
+- **New image `shim-boot-0101s0b.img`** = 0101s0 + `sweetbattery=1` (kernel `xnu/out-0101`,
+  SWEETFB_HZ=60, serial=0; SHA-256 6a38dc18134b9be8091426fdc14d6ca09222e28c41f5882a0f95b962d6c74a7c).
+  Verified in source: patch 0062 (`SweetBattery.cpp`) reads the PM6150 read-only when `sweetbattery=1`,
+  default is static 100%, and `tools/sweet-gpu-image.sh` never passed it. Not booted yet.
+- `tools/sweet-gpu-image.sh` has CRLF line endings on this checkout (`/bin/bash^M`); built via a
+  CR-stripped copy in `/tmp` (with the `cd $(dirname $0)` line removed, run from the repo root).
+- **Research reports (Sonnet sub-agents, not yet verified by hand)** in `reports/research-2026-11-06-*.md`:
+  - `battery`: DC28088 QG register map (VBAT 0x48c0, I 0x48c2, SDAM SOC seed 0xb646/7), small patch plan;
+    ios-flame/sunfish (same SM7150/PM6150) as reference; sailfish 0180 skip idle cache flush.
+  - `gpu`: HackiOS 2.3.4 metal is A642L-only; HackiOS speed comes from 6-thread beam-aware CPU copy
+    (`fb_threads`, `fb_beam`), presenter thread + vsync before `ca_vbl=1`, `wallpaper_freeze`, render scale;
+    sailfish 0182 present on kernel thread; `gpu_recover`. Ranked patch list 0106+.
+  - `wifi`: DC28088 branch rewritten 2026-11-03 (67448d2), Wi-Fi patches unchanged; 0104 broke by replacing
+    our sweet_rpmh.c/SweetKeyStore.cpp (AKS 0x6->0x4, sls 3->0); boot-arg bisection of super possible without CI;
+    DHCP spinner fix = explicit en0/AirPort service in preferences.plist (ios-flame `sunfish-netprefs.py`);
+    wland skips start when boottime equals `/var/local/wland.boot` (needs RTC 0166).
+  - `ecosystem`: upstream idle (45263be); sailfish root recipe for wallpaper/appex (ExtensionKit flag,
+    datamigrator sentinel, staged_system_apps -> /Applications, HEIC->PNG); missing Sandbox op 4 and
+    AMFI developer_mode sysctl/IOService; sailfish 0181 IRQ touch; HackiOS audio source in MrMoxing/ios-alioth.
+
 ### >>> 2026-11-03: super 0104/0105, panic forensics, 5 notas (leer primero) <<<
 
 **Estado del teléfono (2026-11-03, última observación):** en fastboot. Se lanzó
