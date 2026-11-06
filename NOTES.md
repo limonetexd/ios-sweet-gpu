@@ -4,6 +4,14 @@
 
 ### >>> 2026-11-06: gpu2 root reflashed, 0101s0b battery image, 4 research reports <<<
 
+**2026-11-06 (later, opencode): bt6 no gain; 0123 built (bind default); 0125-0127 pushed.** [O]
+`logs/xnu-0122bt6.txt` (bind + `sweetfb_threads=6`): nonzero swaps avg 25.7 vs 26.0, p50 29,
+p90 40 vs 41, p95 42 vs 43, max 44 vs 50; 6 copy threads do not help. 0123 (bind default) CI
+42306437909 success 15m01s; image `shim-boot-0123s0.img` SHA-256
+`6f7e8357c9ff0777ab3c295f1633b79db9bf413d9fcfc03e0efb3d30bc6168aa`. New batch 0125-0127 (beam
+probe 0144, presenter thread 0145 with priority 92, beam-order copy 0146) regenerated clean from
+the 0123 buildtree and pushed; CI 42308440128. `0122b120` (bind + `sweetfb_rate=120`) test running.
+
 **2026-11-06 (later, opencode): 0122bc A/B (observed): `ca_vbl=1` adds nothing.** [O]
 `logs/xnu-0122bc.txt`: nonzero swaps avg 26.2 vs 26.0 for bind alone, p50 29 vs 28, p90 39 vs 41,
 p95 41 vs 43, max 48 vs 50. `SWEET CA: CA_FORCE_TIMER=1 for /usr/libexec/backboardd (ca_vbl=1)`
