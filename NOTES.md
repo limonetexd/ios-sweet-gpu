@@ -58,6 +58,20 @@
   picker lagged and then the phone restarted by itself (respring or reboot; no ring pulled, phone left
   running). Wallpaper/battery UI not reported. Next: ring pull at the next fastboot to see whether it was a
   respring (SpringBoard/backboardd CRASH) or a kernel panic/watchdog.
+- **Freeze agent (Opus, stopped by user request to save usage; report `reports/research-2026-11-06-freeze.md`):**
+  - [O] In `logs/xnu-0101s0-freeze.txt` the 0054 sampler caught backboardd's CA render thread inside the kernel
+    in RedwoodGPU `DRM_MSM_GEM_NEW` (sel 0x42) from glTexImage2D -> Mesa fd_bo_new; GPU idle. Where it waits
+    inside gemNew is not proven.
+  - [O] GPU page tables are a bump allocator (128 tables = 256 MiB GPU VA) never freed; kept buffers (<=160 MB)
+    hold VA; that log had 11 "cannot be entered into the GPU's address space" 55-75 s before the freeze.
+  - Ruled out: GPU hang, zombies, CA "function 40", fence waits (bounded 5 s), eagl waits.
+  - **0113** (= agent's 0121) promoted: out of VA/page tables, newBuffer drops the kept buffers and retries once;
+    full free list logged. Reviewed: newBuffer runs under gGPULock and dropKept takes no lock (as clientClose).
+  - Pending: 0120 freeze probe (names the stuck request, dumps backboardd/SpringBoard backtraces; touches
+    exception.c, sweet_sample.c, SweetHID), 0122 opt-in `sweetfreeze=2` respring after 24 s frozen,
+    `userland/proposed-freeze-fix.diff` (eagl GL-call watchdog).
+  - Note: branch `wifi-ci` reuses numbers 0113-0120 for the Wi-Fi compile test only; renumber when merging.
+- User stopped the remaining agents (usage). Work continues without sub-agents.
 - **eagl reuse agent (Sonnet) finding [O in logs]:** backboardd attaches a NEW IOSurface and a NEW texture
   every frame (ids 2,4,6,7,8...), so per-surface reuse cannot hit today. Attach ~5.7 ms/frame + delete
   ~2.8 ms/frame of a ~19 ms frame go away only once surfaces recur (kernel surface pool / CA buffer ring).

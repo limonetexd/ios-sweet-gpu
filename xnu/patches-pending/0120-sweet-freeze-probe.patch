@@ -1,0 +1,781 @@
+From: HakiOS
+Subject: [PATCH] sweet: freeze probe (RedwoodGPU requests in flight, FRZ thread dumps)
+
+A UI freeze: frames stop, the GPU is idle (fence done, 0 ms pending), touches
+still arrive, no crash, no panic. In logs/xnu-0101s0-freeze.txt the process
+sampler (0054) happened to run 56 s into one: backboardd's CoreAnimation
+thread was in mach_msg2_trap under IOConnectCallStructMethod from libOSMesa
+msm_bo_new (DRM_MSM_GEM_NEW, selector 0x42) <- fd_bo_new <- realloc_bo <-
+st teximage <- glTexImage2D (libOSMesa loaded at 0x107000000; return
+addresses matched to BL instructions). Where in the kernel it waits is not
+known. This patch makes the next freeze say so in one boot:
+
+- RedwoodGPU.cpp: a table of the requests in flight (selector, size, step of
+  gemNew, start time, thread) and gGPULock's holder; redwood_gpu_inflight_ms(),
+  redwood_gpu_inflight_report().
+- SweetFramebuffer.cpp: the once-a-second line triggers a dump when frames
+  had been coming and none came for 4 s while touches arrived, or when a
+  request has been in RedwoodGPU for 3 s (8 dumps at most, 20 s apart).
+  "SWEET FREEZE: ..." line. Boot-arg sweetfreeze=0: off.
+- bsd/dev/sweet_sample.c: sweet_freeze_dump() on a thread of its own: the
+  requests in flight (with kernel backtraces), then every thread of
+  sweetfreeze_names (default backboardd,SpringBoard).
+- osfmk/kern/exception.c: sweet_thread_dump(): state, block hint, wait event,
+  priority, user pc/lr/bt, kernel bt from the saved kernel context (unslid).
+- hid/SweetHID.cpp: sweet_hid_touches counter.
+
+Applies on xnu/patches 0001..0112 (current series). Untested: not compiled locally.
+---
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -19,6 +19,7 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -86,3 +87,83 @@ sweet_sample_start(void)
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * 0120 freeze probe: SweetFramebuffer.cpp's once-a-second line saw no frame for seconds while the
++ * screen was touched, or RedwoodGPU has had a request in it for seconds. On a thread of its own
++ * (a process walk can wait on a process in exec; the display's thread must not): RedwoodGPU's
++ * requests in flight with their threads, then every thread of the processes in boot-arg
++ * sweetfreeze_names (default "backboardd,SpringBoard"), user and kernel backtraces ("FRZ").
++ */
++extern void sweet_freeze_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++extern void redwood_gpu_inflight_report(uint64_t min_ms);              /* iokit/Kernel/arm/RedwoodGPU.cpp */
++extern void sweet_freeze_dump(const char *why);
++
++static char sweet_freeze_names[128];
++static char sweet_freeze_why[96];
++static volatile SInt32 sweet_freeze_busy;
++static int sweet_freeze_count;
++
++static bool
++sweet_freeze_wanted(const char *name)
++{
++	size_t n = strlen(name);
++	for (const char *t = sweet_freeze_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++static int
++sweet_freeze_proc(proc_t p, __unused void *arg)
++{
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (sweet_freeze_wanted(name)) {
++		task_t task = proc_task(p);
++		if (task != TASK_NULL) {
++			sweet_freeze_task(name, proc_pid(p), task);
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static void
++sweet_freeze_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	printf("FRZ --- dump %d: %s\n", sweet_freeze_count, sweet_freeze_why);
++	redwood_gpu_inflight_report(500);
++	proc_iterate(PROC_ALLPROCLIST, sweet_freeze_proc, NULL, NULL, NULL);
++	printf("FRZ --- dump %d done\n", sweet_freeze_count);
++	OSCompareAndSwap(1, 0, (volatile UInt32 *)&sweet_freeze_busy);
++}
++
++void
++sweet_freeze_dump(const char *why)
++{
++	thread_t thread;
++
++	if (sweet_freeze_names[0] == 0 &&
++	    !PE_parse_boot_argn("sweetfreeze_names", sweet_freeze_names, sizeof(sweet_freeze_names))) {
++		strlcpy(sweet_freeze_names, "backboardd,SpringBoard", sizeof(sweet_freeze_names));
++	}
++	if (!OSCompareAndSwap(0, 1, (volatile UInt32 *)&sweet_freeze_busy)) {
++		printf("FRZ: a dump is still being made (it waits on something itself)\n");
++		return;
++	}
++	sweet_freeze_count++;
++	strlcpy(sweet_freeze_why, why, sizeof(sweet_freeze_why));
++	if (kernel_thread_start(sweet_freeze_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		sweet_freeze_busy = 0;
++	}
++}
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -200,6 +200,167 @@ static struct {
+ 	uint64_t making;                        /* ... and the time it took to make the others */
+ } gGPUStat;
+ 
++/*
++ * 0120 (freeze probe): what is under way in here, for the display's once-a-second line
++ * (SweetFramebuffer.cpp): every request of a program's from its start to its end, the step
++ * of a buffer's making it is at, and who holds gGPULock since when. backboardd's CoreAnimation
++ * thread was found inside GEM_NEW (glTexImage2D -> msm_bo_new) 56 s into a freeze with the GPU
++ * idle (logs/xnu-0101s0-freeze.txt, sample 1): a request that stays in here for seconds is
++ * named, with its thread's kernel backtrace (sweet_thread_dump(), osfmk/kern/exception.c).
++ */
++#define GPU_INFLIGHT            16
++struct gpu_inflight {
++	thread_t thread;
++	uint32_t selector, stage;
++	uint64_t began, size;
++};
++static struct gpu_inflight gInflight[GPU_INFLIGHT];
++static IOLock * gInflightLock;                  /* around gInflight[] slots being taken and given back */
++static thread_t volatile gGPULockOwner;
++static uint64_t volatile gGPULockSince;
++static const char * const gStageNames[] = {
++	"the request", "a kept buffer (gGPULock)", "a GPU pool range", "zeroing the pool range",
++	"the pool buffer into the GPU (gGPULock)", "IOBufferMemoryDescriptor", "cleaning it out of the cache",
++	"the buffer into the GPU (gGPULock)", "waiting for the GPU", "mapping a buffer (gGPULock)",
++};
++extern "C" void sweet_thread_dump(const char * tag, thread_t thread);    /* osfmk/kern/exception.c */
++extern "C" uint32_t redwood_gpu_inflight_ms(void);
++extern "C" void redwood_gpu_inflight_report(uint64_t min_ms);
++
++static void
++gpuLock(void)
++{
++	IOLockLock(gGPULock);
++	gGPULockOwner = IOThreadSelf();
++	gGPULockSince = mach_absolute_time();
++}
++
++static void
++gpuUnlock(void)
++{
++	gGPULockOwner = NULL;
++	IOLockUnlock(gGPULock);
++}
++
++static int
++inflightBegin(uint32_t selector, uint64_t size)
++{
++	int slot = -1;
++
++	if (gInflightLock == NULL) {
++		return -1;
++	}
++	IOLockLock(gInflightLock);
++	for (int i = 0; i < GPU_INFLIGHT; i++) {
++		if (gInflight[i].thread == NULL) {
++			gInflight[i].selector = selector;
++			gInflight[i].stage = 0;
++			gInflight[i].size = size;
++			gInflight[i].began = mach_absolute_time();
++			gInflight[i].thread = IOThreadSelf();
++			slot = i;
++			break;
++		}
++	}
++	IOLockUnlock(gInflightLock);
++	return slot;
++}
++
++static void
++inflightEnd(int slot)
++{
++	if (slot >= 0) {
++		IOLockLock(gInflightLock);
++		gInflight[slot].thread = NULL;
++		IOLockUnlock(gInflightLock);
++	}
++}
++
++/* the step this thread's request is at (its own slot: no lock) */
++static void
++inflightStage(uint32_t stage)
++{
++	thread_t self = IOThreadSelf();
++
++	for (int i = 0; i < GPU_INFLIGHT; i++) {
++		if (gInflight[i].thread == self) {
++			gInflight[i].stage = stage;
++			return;
++		}
++	}
++}
++
++static const char *
++requestName(uint32_t selector)
++{
++	switch (selector) {
++	case 0x09: return "GEM_CLOSE";
++	case 0x40: return "GET_PARAM";
++	case 0x42: return "GEM_NEW";
++	case 0x43: return "GEM_INFO";
++	case 0x44: return "GEM_CPU_PREP";
++	case 0x46: return "GEM_SUBMIT";
++	case 0x47: return "WAIT_FENCE";
++	case 0x7e: return "SURFACE";
++	case 0x1000: return "map";
++	default: return "other";
++	}
++}
++
++/* 0120: how long the oldest request still in here has been (ms; 0: none) */
++uint32_t
++redwood_gpu_inflight_ms(void)
++{
++	uint64_t now = mach_absolute_time(), oldest = 0, ns;
++
++	for (int i = 0; i < GPU_INFLIGHT; i++) {
++		uint64_t began = gInflight[i].began;
++		if (gInflight[i].thread != NULL && now > began && now - began > oldest) {
++			oldest = now - began;
++		}
++	}
++	absolutetime_to_nanoseconds(oldest, &ns);
++	return (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
++/* 0120: every request in here for min_ms or longer, with its thread's backtraces; and gGPULock's holder */
++void
++redwood_gpu_inflight_report(uint64_t min_ms)
++{
++	uint64_t now = mach_absolute_time(), ns;
++	thread_t owner = gGPULockOwner;
++	bool owner_told = owner == NULL;
++
++	if (gInflightLock == NULL) {
++		return;
++	}
++	IOLockLock(gInflightLock);
++	for (int i = 0; i < GPU_INFLIGHT; i++) {
++		struct gpu_inflight * f = &gInflight[i];
++		if (f->thread == NULL) {
++			continue;
++		}
++		absolutetime_to_nanoseconds(now - f->began, &ns);
++		if (ns / NSEC_PER_MSEC < min_ms) {
++			continue;
++		}
++		IOLog("SWEET FREEZE: RedwoodGPU %s (%#x, %llu bytes) in here for %llu ms, at %s; thread %#llx%s\n",
++		    requestName(f->selector), f->selector, f->size, ns / NSEC_PER_MSEC,
++		    f->stage < sizeof(gStageNames) / sizeof(gStageNames[0]) ? gStageNames[f->stage] : "?",
++		    (uint64_t)(uintptr_t)f->thread, f->thread == owner ? ", holds gGPULock" : "");
++		sweet_thread_dump("FRZ gpu", f->thread);
++		owner_told = owner_told || f->thread == owner;
++	}
++	IOLockUnlock(gInflightLock);
++	if (owner != NULL) {
++		absolutetime_to_nanoseconds(now - gGPULockSince, &ns);
++		IOLog("SWEET FREEZE: gGPULock %#llx held for %llu ms by thread %#llx%s\n", (uint64_t)(uintptr_t)gGPULock,
++		    ns / NSEC_PER_MSEC, (uint64_t)(uintptr_t)owner, owner_told ? "" : " (not a request of a program's)");
++	} else {
++		IOLog("SWEET FREEZE: gGPULock %#llx free\n", (uint64_t)(uintptr_t)gGPULock);
++	}
++}
++
+ /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
+ static bool
+ gpuWait(uint32_t fence, uint64_t milliseconds)
+@@ -218,9 +379,9 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
+ 		if (mach_absolute_time() - began >= patience || gGPUReported) {
+ 			break;                  /* (a GPU that has stopped answering is not waited for again) */
+ 		}
+-		IOLockUnlock(gGPULock);
++		gpuUnlock();
+ 		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+-		IOLockLock(gGPULock);
++		gpuLock();
+ 	}
+ 	if (milliseconds >= 1000 && !gGPUReported) {
+ 		gGPUReported = true;
+@@ -237,9 +398,9 @@ topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds)
+ 	bool done = true;
+ 
+ 	if (fence != 0 && gGPULock != NULL) {
+-		IOLockLock(gGPULock);
++		gpuLock();
+ 		done = !redwood_gpu_ready() || gpuWait(fence, milliseconds);
+-		IOLockUnlock(gGPULock);
++		gpuUnlock();
+ 	}
+ 	return done;
+ }
+@@ -335,6 +496,7 @@ RedwoodGPUStart(void)
+ 	 * flush_dcache); gpu_cached=0 asks for write-combined buffers */
+ 	gGPUCached = !PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) || cached != 0;
+ 	gGPULock = IOLockAlloc();
++	gInflightLock = IOLockAlloc();
+ 	gpu = OSTypeAlloc(RedwoodGPU);
+ 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+ 		OSSafeReleaseNULL(gpu);
+@@ -352,9 +514,9 @@ RedwoodGPUStart(void)
+ void
+ RedwoodGPUStop(void)
+ {
+-	IOLockLock(gGPULock);
++	gpuLock();
+ 	redwood_gpu_stop();
+-	IOLockUnlock(gGPULock);
++	gpuUnlock();
+ }
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+@@ -568,7 +730,7 @@ IOReturn
+ RedwoodGPUUserClient::clientClose(void)
+ {
+ 	if (fBuffers != NULL) {
+-		IOLockLock(gGPULock);
++		gpuLock();
+ 		/* what the client had the GPU do last may still be going on, in these buffers */
+ 		if (redwood_gpu_ready()) {
+ 			gpuWait(redwood_gpu_last(), 1000);
+@@ -585,7 +747,7 @@ RedwoodGPUUserClient::clientClose(void)
+ 		if (fLeftCount != 0) {
+ 			IOLog("RedwoodGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
+ 		}
+-		IOLockUnlock(gGPULock);
++		gpuUnlock();
+ 	}
+ 	if (!isInactive()) {
+ 		terminate();
+@@ -729,7 +891,8 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		return kIOReturnBadArgument;
+ 	}
+ 	/* one kept of this size and kind, if there is one (the one kept last: likeliest still in the caches' way) */
+-	IOLockLock(gGPULock);
++	inflightStage(1);
++	gpuLock();
+ 	struct gpu_kept * found = NULL;
+ 	uint64_t old;
+ 
+@@ -763,30 +926,33 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			found->memory = NULL;
+ 			fKeptBytes -= size;
+ 			gGPUStat.given_again++;
+-			IOLockUnlock(gGPULock);
++			gpuUnlock();
+ 			if (gGPUKeep == 2) {
+ 				bzero(b->kernel, (size_t) b->size);
+ 			}
+ 			return kIOReturnSuccess;
+ 		}
+ 	}
+-	IOLockUnlock(gGPULock);
++	gpuUnlock();
+ 	/*
+ 	 * Big buffers (textures, the frame's own) from the GPU pool: write-combined, so never
+ 	 * cleaned out of the cache at a submission (the cached ones were ~15 MB a submission).
+ 	 */
+ 	uint8_t * pool_kva = NULL;
++	inflightStage(2);
+ 	uint64_t pool_pa = size >= GPU_POOL_FROM ? sweet_gpu_pool_range(size, &pool_kva) : 0;
+ 	if (pool_pa != 0) {
+ 		IOMemoryDescriptor * md = sweet_gpu_pool_md(pool_pa, size);
+ 		if (md == NULL) {
+ 			sweet_gpu_pool_range_free(pool_pa, size);
+ 		} else {
++			inflightStage(3);
+ 			for (uint64_t i = 0; i < size / 8; i++) {
+ 				((volatile uint64_t *) pool_kva)[i] = 0;
+ 			}
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+-			IOLockLock(gGPULock);
++			inflightStage(4);
++			gpuLock();
+ 			b = newBuffer(md, 0, size, request->flags, &request->handle);
+ 			if (b != NULL) {
+ 				b->memory = md;
+@@ -795,7 +961,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 				gGPUStat.made++;
+ 				gGPUStat.making += mach_absolute_time() - began;
+ 			}
+-			IOLockUnlock(gGPULock);
++			gpuUnlock();
+ 			if (b == NULL) {
+ 				md->release();
+ 				sweet_gpu_pool_range_free(pool_pa, size);
+@@ -809,6 +975,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	 * 0096: not physically contiguous: newBuffer maps it page by page, and 40 MB contiguous
+ 	 * buffers failed (run 0099e).
+ 	 */
++	inflightStage(5);
+ 	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+ 	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, 0x000000fffffff000ull);
+ 	if (memory == NULL) {
+@@ -817,10 +984,12 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	if (gGPUCached) {
++		inflightStage(6);
+ 		redwood_gpu_to_memory(memory->getBytesNoCopy(), size);
+ 	}
+ 
+-	IOLockLock(gGPULock);
++	inflightStage(7);
++	gpuLock();
+ 	b = newBuffer(memory, 0, size, request->flags, &request->handle);
+ 	if (b != NULL) {
+ 		b->memory = memory;
+@@ -828,7 +997,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		gGPUStat.made++;
+ 		gGPUStat.making += mach_absolute_time() - began;
+ 	}
+-	IOLockUnlock(gGPULock);
++	gpuUnlock();
+ 	if (b == NULL) {
+ 		memory->release();
+ 		return kIOReturnNoMemory;
+@@ -902,7 +1071,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		return kIOReturnSuccess;
+ 	}
+ 
+-	IOLockLock(gGPULock);
++	gpuLock();
+ 	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+ 		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
+ 			b = &fBuffers[i];
+@@ -920,7 +1089,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		gGPUStat.surfaces++;
+ 	}
+ 	gGPUStat.taking += mach_absolute_time() - began;
+-	IOLockUnlock(gGPULock);
++	gpuUnlock();
+ 	if (b == NULL) {
+ 		memory->release();
+ 		s->release();
+@@ -935,7 +1104,7 @@ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ 	struct gpu_buffer * b;
+ 	IOReturn ret = kIOReturnSuccess;
+ 
+-	IOLockLock(gGPULock);
++	gpuLock();
+ 	b = buffer(request->handle);
+ 	if (b == NULL) {
+ 		ret = kIOReturnBadArgument;
+@@ -948,7 +1117,7 @@ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ 	} else if (request->info != MSM_INFO_SET_NAME) {            /* a name for somebody's debugger: not kept */
+ 		ret = kIOReturnUnsupported;
+ 	}
+-	IOLockUnlock(gGPULock);
++	gpuUnlock();
+ 	return ret;
+ }
+ 
+@@ -1014,7 +1183,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		ret = kIOReturnVMError;
+ 		goto out;
+ 	}
+-	IOLockLock(gGPULock);
++	gpuLock();
+ 	/*
+ 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
+ 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
+@@ -1072,7 +1241,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		    (uint64_t) cmds[i].submit_offset + cmds[i].size > b->size) {
+ 			IOLog("RedwoodGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
+ 			    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
+-			IOLockUnlock(gGPULock);
++			gpuUnlock();
+ 			goto out;
+ 		}
+ 		addresses[count] = b->address + cmds[i].submit_offset;
+@@ -1155,7 +1324,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		    fBufferBytes >> 20);
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
+-	IOLockUnlock(gGPULock);
++	gpuUnlock();
+ 	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
+ out:
+ 	if (bos != NULL) {
+@@ -1197,8 +1366,10 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ {
+ 	struct gpu_buffer * b;
+ 	IOReturn ret = kIOReturnBadArgument;
++	int slot = inflightBegin(0x1000, 0);
+ 
+-	IOLockLock(gGPULock);
++	inflightStage(9);
++	gpuLock();
+ 	b = buffer(type);
+ 	if (b != NULL) {
+ 		b->memory->retain();
+@@ -1207,7 +1378,8 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ 		*options = b->pool || (b->surface != NULL && b->surface->gpuPool) ? kIOMapWriteCombineCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+-	IOLockUnlock(gGPULock);
++	gpuUnlock();
++	inflightEnd(slot);
+ 	return ret;
+ }
+ 
+@@ -1242,6 +1414,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	}
+ 	bzero(&r, sizeof(r));
+ 	memcpy(&r, args->structureInput, size);
++	int slot = inflightBegin(selector, selector == kMsmGemNew ? r.gemNew.size : 0);
+ 
+ 	switch (selector) {
+ 	case kMsmGetParam:
+@@ -1259,7 +1432,8 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		break;
+ 	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
+ 		waitBegan = mach_absolute_time();
+-		IOLockLock(gGPULock);
++		inflightStage(8);
++		gpuLock();
+ 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
+ 		if (!gpuWait(redwood_gpu_last(), patience)) {
+ 			ret = kIOReturnBusy;
+@@ -1267,7 +1441,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 				waitOver(&r.cpuPrep.timeout, redwood_gpu_last());
+ 			}
+ 		}
+-		IOLockUnlock(gGPULock);
++		gpuUnlock();
+ 		slowWait("cpu-prep", waitBegan);
+ 		break;
+ 	case kMsmGemSubmit:
+@@ -1275,7 +1449,8 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		break;
+ 	case kMsmWaitFence:
+ 		waitBegan = mach_absolute_time();
+-		IOLockLock(gGPULock);
++		inflightStage(8);
++		gpuLock();
+ 		patience = millisecondsUntil(&r.waitFence.timeout);
+ 		if (!gpuWait(r.waitFence.fence, patience)) {
+ 			ret = kIOReturnTimeout;
+@@ -1283,7 +1458,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 				waitOver(&r.waitFence.timeout, r.waitFence.fence);
+ 			}
+ 		}
+-		IOLockUnlock(gGPULock);
++		gpuUnlock();
+ 		slowWait("fence", waitBegan);
+ 		break;
+ 	case kMsmGemMadvise:
+@@ -1298,7 +1473,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		}
+ 		break;
+ 	case kDrmGemClose:
+-		IOLockLock(gGPULock);
++		gpuLock();
+ 		b = buffer(r.close.handle);
+ 		if (b == NULL) {
+ 			ret = kIOReturnBadArgument;
+@@ -1306,7 +1481,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 			freeBuffer(b);
+ 			reap();
+ 		}
+-		IOLockUnlock(gGPULock);
++		gpuUnlock();
+ 		break;
+ 	case kRedwoodSurface:
+ 		ret = surfaceBuffer(&r.surface);
+@@ -1319,6 +1494,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
++	inflightEnd(slot);
+ 	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
+ 		if (args->structureOutputSize > size) {
+ 			args->structureOutputSize = (uint32_t) size;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,9 @@
+ #include "SweetSurface.h"
+ extern "C" void redwood_gpu_to_memory(void *start, uint64_t size);       /* SweetAdreno.cpp */
+ extern "C" uint32_t redwood_gpu_pending_ms(void);                       /* 0097 */
++extern "C" uint32_t redwood_gpu_inflight_ms(void);                      /* 0120, RedwoodGPU.cpp */
++extern "C" void sweet_freeze_dump(const char *why);                     /* 0120, bsd/dev/sweet_sample.c */
++extern "C" volatile uint32_t sweet_hid_touches;                         /* 0120, hid/SweetHID.cpp */
+ extern "C" uint32_t redwood_gpu_last(void);
+ extern "C" void redwood_gpu_report(const char *why);
+ 
+@@ -533,6 +536,44 @@ AppleCLCD::statsReport(void)
+ 		    swaps, window / 1000000,
+ 		    swapgap / 1000000, late, presents, presents ? psum / 1000 / presents : 0, pmax / 1000, stale,
+ 		    vsyncgap / 1000000, pending, redwood_gpu_last(), live, zombies, wired >> 20, failed, repeats);
++		/*
++		 * 0120 freeze probe: frames had been coming, none for 4 s while the screen is touched (an
++		 * idle home screen swaps nothing, but it answers a touch), or a request of a program's
++		 * has been in RedwoodGPU for 3 s: say so, and have every thread of backboardd and
++		 * SpringBoard dumped (sweet_freeze_dump()), at most 8 times, 20 s apart. Boot-arg
++		 * sweetfreeze=0: off.
++		 */
++		{
++			static uint32_t probe = 1, quiet, touches_then, dumps;
++			static uint64_t last_dump;
++			static bool had_frames, parsed;
++			uint32_t touches = sweet_hid_touches, inflight = redwood_gpu_inflight_ms();
++			uint64_t since_dump = 0;
++
++			if (!parsed) {
++				parsed = true;
++				PE_parse_boot_argn("sweetfreeze", &probe, sizeof(probe));
++			}
++			if (swaps != 0) {
++				had_frames = true;
++				quiet = 0;
++				touches_then = touches;
++			} else if (had_frames) {
++				quiet++;
++			}
++			absolutetime_to_nanoseconds(now - last_dump, &since_dump);
++			bool touched = touches - touches_then >= 2;
++			if (probe != 0 && dumps < 8 && (last_dump == 0 || since_dump >= 20 * NSEC_PER_SEC) &&
++			    ((quiet >= 4 && touched) || inflight >= 3000)) {
++				char why[96];
++				snprintf(why, sizeof(why), "no frame for %u s, %u touch reports since; GPU request in flight %u ms; "
++				    "fence %u", quiet, touches - touches_then, inflight, redwood_gpu_last());
++				IOLog("SWEET FREEZE: %s\n", why);
++				dumps++;
++				last_dump = now;
++				sweet_freeze_dump(why);
++			}
++		}
+ 		if (pending > 1000) {
+ 			IOLockLock(fStatLock);
+ 			stalls = ++fStatStalls;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -552,9 +552,14 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++/* 0120: touch reports so far (the freeze probe in SweetFramebuffer.cpp: touched, and no frame) */
++extern "C" volatile uint32_t sweet_hid_touches;
++volatile uint32_t sweet_hid_touches;
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
++	sweet_hid_touches++;
+ 	if (gSweetTouch) {
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1040,6 +1040,106 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	task_unlock(task);
+ }
+ 
++/*
++ * 0120 freeze probe: one thread as it is now -- scheduler state, what it waits on, the user
++ * pc/lr and frame-pointer backtrace from its saved user state, and, when it is off core in
++ * the kernel, the kernel backtrace from its saved kernel context (addresses unslid, for
++ * llvm-symbolizer / nm against kernel.development.sweet). Lines "FRZ TAG ...". The caller
++ * keeps the thread from going away (its task's lock, or RedwoodGPU's request table).
++ */
++void sweet_thread_dump(const char *tag, thread_t thread);
++void sweet_freeze_task(const char *name, int pid, task_t task);
++
++void
++sweet_thread_dump(const char *tag, thread_t thread)
++{
++	char line[200];
++	int n;
++	task_t task = get_threadtask(thread);
++	vm_map_t map = task != TASK_NULL ? get_task_map(task) : VM_MAP_NULL;
++	arm_saved_state_t *ss = task != kernel_task ? find_user_regs(thread) : NULL;
++
++	printf("FRZ %s thread 0x%llx tid %llu state 0x%x hint %d event 0x%llx pri %d%s\n", tag,
++	    (uint64_t)(uintptr_t)thread, thread_tid(thread), thread->state, (int)thread->block_hint,
++	    (uint64_t)thread->wait_event, (int)thread->sched_pri, thread == current_thread() ? " (this one)" : "");
++	if (ss != NULL && is_saved_state64(ss) && map != VM_MAP_NULL) {
++		uint64_t fp = get_saved_state_fp(ss);
++		n = snprintf(line, sizeof(line), "FRZ %s user pc 0x%llx lr 0x%llx bt", tag, get_saved_state_pc(ss),
++		    get_saved_state_lr(ss));
++		for (int i = 0; i < 24 && fp != 0 && (fp & 7) == 0; i++) {
++			uint64_t frame[2];
++			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++				break;
++			}
++			if (n > (int)sizeof(line) - 24) {
++				printf("%s\n", line);
++				n = snprintf(line, sizeof(line), "FRZ %s user bt+", tag);
++			}
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++			if (frame[0] <= fp) {
++				break;
++			}
++			fp = frame[0];
++		}
++		printf("%s\n", line);
++	}
++	if (thread == current_thread()) {
++		return;
++	}
++	if (thread->kernel_stack == 0) {
++		printf("FRZ %s kernel: no stack, continuation 0x%lx\n", tag, VM_KERNEL_UNSLIDE((vm_offset_t)thread->continuation));
++		return;
++	}
++	if (thread->machine.kstackptr == 0) {
++		return;
++	}
++	arm_kernel_saved_state_t *ks = &((thread_kernel_state_t)thread->machine.kstackptr)->machine.ss;
++	vm_offset_t lo = thread->kernel_stack, hi = thread->kernel_stack + kernel_stack_size;
++	uint64_t fp = ks->fp;
++	n = snprintf(line, sizeof(line), "FRZ %s kernel%s lr 0x%lx bt", tag, (thread->state & TH_RUN) ? " (on core?)" : "",
++	    VM_KERNEL_UNSLIDE((vm_offset_t)ks->lr));
++	for (int i = 0; i < 24 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; i++) {
++		uint64_t *frame = (uint64_t *)fp;
++		if (n > (int)sizeof(line) - 24) {
++			printf("%s\n", line);
++			n = snprintf(line, sizeof(line), "FRZ %s kernel bt+", tag);
++		}
++		n += snprintf(line + n, sizeof(line) - n, " 0x%lx", VM_KERNEL_UNSLIDE((vm_offset_t)frame[1]));
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	printf("%s\n", line);
++}
++
++/* 0120: every thread of a task (task_lock_try: a task whose lock is held is said so, not waited for) */
++void
++sweet_freeze_task(const char *name, int pid, task_t task)
++{
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	uint64_t slide = 0;
++	int tn = 0;
++	thread_t thread;
++
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	printf("FRZ %s[%d] slide 0x%llx mh 0x%llx kernel slide 0x%lx\n", name, pid, slide, task->mach_header_vm_address,
++	    vm_kernel_slide);
++	if (!task_lock_try(task)) {
++		printf("FRZ %s[%d]: its task lock is held: threads not walked\n", name, pid);
++		return;
++	}
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		char tag[40];
++		snprintf(tag, sizeof(tag), "%s t%d", name, tn++);
++		sweet_thread_dump(tag, thread);
++	}
++	task_unlock(task);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t

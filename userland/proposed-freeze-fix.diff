@@ -1,0 +1,85 @@
+--- a/userland/eagl-sweet.py
++++ b/userland/eagl-sweet.py
+@@ -75,5 +75,82 @@
+ 	e->attaching += now_us() - began;
+ 	if (attached++ < 24) {''')
+ 
++# 2. sweet: freeze watchdog -- which OpenGL ES entry CoreAnimation is stuck in.
++sub('#include <unistd.h>\n', '#include <pthread.h>\n#include <unistd.h>\n')
++
++WATCHDOG = '''static const char *eagl_slot_name(unsigned offset);
++/*
++ * sweet: a freeze watchdog. UI freezes: frames stop, the GPU is idle, touches arrive, no
++ * crash (logs/xnu-0101s0-20261106-blurfreeze.txt). Once caught by the kernel's sampler,
++ * backboardd's CoreAnimation thread was in glTexImage2D -> Mesa msm_bo_new -> GEM_NEW
++ * (logs/xnu-0101s0-freeze.txt). A thread of ours looks once a second at the entry a context
++ * is in: one that has run for 2 s or more is said once ("redwood-gl: FREEZE?"), with the frame
++ * and the size of the last glTexImage2D, so the log names the entry (the kernel's 0120 probe
++ * names the kernel side). Costs a few stores a call.
++ */
++static volatile unsigned watch_offset, watch_frame;
++static volatile uint64_t watch_since;           /* 0: no entry in progress */
++static volatile int watch_tex_w, watch_tex_h;   /* the last glTexImage2D's size */
++static pthread_once_t watch_once = PTHREAD_ONCE_INIT;
++
++static void *
++watch_main(void *arg)
++{
++	uint64_t told = 0;
++
++	(void)arg;
++	for (;;) {
++		sleep(1);
++		uint64_t since = watch_since, now = now_us();
++		if (since != 0 && since != told && now > since && now - since >= 2000000) {
++			told = since;
++			say("redwood-gl: FREEZE? %s has run for %llu ms (frame %u, last glTexImage2D %dx%d)\\n",
++			    eagl_slot_name(watch_offset), (unsigned long long)((now - since) / 1000), watch_frame, watch_tex_w,
++			    watch_tex_h);
++		} else if (since == 0 && told != 0) {
++			say("redwood-gl: the entry said to be stuck has returned\\n");
++			told = 0;
++		}
++	}
++	return NULL;
++}
++
++static void
++watch_start(void)
++{
++	pthread_t thread;
++
++	if (pthread_create(&thread, NULL, watch_main, NULL) == 0) {
++		pthread_detach(thread);
++	}
++}
++'''
++sub('static const char *eagl_slot_name(unsigned offset);\n', WATCHDOG)
++
++sub('''	slot_calls[offset / 8]++;
++	e->calls++;
++	e->gl_t0 = now_us();
++''', '''	slot_calls[offset / 8]++;
++	e->calls++;
++	e->gl_t0 = now_us();
++	pthread_once(&watch_once, watch_start);         /* sweet: freeze watchdog */
++	watch_offset = offset;
++	watch_frame = e->frames + 1;
++	watch_since = e->gl_t0;
++''')
++
++sub('''	GLenum error;
++
++	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {''', '''	GLenum error;
++
++	watch_since = 0;                                /* sweet: freeze watchdog */
++	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {''')
++
++sub('''	EAGL_ENTER(e, 0x970);
++	if (level == 0) {''', '''	EAGL_ENTER(e, 0x970);
++	watch_tex_w = width;                            /* sweet: freeze watchdog */
++	watch_tex_h = height;
++	if (level == 0) {''')
++
+ open(dst, 'w').write(c)
+ print('eagl-sweet: applied')

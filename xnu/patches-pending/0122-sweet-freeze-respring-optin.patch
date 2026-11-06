@@ -1,0 +1,103 @@
+Subject: [PATCH] sweet: sweetfreeze=2 kills a frozen backboardd (respring), opt-in
+
+With boot-arg sweetfreeze=2 the freeze probe (0120) asks, at its second dump
+of one freeze (24 s or more without a frame while touched), for backboardd
+to get SIGKILL once that dump is written; launchd starts it again (respring).
+Frames coming back are logged ("SWEET FREEZE: frames again after N s") and,
+with sweetfreeze=2, re-arm the probe for the next freeze. A thread that waits
+in the kernel uninterruptibly keeps backboardd from exiting, which then shows
+as no new backboardd in the log. Off by default (it hides the freeze).
+
+Applies after 0120, 0121 (series 0001..0112). Untested: not compiled locally.
+---
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -20,6 +20,8 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/OSAtomic.h>
++#include <sys/signal.h>
++#include <sys/signalvar.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -136,6 +138,35 @@ sweet_freeze_proc(proc_t p, __unused void *arg)
+ 	return PROC_RETURNED;
+ }
+ 
++/*
++ * 0122: boot-arg sweetfreeze=2: after the second dump of one freeze (the screen has then been
++ * frozen for 24 s or more while touched) backboardd gets SIGKILL; launchd starts it again,
++ * as after a crash (a respring). Its exit is logged by the CRASH/exit lines; a thread that
++ * waits in the kernel without being interruptible keeps it from going (that is then seen
++ * too: no new backboardd). Not on by default: it hides the freeze it ends.
++ */
++static int
++sweet_freeze_kill(proc_t p, __unused void *arg)
++{
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, "backboardd") == 0) {
++		printf("FRZ: backboardd[%d] killed (sweetfreeze=2)\n", proc_pid(p));
++		psignal(p, SIGKILL);
++	}
++	return PROC_RETURNED;
++}
++
++static volatile SInt32 sweet_freeze_kill_wanted;
++extern void sweet_freeze_kill_request(void);
++
++/* SweetFramebuffer.cpp, sweetfreeze=2, at the second dump of a freeze: backboardd goes when it is made */
++void
++sweet_freeze_kill_request(void)
++{
++	sweet_freeze_kill_wanted = 1;
++}
++
+ static void
+ sweet_freeze_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -143,6 +174,9 @@ sweet_freeze_thread(__unused void *arg, __unused wait_result_t wr)
+ 	redwood_gpu_inflight_report(500);
+ 	proc_iterate(PROC_ALLPROCLIST, sweet_freeze_proc, NULL, NULL, NULL);
+ 	printf("FRZ --- dump %d done\n", sweet_freeze_count);
++	if (OSCompareAndSwap(1, 0, (volatile UInt32 *)&sweet_freeze_kill_wanted)) {
++		proc_iterate(PROC_ALLPROCLIST, sweet_freeze_kill, NULL, NULL, NULL);
++	}
+ 	OSCompareAndSwap(1, 0, (volatile UInt32 *)&sweet_freeze_busy);
+ }
+ 
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,7 @@ extern "C" uint32_t redwood_gpu_pending_ms(void);                       /* 0097
+ extern "C" uint32_t redwood_gpu_inflight_ms(void);                      /* 0120, RedwoodGPU.cpp */
+ extern "C" void sweet_freeze_dump(const char *why);                     /* 0120, bsd/dev/sweet_sample.c */
+ extern "C" volatile uint32_t sweet_hid_touches;                         /* 0120, hid/SweetHID.cpp */
++extern "C" void sweet_freeze_kill_request(void);                        /* 0122, bsd/dev/sweet_sample.c */
+ extern "C" uint32_t redwood_gpu_last(void);
+ extern "C" void redwood_gpu_report(const char *why);
+ 
+@@ -555,9 +556,13 @@ AppleCLCD::statsReport(void)
+ 				PE_parse_boot_argn("sweetfreeze", &probe, sizeof(probe));
+ 			}
+ 			if (swaps != 0) {
++				if (dumps != 0 && quiet != 0) {
++					IOLog("SWEET FREEZE: frames again after %u s\n", quiet);
++				}
+ 				had_frames = true;
+ 				quiet = 0;
+ 				touches_then = touches;
++				dumps = dumps != 0 && probe == 2 ? 0 : dumps;     /* 0122: a new freeze after a respring is dumped too */
+ 			} else if (had_frames) {
+ 				quiet++;
+ 			}
+@@ -572,6 +577,9 @@ AppleCLCD::statsReport(void)
+ 				dumps++;
+ 				last_dump = now;
+ 				sweet_freeze_dump(why);
++				if (probe == 2 && dumps == 2) {
++					sweet_freeze_kill_request();    /* 0122 */
++				}
+ 			}
+ 		}
+ 		if (pending > 1000) {

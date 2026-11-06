@@ -1,0 +1,91 @@
+Subject: [PATCH] sweet: kept GPU buffers give way when GPU addresses or page tables run out
+
+SweetAdreno.cpp makes the GPU's level-3 page tables as addresses are first
+used (128 tables, 512 KiB of the pool: 256 MiB of GPU addresses at most) and
+never gives them back; RedwoodGPU keeps up to 160 MB of freed buffers for
+reuse, with their addresses. logs/xnu-0101s0-freeze.txt: 11 buffers of
+10-12 MB "cannot be entered into the GPU's address space" 55-75 s before the
+freeze (textures that were then missing). Now, out of addresses or tables,
+the kept buffers are dropped (their addresses lie under tables made already)
+and the mapping is tried once more. Addresses lost because the free list
+(1024 ranges) is full are logged instead of leaking silently.
+
+Series 0113 (drafted as pending 0121 on top of probe 0120; applies without it, offset only).
+---
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -798,21 +798,45 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 			break;
+ 		}
+ 	}
+-	if (b == NULL || (b->address = redwood_gpu_address(size)) == 0) {
+-		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+-		return NULL;
+-	}
+-	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
+-		IOByteCount length = 0;
+-		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+-
+-		mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
++	/*
++	 * 0121: the GPU's page tables are 128 tables made as addresses are first used and never
++	 * given back (SweetAdreno.cpp: 256 MiB of addresses at most), and kept buffers (up to
++	 * GPU_KEPT_BYTES) hold their addresses. Run 0101s0-freeze: 11 buffers of 10-12 MB could
++	 * not be entered (textures that then were not there). Out of addresses or of tables: the
++	 * kept buffers go (their addresses lie under tables made already) and it is tried again.
++	 */
++	for (int attempt = 0; b != NULL; attempt++) {
++		mapped = true;
++		if ((b->address = redwood_gpu_address(size)) != 0) {
++			for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++				IOByteCount length = 0;
++				addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
++
++				mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
++			}
++			redwood_gpu_mapped();
++			if (mapped) {
++				break;
++			}
++			redwood_gpu_unmap(b->address, size);
++			redwood_gpu_address_free(b->address, size);
++			b->address = 0;
++		}
++		if (attempt > 0 || fKeptBytes == 0) {
++			break;
++		}
++		static uint32_t dropped_told;
++		if (dropped_told++ < 16) {
++			IOLog("RedwoodGPU: no room in the GPU's address space for %llu bytes: the kept buffers (%llu MB) go\n", size,
++			    fKeptBytes >> 20);
++		}
++		for (uint32_t i = 0; i < GPU_KEPT; i++) {
++			dropKept(&fKept[i]);
++		}
+ 	}
+-	redwood_gpu_mapped();
+-	if (!mapped) {
+-		redwood_gpu_unmap(b->address, size);
+-		redwood_gpu_address_free(b->address, size);
+-		IOLog("RedwoodGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++	if (b == NULL || b->address == 0) {
++		IOLog("RedwoodGPU: a buffer of %llu bytes cannot be entered into the GPU's address space (%s)\n", size,
++		    b == NULL ? "no handles left" : "no addresses or page tables left");
+ 		return NULL;
+ 	}
+ 	b->size = size;
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -211,6 +211,12 @@ redwood_gpu_address_free(uint64_t address, uint64_t size)
+ 		memmove(&va_free[at + 1], &va_free[at], (va_free_count++ - at) * sizeof(va_free[0]));
+ 		va_free[at].start = address;
+ 		va_free[at].size = size;
++	} else {
++		/* 0121: the list is full: these addresses are lost for the run (said, not silent) */
++		static uint32_t lost_told;
++		if (lost_told++ < 8) {
++			IOLog("SweetAdreno: GPU address list full: %llu KB at 0x%llx lost\n", size >> 10, address);
++		}
+ 	}
+ }
+ 
