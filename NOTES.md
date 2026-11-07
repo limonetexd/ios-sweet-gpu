@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 (DeepSeek lead): C14 0144r booted (RTC read works, RTC stale); B2 0145 pushed <<<
+### >>> 2026-11-07 (DeepSeek lead): C14 0144r booted (RTC read works, RTC stale); B2 0145 failed, 0146 fix <<<
 
 **C14 / 0144r booted** (image `702facbd...`, 240 s reboot, ring `logs/xnu-0144r.txt`, 320 KB).
 The PM6150 RTC read works exactly as written:
@@ -15,10 +15,18 @@ The run itself: 33.6 swaps/s normal avg (p90 45), GL p50 10.1 / p95 28 ms, 0 fre
 
 **B2 / 0145 pushed** (commit `925197a`): `patches-pending/0124` promoted unchanged except the Subject
 number; applies on the 138-commit tree (`xnu-tree.sh update`: ok), `check-patch.py`: ok. CI
-`42384618325` in progress. Next: download `xnu-kernel`, build `0145r` with the 0143r recipe
-(`SWEETFB_HZ=60 SWEET_SERIAL=0 tools/sweet-gpu-image.sh xnu/out-0145 0145r "sweetgpu_reboot=420
+`42384618325` **failed at Build** (12m57s):
+`SweetAdreno.cpp:743: no matching function for call to 'kmem_alloc_contig'` (the 7th argument is
+`uint32_t`, the current signature wants `kma_flags_t`) and
+`SweetAdreno.cpp:747: use of undeclared identifier 'pmap_find_phys'` (declared in
+`osfmk/arm/pmap/pmap.h`, which the IOKit file does not include).
+**0146** fixes both without touching 0145: cast `(kma_flags_t)(KMA_DATA | KMA_ZERO)` and declare
+`ppnum_t pmap_find_phys(pmap_t, addr64_t)` in the existing `extern "C"` block. Patch generated,
+`check-patch.py`: ok, apply check on the tree without the edits: ok. CI for 0146 in progress.
+Next: download `xnu-kernel` to `xnu/out-0146`, build `0146r` with the 0143r recipe
+(`SWEETFB_HZ=60 SWEET_SERIAL=0 tools/sweet-gpu-image.sh xnu/out-0146 0146r "sweetgpu_reboot=420
 sweetgpu_swipe=60 sweetshot=90"`), run the unattended test, check `SWEET GPU: VA window 512 MiB`,
-0 refusals, 0 `SWEET FREEZE: RedwoodGPU`, same or better fps.
+0 refusals, 0 `SWEET FREEZE: RedwoodGPU`, same or better fps than 0143r (36.0 avg, p90 38).
 
 ### >>> 2026-11-07 (DeepSeek lead): A7/A8 done, C14 RTC patch 0144 <<<
 

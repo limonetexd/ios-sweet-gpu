@@ -1,0 +1,43 @@
+From: HakiOS
+Subject: [PATCH 0146] sweet gpu: fix the 0145 build (kma_flags_t cast, pmap_find_phys declaration)
+
+0145 was mechanically correct but CI 42384618325 stopped at Build:
+
+  SweetAdreno.cpp:743: error: no matching function for call to 'kmem_alloc_contig'
+    note: no known conversion from 'uint32_t' to 'kma_flags_t' for 7th argument
+  SweetAdreno.cpp:747: error: use of undeclared identifier 'pmap_find_phys'
+
+kmem_alloc_contig now takes kma_flags_t (an __options_decl type), so
+KMA_DATA | KMA_ZERO yields a plain uint32_t; cast the OR to kma_flags_t.
+pmap_find_phys is declared in osfmk/arm/pmap/pmap.h, which the IOKit file
+does not include; declare it in the existing extern "C" block so the C
+symbol is not mangled.
+
+Behavior is unchanged: same 1.25 MiB contiguous allocation, same
+write-combined table mapping, same 128-table pool fallback. This only
+lets 0145 compile; 0146 must be applied after 0145.
+
+Log check: build succeeds; at boot the ring must still print
+"SWEET GPU: VA window 512 MiB" with zero refusals.
+---
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index 5895b49..cd21b64 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -34,6 +34,7 @@
+ extern "C" {
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
+ void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
+ vm_offset_t sweet_gpu_regs(void);       /* bsd/dev/sweet_gpu.c */
+ vm_offset_t sweet_gpu_shared(void);
+@@ -741,7 +742,7 @@ sweet_adreno_start(void)
+ 	 */
+ 	vm_offset_t ext_kva = 0;
+ 	if (kmem_alloc_contig(kernel_map, &ext_kva, TABLES_EXT_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	    (kma_flags_t)(KMA_DATA | KMA_ZERO), VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		IOLog("SWEET GPU: no 1.25 MiB contiguous XNU memory for tables: 128 in the pool\n");
+ 	} else {
+ 		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ext_kva);
