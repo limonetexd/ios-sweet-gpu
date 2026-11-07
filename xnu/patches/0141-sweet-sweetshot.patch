@@ -1,0 +1,344 @@
+From: HakiOS
+Subject: [PATCH 0141] 0141 sweetshot: kernel screenshots into the log ring
+
+What: a low-priority kernel thread in AppleCLCD point-samples the panel
+memory (every sweetshot_div-th pixel and row, default 6: 1080x2400 -> 180x400),
+converts to RGB565, PackBits-compresses over 16-bit words, FNV-1a-checksums it,
+and writes it to the persistent log as base64 lines ("SWEET SHOT n begin ..." /
+"SWEET SHOT n SEQ4 ..." / "SWEET SHOT n end"), which tools/sweet-shot.py (A4)
+reassembles into a PNG. Boot-args: sweetshot=N seconds between timer shots
+(0 = off), sweetshot_max shots a boot (default 8), sweetshot_div the sample
+step. The freeze probe (next to sweet_freeze_dump) and Vol+ and Vol- held
+together (SweetHIDButtons::key) also ask for a shot, so the thread runs even
+with sweetshot=0. Buffers are IOMallocData/IOFreeData; the thread never takes
+fLock and skips while fPowerOff or fPixels == 0.
+
+Why: there is no way to see the screen during an unattended run (the 750
+layout was never seen). The panel memory is readable by the kernel, so a
+small picture can go into the log ring.
+
+Proof: the log line "SWEET SHOT: every N s, max M, div D, panel WxH" once at
+start, and "SWEET SHOT 1 begin ..." / "SWEET SHOT 1 end" around each shot.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4150baa..bb12f3b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -161,6 +161,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	bool                fTickBound;         /* 0152: the vsync tick's thread is on its processor */
+ 	static void statsMain(void *self, wait_result_t result);
+ 	void statsReport(void);
++	static void shotMain(void *self, wait_result_t result);
++	void shotLoop(void);
+ 	static void copyHelperMain(void *self, wait_result_t result);
+ 	void copyHelper(void);
+ 	static void presenterMain(void *self, wait_result_t result);
+@@ -290,6 +292,223 @@ sweet_dt_u32(IORegistryEntry *entry, const char *key)
+ 	return value;
+ }
+ 
++/*
++ * 0141: sweetshot. A low-priority kernel thread puts a small point-sampled picture of the
++ * panel into the log ring (SWEET SHOT lines, reassembled by tools/sweet-shot.py). Boot-args:
++ * sweetshot=N seconds between timer shots (0 = none), sweetshot_max shots a boot (default 8),
++ * sweetshot_div the point-sample step (default 6: 1080x2400 -> 180x400). The freeze probe and
++ * the Vol+ / Vol- chord also ask for one (sweet_fb_shot_request), so the thread runs even with
++ * sweetshot=0. The picture is RGB565, PackBits-compressed over 16-bit words, base64 in the log.
++ */
++static AppleCLCD       *sweet_fb_shot_fb;        /* the framebuffer (set in start) */
++static uint32_t         sweet_fb_shot_every;     /* seconds between shots, 0 = off */
++static uint32_t         sweet_fb_shot_max = 8;   /* shots taken per boot */
++static uint32_t         sweet_fb_shot_div = 6;   /* point-sample step */
++static uint32_t         sweet_fb_shot_count;     /* shots taken so far */
++static volatile uint32_t sweet_fb_shot_pending;  /* a shot was asked for */
++static char             sweet_fb_shot_why[32];   /* that shot's reason */
++
++/* 0141: ask the shot thread for a picture (the freeze probe; the Vol+ / Vol- chord). */
++extern "C" void
++sweet_fb_shot_request(const char *why)
++{
++	if (sweet_fb_shot_fb == NULL || sweet_fb_shot_max == 0) {
++		return;
++	}
++	snprintf(sweet_fb_shot_why, sizeof(sweet_fb_shot_why), "%s", why);
++	__atomic_store_n(&sweet_fb_shot_pending, 1, __ATOMIC_RELEASE);
++}
++
++static const char sweet_fb_b64[] =
++    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++/* base64 of len bytes into out (4 chars per 3 bytes, '=' padding; out is 4*((len+2)/3)+1). */
++static void
++sweet_fb_base64(const uint8_t *in, uint32_t len, char *out)
++{
++	uint32_t i = 0, o = 0;
++
++	while (i + 3 <= len) {
++		out[o++] = sweet_fb_b64[in[i] >> 2];
++		out[o++] = sweet_fb_b64[((in[i] & 3) << 4) | (in[i + 1] >> 4)];
++		out[o++] = sweet_fb_b64[((in[i + 1] & 15) << 2) | (in[i + 2] >> 6)];
++		out[o++] = sweet_fb_b64[in[i + 2] & 63];
++		i += 3;
++	}
++	if (len - i == 1) {
++		out[o++] = sweet_fb_b64[in[i] >> 2];
++		out[o++] = sweet_fb_b64[(in[i] & 3) << 4];
++		out[o++] = '=';
++		out[o++] = '=';
++	} else if (len - i == 2) {
++		out[o++] = sweet_fb_b64[in[i] >> 2];
++		out[o++] = sweet_fb_b64[((in[i] & 3) << 4) | (in[i + 1] >> 4)];
++		out[o++] = sweet_fb_b64[(in[i + 1] & 15) << 2];
++		out[o++] = '=';
++	}
++	out[o] = '\0';
++}
++
++/* FNV-1a 32-bit over len bytes (the RGB565 words, low byte first). */
++static uint32_t
++sweet_fb_fnv(const uint8_t *bytes, uint32_t len)
++{
++	uint32_t sum = 2166136261u;
++
++	for (uint32_t i = 0; i < len; i++) {
++		sum ^= bytes[i];
++		sum *= 16777619u;
++	}
++	return sum;
++}
++
++/*
++ * PackBits over 16-bit words: a control byte 0..127 copies c+1 literal words, 129..255
++ * repeats the next word 257-c times, 128 is unused. Returns the bytes written to out.
++ */
++static uint32_t
++sweet_fb_packbits(const uint16_t *words, uint32_t n, uint8_t *out)
++{
++	uint32_t op = 0, i = 0;
++
++	while (i < n) {
++		uint32_t run = 1;
++		while (i + run < n && words[i + run] == words[i] && run < 128) {
++			run++;
++		}
++		if (run >= 3) {
++			out[op++] = (uint8_t)(257 - run);
++			out[op++] = (uint8_t)(words[i] & 0xff);
++			out[op++] = (uint8_t)(words[i] >> 8);
++			i += run;
++		} else {
++			uint32_t start = i, lit = 0;
++			while (i < n && lit < 128) {
++				uint32_t r = 1;
++				while (i + r < n && r < 3 && words[i + r] == words[i]) {
++					r++;
++				}
++				if (r >= 3) {
++					break;
++				}
++				i++;
++				lit++;
++			}
++			out[op++] = (uint8_t)(lit - 1);
++			for (uint32_t k = 0; k < lit; k++) {
++				out[op++] = (uint8_t)(words[start + k] & 0xff);
++				out[op++] = (uint8_t)(words[start + k] >> 8);
++			}
++		}
++	}
++	return op;
++}
++
++/*
++ * 0141: one shot: point-sample the panel, PackBits it, write it to the ring in base64 lines
++ * the decoder reassembles. Runs on the shot thread, never under fLock, never on a swap path.
++ */
++static void
++sweet_fb_shot_take(const char *why)
++{
++	AppleCLCD *fb = sweet_fb_shot_fb;
++	uint32_t div = sweet_fb_shot_div;
++	uint32_t w, h, words, sum, packedLen, n, seq, out;
++	uint16_t *rgb;
++	uint8_t *packed;
++	char reason[32];
++	uint64_t ms = 0;
++
++	if (fb == NULL || fb->fPixels == 0 || fb->fPowerOff || div == 0) {
++		return;
++	}
++	w = (fb->fWidth + div - 1) / div;
++	h = (fb->fHeight + div - 1) / div;
++	if (w == 0 || h == 0) {
++		return;
++	}
++	words = w * h;
++	snprintf(reason, sizeof(reason), "%s", why);
++	rgb = (uint16_t *)IOMallocData(words * sizeof(uint16_t));
++	if (rgb == NULL) {
++		return;
++	}
++	out = 0;
++	for (uint32_t y = 0; y < fb->fHeight; y += div) {
++		const uint8_t *row = (const uint8_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++		for (uint32_t x = 0; x < fb->fWidth; x += div) {
++			uint32_t b = row[x * 4 + 0];
++			uint32_t g = row[x * 4 + 1];
++			uint32_t r = row[x * 4 + 2];
++			rgb[out++] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
++		}
++	}
++	sum = sweet_fb_fnv((const uint8_t *)rgb, words * 2);
++	packed = (uint8_t *)IOMallocData(words * 3 + 4);
++	if (packed == NULL) {
++		IOFreeData(rgb, words * sizeof(uint16_t));
++		return;
++	}
++	packedLen = sweet_fb_packbits(rgb, words, packed);
++	IOFreeData(rgb, words * sizeof(uint16_t));
++	n = sweet_fb_shot_count + 1;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ms);
++	ms /= 1000000;
++	IOLog("SWEET SHOT %u begin %ux%u rgb565 packbits %u sum %08x why %s t %llu\n",
++	    n, w, h, packedLen, sum, reason, ms);
++	seq = 0;
++	for (uint32_t off = 0; off < packedLen; off += 75) {
++		uint32_t chunk = packedLen - off < 75 ? packedLen - off : 75;
++		char b64[101];
++		sweet_fb_base64(packed + off, chunk, b64);
++		IOLog("SWEET SHOT %u %04x %s\n", n, seq, b64);
++		seq++;
++		if ((seq & 31) == 0) {
++			IOSleep(1);     /* let the 4 MiB ring and the UFS flush keep up */
++		}
++	}
++	IOLog("SWEET SHOT %u end\n", n);
++	sweet_fb_shot_count = n;
++	IOFreeData(packed, words * 3 + 4);
++}
++
++void
++AppleCLCD::shotMain(void *self, wait_result_t result __unused)
++{
++	((AppleCLCD *)self)->shotLoop();
++}
++
++/* 0141: every 250 ms, a timer shot (sweetshot) or a requested one (freeze, Vol+/Vol-). */
++void
++AppleCLCD::shotLoop(void)
++{
++	uint64_t last = 0;
++
++	for (;;) {
++		const char *why = NULL;
++		IOSleep(250);
++		if (sweet_fb_shot_count >= sweet_fb_shot_max || fPixels == 0) {
++			continue;
++		}
++		if (__atomic_exchange_n(&sweet_fb_shot_pending, 0, __ATOMIC_ACQUIRE) != 0) {
++			why = sweet_fb_shot_why;
++		} else if (sweet_fb_shot_every != 0) {
++			uint64_t now = mach_absolute_time(), since = 0;
++			if (last == 0) {
++				last = now;
++			}
++			absolutetime_to_nanoseconds(now - last, &since);
++			if (since >= (uint64_t)sweet_fb_shot_every * NSEC_PER_SEC) {
++				last = now;
++				why = "timer";
++			}
++		}
++		if (why != NULL) {
++			sweet_fb_shot_take(why);
++		}
++	}
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -413,6 +632,26 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 
++	/*
++	 * 0141: sweetshot. The low-priority shot thread runs even when sweetshot=0 (the freeze
++	 * probe and the Vol+ / Vol- chord also ask for a shot, at most sweetshot_max a boot).
++	 */
++	sweet_fb_shot_fb = this;
++	PE_parse_boot_argn("sweetshot", &sweet_fb_shot_every, sizeof(sweet_fb_shot_every));
++	PE_parse_boot_argn("sweetshot_max", &sweet_fb_shot_max, sizeof(sweet_fb_shot_max));
++	PE_parse_boot_argn("sweetshot_div", &sweet_fb_shot_div, sizeof(sweet_fb_shot_div));
++	if (sweet_fb_shot_div == 0) {
++		sweet_fb_shot_div = 1;
++	}
++	IOLog("SWEET SHOT: every %u s, max %u, div %u, panel %ux%u\n",
++	    sweet_fb_shot_every, sweet_fb_shot_max, sweet_fb_shot_div, fWidth, fHeight);
++	if (sweet_fb_shot_max != 0) {
++		thread_t thread;
++		if (kernel_thread_start(&AppleCLCD::shotMain, this, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
++
+ 	/*
+ 	 * 0144: boot-arg sweetfb_beam=1 reads the display interface's frame and line counters once,
+ 	 * ten seconds after start, and logs the panel's real refresh rate and lines ("SWEET BEAM:");
+@@ -825,6 +1064,7 @@ AppleCLCD::statsReport(void)
+ 				dumps++;
+ 				last_dump = now;
+ 				sweet_freeze_dump(why);
++				sweet_fb_shot_request("freeze");
+ 				if (probe == 2 && dumps == 2) {
+ 					sweet_freeze_kill_request();    /* 0122 */
+ 				}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 265f620..7c4da20 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -31,6 +31,7 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++extern "C" void sweet_fb_shot_request(const char *why);   /* 0141, SweetFramebuffer.cpp */
+ 
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -340,6 +341,7 @@ private:
+ 	IOTimerEventSource *fTest;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
++	bool fVolUp, fVolDown;     /* 0141: the Vol+ / Vol- sweetshot chord */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ 
+@@ -392,6 +394,7 @@ SweetHIDButtons::start(IOService *provider)
+ 			fTest->setTimeoutMS(fTestSecs * 1000);
+ 		}
+ 	}
++	fVolUp = fVolDown = false;
+ 	gSweetButtons = this;
+ 	registerService();
+ 	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
+@@ -403,6 +406,21 @@ SweetHIDButtons::key(UInt32 usage, bool down)
+ {
+ 	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
+ 
++	/*
++	 * 0141: Vol+ and Vol- held together asks the kernel for a screenshot (sweetshot). The
++	 * chord is seen on the down of the second key; the release of either clears it.
++	 */
++	if (usage == kHIDUsage_Csmr_VolumeIncrement || usage == kHIDUsage_Csmr_VolumeDecrement) {
++		if (usage == kHIDUsage_Csmr_VolumeIncrement) {
++			fVolUp = down;
++		} else {
++			fVolDown = down;
++		}
++		if (down && fVolUp && fVolDown) {
++			sweet_fb_shot_request("volboth");
++		}
++	}
++
+ 	if (event) {
+ 		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
+ 		    _clients ? _clients->getCount() : 0);
