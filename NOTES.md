@@ -11,19 +11,21 @@
   superseded by the clean `0125-0127`; leave them. Wi-Fi drafts `patches-pending/0130-0137` must
   be renumbered **0132-0139** when promoted, because 0130/0131 are now the presenter fix and the
   scaled-copy column map.
-- Latest tested kernel **0130**: image `shim-boot-0130r.img` SHA
-  `9c0bb0d2e1706eb3774932a5787f714085de7b4df1caf98c21acb65a28e82c1c`; manual
-  `shim-boot-0130s0.img` SHA `f15ba7dce5a2fc59cf985b135c039143afbc62b2720fd87be9fa7a86c26088b5`;
-  log `logs/xnu-0130r.txt`; CI 42311771101 (12m15s). Old-ADT fallback `0123s0` SHA
+- Latest built kernel **0131**: CI 42314190705 success 19m36s; `shim-boot-0131r.img` SHA
+  `2f169858adff9352e2d589a186ef90242ad845831bc7a2086d8c1a72a9f23d34`, `shim-boot-0131s0.img` SHA
+  `b1ad220ff83229bc379bdcbb8058f1a50e6fa884d5512018227bd55875be4cce`; unattended test started
+  -> `logs/xnu-0131r.txt` (result not written yet). Latest measured: **0130**: `0130r` SHA
+  `9c0bb0d2e1706eb3774932a5787f714085de7b4df1caf98c21acb65a28e82c1c`, `0130s0` SHA
+  `f15ba7dce5a2fc59cf985b135c039143afbc62b2720fd87be9fa7a86c26088b5`, log `logs/xnu-0130r.txt`;
+  CI 42311771101 (12m15s). Old-ADT fallback `0123s0` SHA
   `6f7e8357c9ff0777ab3c295f1633b79db9bf413d9fcfc03e0efb3d30bc6168aa` (1125x2436, bind default).
 - **Render scale works** (0129, default `sweetfb_scale=2`; `mkadt.py` `display-scale=2`, canvas
   750x1624): `SWEET FB: modes published: 750x1624 at 60 Hz`; CA surfaces 750x1624 (6,144,000 B),
   wired 47 MB; GL frame p50 **7.21 ms**, p90 **8.64**, p95 **9.59** (was 13.1/21.5). New
   bottleneck: `present` **11.4 ms** average, from the per-pixel divide in the scaled band copy;
   swaps active avg 29.2, p50 30, p90 **51**, max 53. **0131** precomputes a source-column map
-  (`scaleX`) and is in CI **42314190705** (started after 0130). Next: download `xnu/out-0131`,
-  build `0131r` (`SWEETFB_HZ=60`, `sweetgpu_reboot=420 sweetgpu_swipe=60`), run
-  `tools\sweet-probe-loop.ps1 -ProbeSeconds 540 -Xnu`; target present 4-5 ms and higher swaps.
+  (`scaleX`); CI 42314190705 success 19m36s; `0131r`/`0131s0` built and `0131r` is running
+  unattended (`logs/xnu-0131r.txt`). Next: analyze present/swaps; target 4-5 ms and higher swaps.
 - **Defaults/AB** (all in `logs/`): 0123 `sweetfb_bind=1` on (26.0 vs 21.7 avg, p90 41 vs 33);
   `ca_vbl=1` no gain (26.2/39, `xnu-0122bc.txt`); `sweetfb_threads=6` no gain (25.7/40,
   `xnu-0122bt6.txt`); `sweetfb_rate=120` worse (25.4/38, `xnu-0122b120.txt`). 0122 pool clamp
@@ -41,9 +43,10 @@
   0123+0125-0127; renumber to 0132-0139; wland patch 0002 is mandatory; boot order
   `sweetpmem=1 sweetsmmuwlan=2` first, then `sweetsmmuwlan=1`, then `sweetwifid=1` + root; root
   side in gpu3. Reports are gitignored but present under `reports/`.
-- **Phone**: fastboot after the 0130r ring pull. 0130r has the known `driverkitd` sig 9 boot crash
-  only; no `SWEET FREEZE: RedwoodGPU`, no pool zeroing. One push per batch; a push starts `xnu.yml`
-  by itself (never also `gh workflow run`).
+- **Phone**: `0131r` unattended test running (kernel 0131, ADT 750; returns to fastboot/recovery
+  around 420 s after boot). 0130r had only the known `driverkitd` sig 9 boot crash, no
+  `SWEET FREEZE: RedwoodGPU`, no pool zeroing. One push per batch; a push starts `xnu.yml` by
+  itself (never also `gh workflow run`).
 
 **0130r unattended (observed): render scale works; the scaled present is the new bottleneck.** [O]
 Kernel 0130 (batch 0125-0130, CI 42311771101 success 12m15s), image `0130r`
