@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 (DeepSeek lead): C1 Wi-Fi fixed as a single 0147; CI 42403022012 <<<
+### >>> 2026-11-07 (DeepSeek lead): C1 0147+0154+0155+0156; CI 42404108358 <<<
 
 **CI `42398886992` failed** (commit `974c282`): the seven drafted patches did not build.
 Root causes: `sweet_rpmh.c` called `rh_lookup_ex`/`rh_send_n`/`RH_BCM` (never existed) and used a
@@ -30,6 +30,29 @@ CI run `42403216310` (commit `ec63a90`) is the one to watch. If it succeeds: dow
 `gh run download 42403216310 -R limonetexd/ios-sweet-gpu -n xnu-kernel -D xnu/out-0154`, build the
 rung-1 image (`sweetpmem=1 sweetsmmuwlan=2`, low risk) and test with the user present; rung 2
 (`=1`) may stall a CPU and needs a manual force-reboot if it dies.
+
+**Research round (4 agents, 2026-11-07 late):** the Wi-Fi agent found two functional (not compile)
+blockers in 0147, now fixed by `0155` (commit `eaf1a58`): (a) 0147 shipped `/dev/pmem` **without**
+`PMEM_RPMH`, so wland's first `pm_rpmh()` got ENOTTY and exited; (b) `rh_lookup()` accepted only VRM
+(slave 4), but BCM SN15/CN0 are slave 5 and cx.lvl/mss.lvl are ARC slave 3. 0155 adds the ioctl and a
+typed lookup (alignment 16 for VRM, 4 for ARC/BCM) and a whitelist of the WCN3990/modem rails
+(ldoa9/ldoc1/ldoc2/ldoc10, donor ldoa1/ldoa7/ldoc11, rfclka2, cx.lvl/mss.lvl; everything else,
+including touch L11C, refused). `0156` adds `sweetepoch=` (stamped by `tools/sweet-gpu-image.sh`,
+`SWEET_EPOCH` override): the PM6150 RTC is a free-running counter (`qcom,qpnp-rtc-write = 0`), so the
+image now carries the host's Unix time and `SweetBattery::start()` applies it before the 0144 RTC
+fallback. Expected clock line: `SWEET RTC: calendar set from sweetepoch: 17xxxxxxxx`. Timezone is
+separate: gpu2 localtime points at US/Pacific.
+
+Both apply clean (xnu-tree: 143 commits), check-patch ok. CI `42404108358` (commit `eaf1a58`) is the
+run to watch; the older `42403216310` is superseded.
+
+**Other agent findings:** (apps) SpringBoard stable, no app crashes in the newest rings; PosterBoard
+last crashed on 0131r and its root cause is unregistered app extensions (B4/B13) plus AMFI selector
+`0x60` (sunfish maps it to `0x86`; our 0084 only answers `0x5a`); Photos needs sandbox ops 5/6 (B8).
+(60 FPS) native is render-bound: ~32 swaps/s sustained, 42 % of swaps miss the vsync tick; the only
+measured 60-capable setup is the scaled 750x1624 path; a DDR/NoC vote at GPU start and the presenter
+thread are the next candidates. (clock) confirmed `timed` is stock and entitled; it will set the
+clock once Wi-Fi/configd reaches the network.
 
 Four research agents were launched (Wi-Fi C2/C3 remainder, clock path, 60 FPS/PosterBoard, apps
 status); their reports update the roadmap when they land.
