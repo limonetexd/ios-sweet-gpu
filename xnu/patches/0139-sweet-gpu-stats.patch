@@ -1,0 +1,74 @@
+From: HakiOS
+Subject: [PATCH 0139] sweet-gpu: the statistics line right, and the first whole cleans counted
+
+"The GPU worked N us on each of M" divided N by M although redwood_gpu_worked() already
+returns the average (worked_us / worked_n), and "ms in all" divided that average by 1000
+instead of multiplying by the count: both numbers were wrong. The single IOLog was also
+cut at 256 characters, so the end of it never reached the log, which is what A5 needs to
+judge the cache cleaning.
+
+Print the average, the total as average * count / 1000, and split the line in three
+(each under 200 characters): (a) submissions, command buffers, buffers named, KB out of
+the cache, us per submission and the whole cleans; (b) the GPU time (average, count, the
+seven buckets); (c) waits, over, IOSurfaces, buffers and MB.
+
+toMemoryWritten() now counts, when the whole-buffer flag is still clear at entry (a new
+surface, or a buffer's first flush), the buffer in gGPUStat.wholeCleans and its size in
+gGPUStat.wholeBytes, both zeroed with the rest by bzero(&gGPUStat, ...), and (a) prints
+them as "N first cleans of M MB".
+
+Proof in the log, every five seconds in which something was submitted:
+
+  RedwoodGPU: 1204 submissions in 5001 ms: 1500 command buffers and 3400 buffers named, 980 KB out of the cache in 4100 us a submission; 3 first cleans of 24 MB
+  RedwoodGPU: the GPU worked 812 us on each of 1204 (0 under 0.1 ms, 2 under 0.25, 40 under 0.5, 1100 under 1, 60 under 2, 2 under 4, 0 longer; 977 ms in all)
+  RedwoodGPU: 12 waits of 320 us, 0 over before they began; 60 IOSurfaces taken as buffers in 210 us each; 900 buffers, 120 MB
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index f6fbd6d..8d9ddeb 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -194,7 +194,8 @@ static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+ /* What the last seconds' submissions were and cost here, for the log. */
+ static struct {
+ 	uint64_t since, flushing, waiting, taking;      /* times of the processor's clock */
+-	uint64_t flushed;                       /* bytes sent out of the cache */
++	uint64_t flushed, wholeBytes;           /* bytes sent out of the cache, and of the first cleans, how big those buffers were */
++	uint32_t wholeCleans;                   /* buffers every page of which was pushed out once (the first time) */
+ 	uint32_t submissions, commands, buffers, surfaces, waits, over;
+ 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
+@@ -1166,6 +1167,12 @@ toMemoryWritten(struct gpu_buffer * b)
+ 	/* a surface is a new buffer every time a program takes it again (each frame): its own flag */
+ 	bool * whole = b->surface != NULL ? &b->surface->cleanOnce : &b->whole;
+ 
++	if (!*whole) {
++		/* 0139: the first time, every page is pushed out (see below): how many such buffers and how big */
++		gGPUStat.wholeCleans++;
++		gGPUStat.wholeBytes += b->size;
++	}
++
+ 	for (uint64_t off = 0; off < b->size; off += PAGE_SIZE) {
+ 		IOByteCount len = 0;
+ 		addr64_t pa = b->memory->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
+@@ -1343,13 +1350,16 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
+ 		IOLog("RedwoodGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n", gGPUStat.made,
+ 		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
+-		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
+-		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
+-		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
+-		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB\n",
++		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the "
++		    "cache in %llu us a submission; %u first cleans of %llu MB\n",
+ 		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
+ 		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
+-		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
++		    gGPUStat.wholeCleans, gGPUStat.wholeBytes >> 20);
++		IOLog("RedwoodGPU: the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
++		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all)\n",
++		    worked, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked * timed / 1000);
++		IOLog("RedwoodGPU: %u waits of %llu us, %u over before they began; %u IOSurfaces taken as buffers in "
++		    "%llu us each; %u buffers, %llu MB\n",
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+ 		    fBufferBytes >> 20);
