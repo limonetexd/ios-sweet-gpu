@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 (DeepSeek lead): C1 0147+0154+0155+0156; CI 42404108358 <<<
+### >>> 2026-11-07 (DeepSeek lead): rung 1 PASSED; clock fix 0159; CI 42407117041 <<<
 
 **CI `42398886992` failed** (commit `974c282`): the seven drafted patches did not build.
 Root causes: `sweet_rpmh.c` called `rh_lookup_ex`/`rh_send_n`/`RH_BCM` (never existed) and used a
@@ -30,6 +30,27 @@ CI run `42403216310` (commit `ec63a90`) is the one to watch. If it succeeds: dow
 `gh run download 42403216310 -R limonetexd/ios-sweet-gpu -n xnu-kernel -D xnu/out-0154`, build the
 rung-1 image (`sweetpmem=1 sweetsmmuwlan=2`, low risk) and test with the user present; rung 2
 (`=1`) may stall a CPU and needs a manual force-reboot if it dies.
+
+**RUNG 1 PASSED (2026-11-07 20:26, image `shim-boot-0156r.img` = CI `42404108358` kernel + `sweetpmem=1
+sweetsmmuwlan=2`, ring `logs/xnu-0156r-rung1.txt`, 813 KB):**
+`SWEET PMEM: /dev/pmem ready (major 19)` · `SWEET RPMH: BCM SN15 addr=0x5007c vote 0x60004001 -> 0` ·
+`SWEET RPMH: BCM CN0 addr=0x500a8 vote 0x60004001 -> 0` · `SWEET SMMU: BCM votes SN15=0 CN0=0
+(sweetsmmuwlan=2)` · `SWEET RTC: calendar set from sweetepoch: 1794079567` · SpringBoard reached, FPS
+ticking, touch alive, no panic (only the known `driverkitd sig 9`). 0155 is validated on hardware: the
+typed lookup and PMEM_RPMH work, and the whitelist accepted the BCM votes.
+
+**Clock still wrong in userland:** launchd/SpringBoard logged 1969-12-31. Cause: `PE_lockdown_iokit()`
+starts IOKit matching before `bsd_init`, so `SweetBattery::start()` applied sweetepoch, and then
+`bsd_init -> IOKitInitializeTime -> clock_initialize_calendar()` replaced the calendar with the
+platform RTC's (no IORTC -> 0). `0159` re-applies sweetepoch right after `clock_initialize_calendar()`
+(then drops the ineffective early battery call). Pushed with `0157` (AMFI 0x60 -> 0x86 for
+ExtensionKit/PosterBoard) and `0158` (`sweetfb_scale=2` opt-in scaled 60 FPS path) in commit `e5a0e26`;
+CI `42407117041` queued.
+
+**Next:** CI green -> download `xnu/out-0159` -> rung-2 image (`sweetpmem=1 sweetsmmuwlan=1`, the
+prebuilt `shim-boot-0156r2.img` uses the old kernel and must be rebuilt) -> user present, because the
+SMMU stream can stall a CPU (Power+Vol- to recover). The ring must show the WLAN SMMU stream lines and
+a 2026 date.
 
 **Research round (4 agents, 2026-11-07 late):** the Wi-Fi agent found two functional (not compile)
 blockers in 0147, now fixed by `0155` (commit `eaf1a58`): (a) 0147 shipped `/dev/pmem` **without**

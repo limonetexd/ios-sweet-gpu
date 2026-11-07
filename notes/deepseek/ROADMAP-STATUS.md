@@ -47,7 +47,7 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | C14 | system time not set (RTC/NTP/timed) | DOING | 2026-11-07 | 0144r: PM6150 RTC read works but returns 53802463 s = 1971-09-15 (RTC is a free-running counter, DT qcom,qpnp-rtc-write=0). 0156 sets the calendar from sweetepoch= stamped by tools/sweet-gpu-image.sh; CI 42404108358. NTP via stock timed waits for C1/C3. Ring logs/xnu-0144r.txt |
 | B13 | flash gpu3 | BLOCKED | | Q4: user's explicit OK |
 | B14 | wallpaper / extensions verification | TODO | | after B13 |
-| C1 | promote the 8 Wi-Fi drafts + boot ladder | DOING | 2026-11-07 | 0147 regenerated (commit 1ce29b4); 0154 scope/sender fix (ec63a90); 0155 PMEM_RPMH + typed BCM/ARC lookup + rail whitelist (eaf1a58); 0156 sweetepoch clock (eaf1a58). All apply clean (xnu-tree 143 commits), check-patch ok. CI 42404108358 building. Rung 1 pending kernel; rung 2 may stall CPU |
+| C1 | promote the 8 Wi-Fi drafts + boot ladder | DOING | 2026-11-07 | **rung 1 PASSED**: kernel out-0156 + sweetpmem=1 sweetsmmuwlan=2 -> /dev/pmem ready, BCM SN15/CN0 -> 0, SMMU votes 0, no panic (logs/xnu-0156r-rung1.txt). 0159 (epoch after clock_initialize_calendar) + 0157 (AMFI 0x86) + 0158 (sweetfb_scale opt-in) in CI 42407117041. Rung 2 (sweetsmmuwlan=1) next; may stall CPU |
 | C2 | ADT --wlan + Wi-Fi root files | TODO | | |
 | C3 | Wi-Fi bring-up verification | TODO | | after B13, C1 rung 3 |
 | C4 | battery verification and polish | TODO | | |
