@@ -21,7 +21,7 @@ NOTES.md entry title. Cards: `ROADMAP-2026-11-07.md` (A), `-B-near.md`, `-C-conn
 | A3 | 0141 sweetshot kernel screenshots | TODO | | after A2 (same files) |
 | A4 | `tools/sweet-shot.py` decoder | TODO | | spec in A3/A4 cards |
 | A5 | 0142 background clean of recycled surface memory | TODO | | after A2 |
-| A6 | shim CPU max + 0143 thermal log | TODO | | 0143 after A3 |
+| A6 | shim CPU max + 0143 thermal log | DOING | 2026-11-07 | part 1 SHIM_CPUMAX built; 0143 thermal after A3 |
 | A7 | batch gate: push, CI, 4 images, 4 tests | TODO | | needs phone in fastboot |
 | A8 | decide defaults from the A/B | TODO | | |
 | A9 | 750 vs 1125 on screenshots, ask the user (Q1) | TODO | | |
