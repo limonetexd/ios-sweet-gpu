@@ -1,0 +1,70 @@
+From: HakiOS
+Subject: [PATCH 0156] sweet rtc: set the calendar from sweetepoch= at boot (C14 fallback)
+
+The PM6150 RTC is a free-running counter, not a wall clock: the live DTB
+says qcom,qpnp-rtc-write = 0, and the value read on 0144r was 53802463 s
+(1971-09-15). So the phone still shows 1971 even though 0144 works.
+
+tools/sweet-gpu-image.sh now stamps the image with the host's Unix time
+(sweetepoch=, override SWEET_EPOCH). bsd/dev/sweet_spmi.c applies it with
+clock_set_calendar_microtime() at boot; SweetBattery::start() calls it
+before sweet_spmi_init(), so it works even if SPMI fails. Values below
+978307200 (2001-01-01) are ignored.
+
+0144 stays as the fallback: sweet_rtc_set_calendar() returns early when
+the calendar is already after 2001, so a correct sweetepoch suppresses the
+1971 RTC read. No PMIC writes, no network, no userspace.
+
+Expected ring line: "SWEET RTC: calendar set from sweetepoch: 17xxxxxxxx".
+Timezone is separate: the gpu2 root symlinks localtime to US/Pacific.
+---
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 0a051d1..42b7471 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -136,7 +136,25 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  * and exits "already started in this boot" whenever it repeats (no Wi-Fi on
+  * the second boot). Only when the calendar is still before 2001. Disable with
+  * sweetrtc=0. Called from SweetBattery::start after sweet_spmi_init().
++ *
++ * The PM6150 RTC is a free-running counter (DT: qcom,qpnp-rtc-write = 0), so
++ * it cannot supply wall time. tools/sweet-gpu-image.sh passes the host's Unix
++ * time as sweetepoch=, which is applied here first; the RTC read (0144) then
++ * sees a 2026 calendar and leaves it alone.
+  */
++void sweet_set_calendar_from_bootarg(void);
++void
++sweet_set_calendar_from_bootarg(void)
++{
++	uint32_t epoch = 0;
++	if (!PE_parse_boot_argn("sweetepoch", &epoch, sizeof(epoch)) ||
++	    epoch < 978307200u) {
++		return;
++	}
++	clock_set_calendar_microtime((clock_sec_t)epoch, 0);
++	printf("SWEET RTC: calendar set from sweetepoch: %u\n", epoch);
++}
++
+ void sweet_rtc_set_calendar(void);
+ void
+ sweet_rtc_set_calendar(void)
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 4339dac..1ca9b83 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,6 +17,7 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" void sweet_rtc_set_calendar(void);    /* Wi-Fi 0133 */
++extern "C" void sweet_set_calendar_from_bootarg(void);  /* host time from the image build */
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -276,6 +277,7 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++	sweet_set_calendar_from_bootarg();      /* sweetepoch=: correct date even if SPMI fails */
+ 	int real = 1;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;

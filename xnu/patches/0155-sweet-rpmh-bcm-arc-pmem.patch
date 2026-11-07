@@ -1,0 +1,166 @@
+From: HakiOS
+Subject: [PATCH 0155] sweet wifi: PMEM_RPMH ioctl + typed RPMh lookup for BCM/ARC (0147 fix)
+
+Rung 1 could not pass as built: 0147 shipped /dev/pmem without the
+PMEM_RPMH ioctl (wland's first pm_rpmh() returned ENOTTY and exited), and
+rh_lookup() accepted only VRM (slave 4) while BCM SN15/CN0 are slave 5 and
+cx.lvl/mss.lvl are ARC slave 3.
+
+bsd/dev/sweet_pmem.c: struct pmem_rpmh + PMEM_RPMH _IOW('P',5) (same
+layout as phone/wifi/pmem.h); pm_ioctl handles it before taking
+sweet_pmem_lock because it waits for an RPMh TCS; logs the result.
+
+bsd/dev/sweet_rpmh.c:
+- RH_ARC 3, RH_BCM 5; rh_lookup(res, expected_slave, &addr) checks the
+  slave from the cmd-db header and the alignment (16 for VRM, 4 for
+  ARC/BCM). Touch's ldoc11 path still uses RH_VRM: unchanged.
+- sweet_rpmh_write() whitelists the WCN3990/modem supplies only:
+  ldoa9 600-800, ldoc1 1600-2000, ldoc2 1200-1400, ldoc10 3100-3400 mV,
+  plus the donor-tree variants ldoa1/ldoa7/ldoc11; rfclka2 enable;
+  cx.lvl/mss.lvl index < 16. Everything else (touch L11C included) is
+  refused with EPERM. It picks RH_ARC for the level resources and RH_VRM
+  otherwise.
+- sweet_rpmh_bcm_vote() looks up RH_BCM.
+
+With this, the expected rung-1 lines are "BCM SN15 ... -> 0" and
+"SWEET SMMU: BCM votes SN15=0 CN0=0".
+---
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 5a05a10..3d99eee 100755
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -65,6 +65,15 @@ struct pmem_list {
+ #define PMEM_FREE       _IOW('P', 2, uint64_t)
+ #define PMEM_SMC        _IOWR('P', 3, struct pmem_smc)
+ #define PMEM_LIST       _IOR('P', 4, struct pmem_list)
++/* Wi-Fi: one RPMh active vote for wland (same struct as phone/wifi/pmem.h). */
++struct pmem_rpmh {
++	char res[16];           /* cmd-db name */
++	uint32_t n;             /* 1..4 commands */
++	uint32_t offset[4];     /* from the resource address */
++	uint32_t value[4];
++};
++#define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+ 
+ #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
+ #define PMEM_WIN        0x200000ULL
+@@ -272,6 +281,14 @@ static int
+ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+ {
+ 	int err = 0;
++	if (cmd == PMEM_RPMH) {
++		/* Waits for the TCS, not under the pmem lock. */
++		struct pmem_rpmh *r = (struct pmem_rpmh *)data;
++		r->res[sizeof(r->res) - 1] = 0;
++		err = sweet_rpmh_write(r->res, r->n, r->offset, r->value);
++		printf("SWEET PMEM: rpmh %s %u cmds -> %d\n", r->res, r->n, err);
++		return err;
++	}
+ 	lck_mtx_lock(&sweet_pmem_lock);
+ 	switch (cmd) {
+ 	case PMEM_ALLOC:
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index de770ef..408cee8 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -44,6 +44,8 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_ARC          3u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -165,7 +167,7 @@ rh_map(void)
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned expected_slave, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -192,9 +194,12 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			/* VRM resources are 16-byte aligned; ARC and BCM only 4. */
++			const uint32_t amask = expected_slave == RH_VRM ? 15u : 3u;
++			if (slave != expected_slave || (addr >> 16) != expected_slave ||
++			    (addr & amask) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid slave-%u entry for %s\n", expected_slave, res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -460,7 +465,7 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &address);
+ 	}
+ 	if (!error) {
+ 		error = rh_send(address, mv);
+@@ -484,9 +489,39 @@ out:
+ int
+ sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
+ {
++	/* Only the WCN3990/modem supplies; everything else (touch L11C included) is refused. */
++	static const struct { const char *name; uint32_t min_mv, max_mv; } rails[] = {
++		{ "ldoa9", 600, 800 }, { "ldoc1", 1600, 2000 }, { "ldoc2", 1200, 1400 },
++		{ "ldoc10", 3100, 3400 },
++		/* phone/wifi variants from the other donor tree */
++		{ "ldoa1", 600, 800 }, { "ldoa7", 1700, 1900 }, { "ldoc11", 3000, 3400 },
++	};
+ 	if (!res || n == 0 || n > 4 || !offsets || !values) {
+ 		return EINVAL;
+ 	}
++	int rail = -1;
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		if (!strcmp(res, rails[i].name)) {
++			rail = (int)i;
++		}
++	}
++	const bool clock = !strcmp(res, "rfclka2");
++	const bool arc = !strcmp(res, "cx.lvl") || !strcmp(res, "mss.lvl");
++	if (rail < 0 && !clock && !arc) {
++		printf("SWEET RPMH: userland vote for %s refused\n", res);
++		return EPERM;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		const uint32_t o = offsets[i], v = values[i];
++		const bool ok = arc ? (o == 0 && v < 16) :
++		    clock ? (o == 4 && v <= 1) :
++		    ((o == 0 && v >= rails[rail].min_mv && v <= rails[rail].max_mv) ||
++		    (o == 4 && v <= 1) || (o == 8 && v == 7));
++		if (!ok) {
++			printf("SWEET RPMH: userland vote %s offset %#x value %u refused\n", res, o, v);
++			return EPERM;
++		}
++	}
+ 	if (rh_poisoned) {
+ 		return EPERM;
+ 	}
+@@ -495,7 +530,7 @@ sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uin
+ 		return error;
+ 	}
+ 	uint32_t address;
+-	error = rh_lookup(res, &address);
++	error = rh_lookup(res, arc ? RH_ARC : RH_VRM, &address);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -527,7 +562,7 @@ sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y)
+ 	} else {
+ 		error = rh_map();
+ 		if (!error) {
+-			error = rh_lookup(res, &address);
++			error = rh_lookup(res, RH_BCM, &address);
+ 		}
+ 		if (!error) {
+ 			const uint32_t offset = 0;
