@@ -4,6 +4,12 @@ One line per task. Change only the Status, Updated and Evidence cells; never edi
 Status: TODO | DOING | BLOCKED (say what blocks) | DONE | DROPPED (say why). Evidence = commit, CI run id, log file,
 NOTES.md entry title. Cards: `ROADMAP-2026-11-07.md` (A), `-B-near.md`, `-C-connectivity-hardware.md`, `-D-far.md`.
 
+## Model budget (user, 2026-11-07)
+
+Never use `deepseek/deepseek-v4-pro` or any paid model unless the user explicitly approves that one call.
+Use `deepseek/deepseek-flash` or any free/cheaper model. The A3 0141 v4-pro run in flight when this was
+written is the last one.
+
 ## Done so far (Claude Code, 2026-11-07)
 
 - 0138 native resolution default: patch written, applies on the full series (`tools/xnu-tree.sh`), **not pushed, not built**.

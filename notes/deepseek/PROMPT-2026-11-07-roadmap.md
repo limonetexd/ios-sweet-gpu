@@ -1,6 +1,6 @@
 # Prompt for DeepSeek (opencode): continue HakiOS from the roadmap (written 2026-11-07)
 
-Paste everything below the line into `opencode` (model `deepseek/deepseek-v4-pro`), started in
+Paste everything below the line into `opencode` (model `deepseek/deepseek-flash`; never v4-pro/paid without the user's explicit OK for that call), started in
 `D:\pablo\Downloads\CLAUDE\iOS on sweet`. It replaces `PROMPT-2026-11-06-next.md`.
 
 ---
@@ -46,11 +46,11 @@ Use opencode's task / sub-agent feature. If you cannot choose a model per sub-ag
 | Give to a sub-agent (brief from roadmap 3.2 + the card, pasted whole) | Do yourself |
 | --- | --- |
 | reading many files, GitHub surveys (`researcher`, `deepseek-flash`) | choosing the next task and the order |
-| writing ONE patch from a card (`patch-writer`, `deepseek-v4-pro`, own tree `XNU_TREE=~/cxnu-NAME`) | the review of every diff (roadmap 3.3), always |
+| writing ONE patch from a card (`patch-writer`, `deepseek-flash`; v4-pro only with the user's explicit OK, own tree `XNU_TREE=~/cxnu-NAME`) | the review of every diff (roadmap 3.3), always |
 | writing a small tool and its self-test (`tool-writer`, flash) | pushes, CI, image builds, boots, anything that touches the phone |
 | reading a ring log and summarising it (`log-reader`, flash) | every question to the user |
 | drafting NOTES / README text from facts you give it (`doc-writer`, flash) | anything under the hard rules |
-| a second pair of eyes on a patch (`reviewer`, v4-pro) | decisions (rule 2.8) |
+| a second pair of eyes on a patch (`reviewer`, flash) | decisions (rule 2.8) |
 
 Rules: at most 2 sub-agents at once, never two on the same file. **Patches that touch the same file are made one after the
 other**: the next agent's tree must already contain the previous patch (commit it to `xnu/patches/`, then

@@ -4,6 +4,11 @@
 
 ### >>> 2026-11-07 (DeepSeek lead): A1/A2 patches reviewed and committed (0139/0140) <<<
 
+**Model budget (user, 2026-11-07, emphatic): never use `deepseek/deepseek-v4-pro` or any paid model
+unless the user explicitly approves that one call. Use `deepseek/deepseek-flash` or any free/cheaper
+model (Big Pickle / DeepSeek free if available). The A3 0141 v4-pro run in flight when the rule was
+written is the last one; do not start another.**
+
 **Build:** not pushed, not built; `0139`/`0140` apply on the 0138 tree; `check-patch.py` ok; tree 133 commits.
 **Observed [O]:** `0139` removes the double divide (`worked` is already the average; total is
 `worked * timed / 1000`), splits the RedwoodGPU IOLog in three (<200 chars), and counts the first whole
