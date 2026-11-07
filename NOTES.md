@@ -43,6 +43,9 @@ Push `f4523e1..33a27b6`; CI run 42374790152.
 `SWEETFB_HZ=60 SWEET_SERIAL=0`, args `sweetgpu_reboot=420 sweetgpu_swipe=60 sweetshot=90`:
 `0143r` native `7ef7fd4b...`, `0143rm` CPU max `57bef953...`, `0143r2` 750x1624 `d7404e20...`,
 `0143rc0` native + `sweet_surfclean=0` `8d0ddd8c...`. Four unattended tests running (540 s each).
+**A7 test `0143r` hung:** booted 14:14:12, did not return to fastboot within 540 s (kernel reboots at
+420 s), no adb/fastboot device now. Waiting for a manual Power+Vol- power cycle, then pull the ring in
+recovery. Suspects: 0138 native canvas path, or 0143's read-only TSENS map/read (first read at 5 s).
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 
