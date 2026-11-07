@@ -39,7 +39,7 @@ new file mode 100755
 index 0000000..63cf60f
 --- /dev/null
 +++ b/bsd/dev/sweet_thermal.c
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,197 @@
 +/*
 + * 0143: SWEET THERM, read only: the hottest CPU, GPU and DDR temperatures, one line every 5 s from the
 + * AppleCLCD statistics thread.
@@ -62,6 +62,9 @@ index 0000000..63cf60f
 +#include <pexpert/pexpert.h>
 +#include <machine/machine_routines.h>
 +#include <mach/vm_prot.h>
++
++/* bsd/dev does not define PEXPERT_KERNEL_PRIVATE: declare it here, as sweet_gpu.c does for ml_io_map */
++extern vm_offset_t ml_io_map_with_prot(vm_offset_t phys_addr, vm_size_t size, vm_prot_t prot);
 +
 +#define TS0_TM_PA       0x0c263000u     /* tsens@c222000 reg[1], TM block */
 +#define TS1_TM_PA       0x0c265000u     /* tsens@c223000 reg[1], TM block */

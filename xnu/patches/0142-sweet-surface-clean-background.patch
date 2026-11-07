@@ -3,7 +3,7 @@ Subject: [PATCH 0142] sweet: clean recycled surface memory in the background (A5
 
 0120 recycles big surface memory but its first submit still pays a whole
 13.9 MB clean out of the CPU cache. The kept-memory thread now bzeroes,
-cleans to PoC (dc civac) and clears the pmap dirty bits, and the create path
+cleans to PoC (dc civac), and the create path
 marks the surface cleanOnce, so the first submit has nothing to clean.
 sweet_surfclean=0 restores today's behaviour. Proof: the RedwoodGPU line (a)
 KB/us per submission and "first cleans" fall, no corruption/freeze.
@@ -12,11 +12,10 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 index a0aa089..3ef4ebe 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -52,9 +52,11 @@
+@@ -52,9 +52,10 @@
  #include <pexpert/pexpert.h>
  #include <kern/thread_call.h>
  #include <mach/mach_time.h>
-+#include <vm/pmap.h>
  
  extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);   /* SweetAdreno.cpp */
  extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
@@ -32,7 +31,7 @@ index a0aa089..3ef4ebe 100644
  static uint32_t       sweet_surf_reused, sweet_surf_made;
  
  static void
-@@ -175,7 +178,22 @@ sweet_surf_clear_kept(thread_call_param_t, thread_call_param_t)
+@@ -175,7 +178,14 @@ sweet_surf_clear_kept(thread_call_param_t, thread_call_param_t)
  		}
  		sweet_surf_kept[i].busy = true;
  		IOLockUnlock(sweet_surf_kept_lock);
@@ -41,17 +40,9 @@ index a0aa089..3ef4ebe 100644
 +		uint64_t bytes = m->getCapacity();
 +		bzero(va, bytes);
 +		if (sweet_surf_clean) {
-+			/* A5 0142: push the zeroes out of the cache and clear the dirty bits: the next
-+			 * surface's first submit then has nothing to clean (today it cleaned 13.9 MB). */
++			/* A5 0142: push the zeroes out of the cache: the next surface's first submit
++			 * then has nothing to clean (today it cleaned 13.9 MB). */
 +			redwood_gpu_to_memory(va, bytes);
-+			for (uint64_t off = 0; off < bytes; off += PAGE_SIZE) {
-+				IOByteCount len = 0;
-+				addr64_t pa = m->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
-+				ppnum_t pn = (ppnum_t)(pa >> PAGE_SHIFT);
-+				if (pa != 0 && pmap_valid_page(pn)) {
-+					pmap_clear_modify(pn);
-+				}
-+			}
 +		}
  		IOLockLock(sweet_surf_kept_lock);
  		sweet_surf_kept[i].busy = false;
