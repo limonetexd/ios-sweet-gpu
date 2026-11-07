@@ -18,7 +18,16 @@ CI-validated patch is lost. The patch contains, boot-arg gated and default off:
 (`/dev/wlan`, en0, Apple80211, `sweetwifid=1`), MiniIONetworkStack + RedwoodWLAN,
 `sweetquiesce=1` IOKit hold skip, and AKS wrap/unwrap 10/11.
 
-CI run `42403022012` (commit `1ce29b4`) is building. If it succeeds: download the kernel, build the
+CI run `42403022012` (commit `1ce29b4`) built `0147` and failed to compile: my `rh_map()` edit had
+put `db_version`/`magic`/`flags` inside the `geometry_logged` block, so the magic/version check
+referenced out-of-scope identifiers. Fixed by `0154-sweet-rpmh-fix-cmds.patch` (commit `ec63a90`):
+declarations back at function scope, printf still gated. `0154` also adds `rh_send_cmds()` (generic
+1..4-command TCS sender) because `sweet_rpmh_write`/`sweet_rpmh_bcm_vote` were calling `rh_send()`,
+which is the LDO helper (3 commands: value/mode 7/enable 1 at offsets 0/8/4). BCM votes now send one
+`commit|valid|vote` command at offset 0, like Linux. `check-patch.py` ok, `xnu-tree.sh update` ok.
+
+CI run `42403216310` (commit `ec63a90`) is the one to watch. If it succeeds: download the kernel with
+`gh run download 42403216310 -R limonetexd/ios-sweet-gpu -n xnu-kernel -D xnu/out-0154`, build the
 rung-1 image (`sweetpmem=1 sweetsmmuwlan=2`, low risk) and test with the user present; rung 2
 (`=1`) may stall a CPU and needs a manual force-reboot if it dies.
 
