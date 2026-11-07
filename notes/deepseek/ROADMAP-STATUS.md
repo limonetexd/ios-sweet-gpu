@@ -6,9 +6,10 @@ NOTES.md entry title. Cards: `ROADMAP-2026-11-07.md` (A), `-B-near.md`, `-C-conn
 
 ## Model budget (user, 2026-11-07)
 
-Never use `deepseek/deepseek-v4-pro` or any paid model unless the user explicitly approves that one call.
-Use `deepseek/deepseek-flash` or any free/cheaper model. The A3 0141 v4-pro run in flight when this was
-written is the last one.
+Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free models
+(`opencode/glm-5.3-flash-free`, `opencode/mimo-v2.6-flash-free`) are fine. Never
+`deepseek/deepseek-v4-pro` or any paid model without the user's explicit OK for that call.
+`deepseek/deepseek-flash` only when no free model fits.
 
 ## Done so far (Claude Code, 2026-11-07)
 
@@ -27,7 +28,7 @@ written is the last one.
 | A3 | 0141 sweetshot kernel screenshots | DONE | 2026-11-07 | commit d42a076; apply/check ok; tree 134 |
 | A4 | `tools/sweet-shot.py` decoder | DONE | 2026-11-07 | commit 85283c3; selftest ok |
 | A5 | 0142 background clean of recycled surface memory | DONE | 2026-11-07 | commit 55fdd54; apply/check ok; tree 135 |
-| A6 | shim CPU max + 0143 thermal log | DOING | 2026-11-07 | part 1 SHIM_CPUMAX built; TSENS map `reports/research-2026-11-07-tsens.md`; 0143 after A3 |
+| A6 | shim CPU max + 0143 thermal log | DONE | 2026-11-07 | part 1 SHIM_CPUMAX + image env; part 2 commit pending (0143 apply/check ok, tree 136) |
 | A7 | batch gate: push, CI, 4 images, 4 tests | TODO | | needs phone in fastboot |
 | A8 | decide defaults from the A/B | TODO | | |
 | A9 | 750 vs 1125 on screenshots, ask the user (Q1) | TODO | | |

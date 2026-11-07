@@ -4,10 +4,10 @@
 
 ### >>> 2026-11-07 (DeepSeek lead): A1/A2 patches reviewed and committed (0139/0140) <<<
 
-**Model budget (user, 2026-11-07, emphatic): never use `deepseek/deepseek-v4-pro` or any paid model
-unless the user explicitly approves that one call. Use `deepseek/deepseek-flash` or any free/cheaper
-model (Big Pickle / DeepSeek free if available). The A3 0141 v4-pro run in flight when the rule was
-written is the last one; do not start another.**
+**Model budget (user, 2026-11-07): agents use `opencode/deepseek-v4.1-flash-free` (free) by default;
+other free models (`opencode/glm-5.3-flash-free`, `opencode/mimo-v2.6-flash-free`) are fine. Never
+`deepseek/deepseek-v4-pro` or any paid model without the user's explicit OK for that call.
+`deepseek/deepseek-flash` only when no free model fits.**
 
 **Build:** not pushed, not built; `0139`/`0140` apply on the 0138 tree; `check-patch.py` ok; tree 133 commits.
 **Observed [O]:** `0139` removes the double divide (`worked` is already the average; total is
@@ -26,11 +26,12 @@ boot args. The agent used `kernel_thread_start_priority`, which failed to compil
 replaced it with `kernel_thread_start` (the thread sleeps 250 ms). `check-patch`/apply ok; tree 134.
 A4's decoder was fixed to parse the kernel's `why TEXT t MS` fields; `--selftest` still prints
 `selftest ok`.
-**A5 done:** `0142-sweet-surface-clean-background.patch` (commit 55fdd54): the kept-memory thread now
-bzeroes, cleans to PoC (`dc civac`) and clears the pmap dirty bits; the create marks `s->cleanOnce`, so
-the first submit has no whole 13.9 MB clean. `sweet_surfclean=0` restores today's behaviour. Apply/check
-ok; tree 135. Not built/tested yet.
-**Next:** A6 0143 thermal (flash agent), then A7 batch gate.
+**A6 done:** `0143-sweet-thermal.patch`: new `bsd/dev/sweet_thermal.c` (in `bsd/conf/files`), TSENS TM
+`0xc263000`/`0xc265000` and SROT `0xc222000`/`0xc223000` mapped `VM_PROT_READ`; status word
+`+0xa0+4n`, bit 21 valid, signed deci-C; `SWEET THERM: cpu/a55/big/gpu/ddr/cpuss` every 5 s from
+`statsReport`; one-shot SROT probe prints deci-C vs raw ADC; `sweettherm=0` off. Review replaced
+`IOLog` with `printf` (bsd/dev has no IOLib.h). Apply/check ok; tree 136.
+**Next:** A7 batch gate: one push (0138-0143), CI, 4 images, 4 unattended tests.
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 

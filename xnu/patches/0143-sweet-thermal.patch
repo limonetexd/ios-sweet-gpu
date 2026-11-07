@@ -1,0 +1,273 @@
+From: HakiOS
+Subject: [PATCH 0143] 0143: SWEET THERM, read-only TSENS temperatures every 5 s
+
+What: a new bsd/dev/sweet_thermal.c (added to bsd/conf/files) with the two TSENS TM blocks of sweet's
+own device tree (0x0c263000, 0x0c265000) and their SROT blocks (0x0c222000, 0x0c223000) mapped
+VM_PROT_READ, and one log line every 5 s from AppleCLCD::statsReport: max CPU, A55, A76, GPU, DDR
+and cpuss, in deci-C, "--" for a sensor with no valid reading. All accesses are plain 32-bit loads of
+TM + 0xa0 + 4*n: bit 21 valid, bits 11:0 signed deci-C, 0xffffffff means nothing there. The 5-count
+divider and the one-shot start live in the stats thread, so the first read is 5 s after the panel is
+up, never during early boot.
+
+Why: A6 raises the CPU clocks to the top of the OSM LUT, and the decision needs the temperatures of the
+same run ("hottest sensor below 80 C for the whole 540 s"). Boot-arg sweettherm=0 turns the line off.
+The one-shot SROT ctrl probe (bit 0 TSENS_EN, bit 21 CODE_OR_TEMP) is printed with the first reading so
+the log itself says whether the codes really are deci-C (on raw ADC codes no temperature line is
+printed). TM_TRDY is only logged raw: patch 0255 uses bit 3 of 0xe4 and mainline bit 0, so it is not
+used as a gate; the per-sensor valid bit is.
+
+Proof: mkpatch and tools/check-patch.py ok; applies on the series tree (0138-0142); no line over 200
+characters; no store to any TSENS register (VM_PROT_READ maps, loads only). Expected lines:
+  SWEET THERM: on, tsens0 TM 0c263000, tsens1 TM 0c265000, every 5 s (sweettherm=0 off)
+  SWEET THERM: probe ts0 trdy ........ ctrl ........ (deci-C), ts1 trdy ........ ctrl ........ (deci-C)
+  SWEET THERM: cpu 45.2 a55 44.8 big 45.2 gpu 43.1 ddr 40.9 cpuss 44.1 C
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7052e81..ead0eae 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_thermal.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+new file mode 100755
+index 0000000..63cf60f
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.c
+@@ -0,0 +1,194 @@
++/*
++ * 0143: SWEET THERM, read only: the hottest CPU, GPU and DDR temperatures, one line every 5 s from the
++ * AppleCLCD statistics thread.
++ *
++ * Blocks and layout from sweet's own device tree (dtb/boot_unpacked/dtb, /soc/tsens@c222000 and
++ * tsens@c223000, reg = <SROT 0x8> <TM 0x1ff>) and from Linux's tsens-v2.c: a sensor's status word is
++ * TM + 0xa0 + 4*n, bit 21 = valid, bits 11:0 = signed deci-degrees C, 0xffffffff = nothing there.
++ * Sensor ids from the thermal-zones of the same device tree: tsens0 1-6 A55, 7-8 cpuss, 9-12 the two
++ * A76 (which sensor is which core is not in the DT, so only their max is printed), 13-14 GPU; tsens1 3
++ * DDR. The SROT control word (SROT + 4, bit 0 TSENS_EN, bit 21 CODE_OR_TEMP) is read once so the first
++ * reading line says whether the codes really are deci-C.
++ *
++ * Nothing is written here: both TM blocks and both SROT blocks are mapped VM_PROT_READ and only 32-bit
++ * words are loaded. ml_io_map cannot fail (KMA_NOFAIL), so the off switch is boot-arg sweettherm=0, and
++ * the first read happens 5 s after the panel is up (never during early boot).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++#include <mach/vm_prot.h>
++
++#define TS0_TM_PA       0x0c263000u     /* tsens@c222000 reg[1], TM block */
++#define TS1_TM_PA       0x0c265000u     /* tsens@c223000 reg[1], TM block */
++#define TS0_SROT_PA     0x0c222000u     /* tsens@c222000 reg[0], SROT block */
++#define TS1_SROT_PA     0x0c223000u     /* tsens@c223000 reg[0], SROT block */
++#define TS_PAGE_SIZE    0x1000u
++#define TS_SN_OFF(n)    (0x0a0u + 4u * (unsigned)(n))
++#define TS_TRDY_OFF     0x0e4u
++#define TS_SROT_CTRL    0x004u
++#define TS_VALID        (1u << 21)
++#define TS_TEMP_MASK    0x0fffu
++#define TS_CTRL_EN      (1u << 0)       /* SROT: TSENS_EN */
++#define TS_CTRL_DECI    (1u << 21)      /* SROT: CODE_OR_TEMP, 1 = deci-C, 0 = raw ADC code */
++#define TS_NONE         (-9999)
++
++static volatile uint32_t *sweet_ts_tm[2];      /* [0] tsens0 TM, [1] tsens1 TM */
++static volatile uint32_t *sweet_ts_srot[2];    /* [0] tsens0 SROT, [1] tsens1 SROT */
++static bool sweet_ts_started;
++static bool sweet_ts_on;
++static bool sweet_ts_deci[2];
++static bool sweet_ts_probed;
++static bool sweet_ts_said_invalid;
++
++void sweet_therm_start(void);
++void sweet_therm_log(void);
++
++/* One sensor, signed deci-C, or TS_NONE. Never writes. */
++static int
++sweet_ts_read(unsigned ctl, unsigned n)
++{
++	volatile uint32_t *base = sweet_ts_tm[ctl];
++	uint32_t w = 0;
++	unsigned i;
++	int v;
++
++	if (!sweet_ts_deci[ctl]) {
++		return TS_NONE;
++	}
++	/* a sensor can be between two measurements: the vendor driver reads up to three times */
++	for (i = 0; i < 3; i++) {
++		w = base[TS_SN_OFF(n) >> 2];
++		if (w == 0xffffffffu || (w & TS_VALID) != 0) {
++			break;
++		}
++	}
++	if (w == 0xffffffffu || (w & TS_VALID) == 0) {
++		return TS_NONE;
++	}
++	v = (int)(w & TS_TEMP_MASK);
++	if (v & 0x800) {
++		v -= 0x1000;                    /* bits 11:0 are signed deci-C */
++	}
++	return (v < -400 || v > 1500) ? TS_NONE : v;
++}
++
++static int
++sweet_ts_hot(int a, int b)
++{
++	if (a == TS_NONE) {
++		return b;
++	}
++	if (b == TS_NONE) {
++		return a;
++	}
++	return a > b ? a : b;
++}
++
++static void
++sweet_ts_fmt(char *b, size_t n, int v)
++{
++	int a;
++
++	if (v == TS_NONE) {
++		(void)snprintf(b, n, "--");
++		return;
++	}
++	a = v < 0 ? -v : v;
++	(void)snprintf(b, n, "%s%d.%d", v < 0 ? "-" : "", a / 10, a % 10);
++}
++
++/*
++ * One-shot SROT probe: bit 0 TSENS_EN and bit 21 CODE_OR_TEMP say whether the TM words are deci-C.
++ * TM_TRDY is only logged raw: patch 0255 uses bit 3 of 0xe4 and mainline bit 0, so gating on it could
++ * hide every reading. The per-sensor valid bit is what all the sources agree on.
++ */
++static void
++sweet_ts_probe(void)
++{
++	uint32_t c0, c1, t0, t1;
++
++	sweet_ts_probed = true;
++	c0 = sweet_ts_srot[0][TS_SROT_CTRL >> 2];       /* 0x0c222004 */
++	c1 = sweet_ts_srot[1][TS_SROT_CTRL >> 2];       /* 0x0c223004 */
++	t0 = sweet_ts_tm[0][TS_TRDY_OFF >> 2];
++	t1 = sweet_ts_tm[1][TS_TRDY_OFF >> 2];
++	sweet_ts_deci[0] = (c0 & TS_CTRL_EN) != 0 && (c0 & TS_CTRL_DECI) != 0;
++	sweet_ts_deci[1] = (c1 & TS_CTRL_EN) != 0 && (c1 & TS_CTRL_DECI) != 0;
++	printf("SWEET THERM: probe ts0 trdy %08x ctrl %08x (%s), ts1 trdy %08x ctrl %08x (%s)\n",
++	    t0, c0, sweet_ts_deci[0] ? "deci-C" : "raw ADC",
++	    t1, c1, sweet_ts_deci[1] ? "deci-C" : "raw ADC");
++	if (!sweet_ts_deci[0] && !sweet_ts_deci[1]) {
++		printf("SWEET THERM: not deci-C, no temperature line (sweettherm=0 off)\n");
++		sweet_ts_on = false;
++	}
++}
++
++/* The 5 s line: max CPU, A55, A76, GPU, DDR and CPU subsystem, "--" where a sensor has no reading. */
++void
++sweet_therm_log(void)
++{
++	int a55 = TS_NONE, big = TS_NONE, gpu = TS_NONE, ddr = TS_NONE, cpuss = TS_NONE;
++	unsigned n;
++	char b[6][8];
++
++	if (!sweet_ts_on) {
++		return;
++	}
++	if (!sweet_ts_probed) {
++		sweet_ts_probe();
++		if (!sweet_ts_on) {
++			return;
++		}
++	}
++	for (n = 1; n <= 6; n++) {                      /* A55: one sensor per core */
++		a55 = sweet_ts_hot(a55, sweet_ts_read(0, n));
++	}
++	for (n = 9; n <= 12; n++) {                     /* A76: four sensors, two cores: max only */
++		big = sweet_ts_hot(big, sweet_ts_read(0, n));
++	}
++	cpuss = sweet_ts_hot(sweet_ts_read(0, 7), sweet_ts_read(0, 8));
++	gpu = sweet_ts_hot(sweet_ts_read(0, 13), sweet_ts_read(0, 14));
++	ddr = sweet_ts_read(1, 3);
++	sweet_ts_fmt(b[0], sizeof(b[0]), sweet_ts_hot(a55, big));
++	sweet_ts_fmt(b[1], sizeof(b[1]), a55);
++	sweet_ts_fmt(b[2], sizeof(b[2]), big);
++	sweet_ts_fmt(b[3], sizeof(b[3]), gpu);
++	sweet_ts_fmt(b[4], sizeof(b[4]), ddr);
++	sweet_ts_fmt(b[5], sizeof(b[5]), cpuss);
++	printf("SWEET THERM: cpu %s a55 %s big %s gpu %s ddr %s cpuss %s C\n",
++	    b[0], b[1], b[2], b[3], b[4], b[5]);
++	/* say once, not every 5 s, that a sensor had no valid reading */
++	if (!sweet_ts_said_invalid && (a55 == TS_NONE || big == TS_NONE || gpu == TS_NONE ||
++	    ddr == TS_NONE || cpuss == TS_NONE)) {
++		sweet_ts_said_invalid = true;
++		printf("SWEET THERM: a sensor had no valid reading (shown as --)\n");
++	}
++}
++
++/* Called once from AppleCLCD::statsReport's 1 s loop; the first read is its 5th tick. */
++void
++sweet_therm_start(void)
++{
++	unsigned on = 1;
++
++	if (sweet_ts_started) {
++		return;
++	}
++	sweet_ts_started = true;
++	PE_parse_boot_argn("sweettherm", &on, sizeof(on));
++	if (on == 0) {
++		printf("SWEET THERM: off (sweettherm=0)\n");
++		return;
++	}
++	sweet_ts_tm[0] = (volatile uint32_t *)ml_io_map_with_prot(TS0_TM_PA, TS_PAGE_SIZE, VM_PROT_READ);
++	sweet_ts_tm[1] = (volatile uint32_t *)ml_io_map_with_prot(TS1_TM_PA, TS_PAGE_SIZE, VM_PROT_READ);
++	sweet_ts_srot[0] = (volatile uint32_t *)ml_io_map_with_prot(TS0_SROT_PA, TS_PAGE_SIZE, VM_PROT_READ);
++	sweet_ts_srot[1] = (volatile uint32_t *)ml_io_map_with_prot(TS1_SROT_PA, TS_PAGE_SIZE, VM_PROT_READ);
++	sweet_ts_on = true;
++	printf("SWEET THERM: on, tsens0 TM %08x, tsens1 TM %08x, every 5 s (sweettherm=0 off)\n",
++	    (unsigned)TS0_TM_PA, (unsigned)TS1_TM_PA);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b77d430..2c8f2ed 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -43,6 +43,8 @@ extern "C" volatile uint32_t sweet_hid_touches;                         /* 0120,
+ extern "C" void sweet_freeze_kill_request(void);                        /* 0122, bsd/dev/sweet_sample.c */
+ extern "C" uint32_t redwood_gpu_last(void);
+ extern "C" void redwood_gpu_report(const char *why);
++extern "C" void sweet_therm_start(void);                                  /* 0143, bsd/dev/sweet_thermal.c */
++extern "C" void sweet_therm_log(void);                                    /* 0143 */
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -1013,6 +1015,23 @@ AppleCLCD::statsReport(void)
+ 		    swaps, window / 1000000,
+ 		    swapgap / 1000000, late, presents, presents ? psum / 1000 / presents : 0, pmax / 1000, stale,
+ 		    vsyncgap / 1000000, pending, redwood_gpu_last(), live, zombies, wired >> 20, failed, repeats);
++		/*
++		 * 0143: SWEET THERM once every 5 s (sweettherm=0 off). The maps are taken here, on the
++		 * first tick, and the first read is the fifth, so nothing touches the TSENS blocks
++		 * during boot.
++		 */
++		{
++			static bool therm_started = false;
++			static unsigned therm_s = 0;
++			if (!therm_started) {
++				therm_started = true;
++				sweet_therm_start();
++			}
++			if (++therm_s >= 5) {
++				therm_s = 0;
++				sweet_therm_log();
++			}
++		}
+ 		if (fBeamIntf != 0) {
+ 			uint32_t beamFrames, beamTorn;
+ 			IOLockLock(fStatLock);
