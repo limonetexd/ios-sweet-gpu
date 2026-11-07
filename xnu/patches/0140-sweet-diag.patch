@@ -1,0 +1,220 @@
+From: HakiOS
+Subject: [PATCH 0140] A2 diagnostics for B1: what CoreAnimation asks for when it creates its
+per-frame framebuffer surface, and what it passes to IOMobileFramebuffer.
+
+(a) IOSurfaceRootUserClient::create. For the first six successful creates
+with allocSize >= 4 MB made by backboardd, log the request's property
+dictionary as "SWEET SURF: props id N KEY=VALUE ..." lines chunked at about
+180 characters. Numbers are decimal, booleans true/false, strings their
+first 40 characters, data "data(len)", anything else its class name. The
+iterator is released; props itself is still released by the create path.
+
+(b) IOMobileFramebufferUserClient::externalMethod. Keep the existing
+once-per-selector line and add, for the first three calls of every selector,
+"SWEET FB: sel N call K scalars a,b,c,d struct-in S struct-out S" (S is the
+structure size, or the descriptor length when the call uses one). For
+selector 5 (SwapEnd) the first two records are hex-dumped, the first 0x120
+bytes 32 to a line: "SWEET FB: swap N rec K +OFF ..." where the swap id is
+at +0x50, the layer surface ids +0x54, source rects +0x64, the enabled mask
++0xa4, dest rects +0xc4 and layer masks +0x104/+0x108.
+
+How to see it: with this kernel on the panel, let backboardd composite and
+read the persistent log:
+
+  SWEET SURF: props id 12 IOSurfaceWidth=1125 IOSurfaceHeight=2436 ...
+  SWEET FB: sel 5 call 1 scalars 0,0,0,0 struct-in 1132 struct-out 0
+  SWEET FB: swap 7 rec 1 +000 ...
+
+No new log line is longer than 200 characters.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 01f0dc7..4150baa 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1586,6 +1586,8 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++static uint32_t sweet_fb_calls[64];     /* 0140: calls logged per selector */
++static uint32_t sweet_fb_swap_dumps;    /* 0140: SwapEnd records hex-dumped */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -1704,6 +1706,46 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		    args->scalarInputCount, args->structureInputSize,
+ 		    args->scalarOutputCount, args->structureOutputSize, ret);
+ 	}
++	/*
++	 * 0140: what CoreAnimation passes, for B1: the first three calls of
++	 * every selector, their first four scalars and the structure sizes
++	 * (descriptor lengths when the call came through a descriptor).
++	 */
++	if (selector < 64 && sweet_fb_calls[selector] < 3) {
++		uint32_t inSize = args->structureInputSize;
++		uint32_t outSize = args->structureOutputSize;
++		if (args->structureInputDescriptor != NULL) {
++			inSize = (uint32_t)args->structureInputDescriptor->getLength();
++		}
++		if (args->structureOutputDescriptor != NULL) {
++			outSize = (uint32_t)args->structureOutputDescriptor->getLength();
++		}
++		sweet_fb_calls[selector]++;
++		IOLog("SWEET FB: sel %u call %u scalars %llu,%llu,%llu,%llu struct-in %u struct-out %u\n",
++		    selector, sweet_fb_calls[selector],
++		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
++		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++		    args->scalarInputCount > 2 ? args->scalarInput[2] : 0,
++		    args->scalarInputCount > 3 ? args->scalarInput[3] : 0, inSize, outSize);
++	}
++	/*
++	 * 0140: the SwapEnd record CoreAnimation fills: swap id +0x50, layer
++	 * surface ids +0x54, source rects +0x64, enabled mask +0xa4, dest
++	 * rects +0xc4, layer masks +0x104/+0x108. First two records, 0x120
++	 * bytes each, 32 a line.
++	 */
++	if (selector == kSweetFBSwapEnd && sweet_fb_swap_dumps < 2 &&
++	    args->structureInput != NULL && args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE) {
++		const uint8_t *rec = (const uint8_t *)args->structureInput;
++		sweet_fb_swap_dumps++;
++		for (uint32_t off = 0; off < 0x120; off += 32) {
++			IOLog("SWEET FB: swap %u rec %u +%03x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			    get32(rec, 0x50), sweet_fb_swap_dumps, off,
++			    get32(rec, off), get32(rec, off + 4), get32(rec, off + 8),
++			    get32(rec, off + 12), get32(rec, off + 16), get32(rec, off + 20),
++			    get32(rec, off + 24), get32(rec, off + 28));
++		}
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index a905b54..a0aa089 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,8 +39,13 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <libkern/c++/OSSerialize.h>
+ #include <sys/proc.h>
+@@ -99,6 +104,7 @@ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++static uint32_t      sweet_surface_props_logged;        /* 0140: 4 MB+ backboardd creates logged */
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ static volatile SInt32 sweet_surface_failed;    /* creates that returned an error (0097) */
+@@ -960,6 +966,83 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	return ret;
+ }
+ 
++/*
++ * 0140: one property's value as text: numbers decimal, booleans true/false,
++ * strings their first 40 characters, data its length, anything else its
++ * class name (B1 reads these lines to see what CoreAnimation asks for).
++ */
++static void
++sweet_surf_prop_text(OSObject *obj, char *buf, size_t len)
++{
++	OSNumber *number;
++	OSString *string;
++	OSData *data;
++
++	if (obj == NULL) {
++		snprintf(buf, len, "null");
++	} else if ((number = OSDynamicCast(OSNumber, obj)) != NULL) {
++		snprintf(buf, len, "%llu", number->unsigned64BitValue());
++	} else if (OSDynamicCast(OSBoolean, obj) != NULL) {
++		snprintf(buf, len, "%s", obj == kOSBooleanTrue ? "true" : "false");
++	} else if ((string = OSDynamicCast(OSString, obj)) != NULL) {
++		snprintf(buf, len, "%.40s", string->getCStringNoCopy());
++	} else if ((data = OSDynamicCast(OSData, obj)) != NULL) {
++		snprintf(buf, len, "data(%u)", data->getLength());
++	} else {
++		snprintf(buf, len, "%s", obj->getMetaClass()->getClassName());
++	}
++}
++
++/*
++ * 0140: print a create request's property dictionary as "KEY=VALUE" pairs,
++ * chunked at about 180 characters a line (IOLog cuts long lines).
++ */
++static void
++sweet_surf_log_props(uint32_t id, OSDictionary *props)
++{
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++	char line[192];
++	char entry[136];
++	char value[64];
++	int used;
++	bool any = false;
++	OSObject *obj;
++
++	if (it == NULL) {
++		return;
++	}
++	used = snprintf(line, sizeof(line), "SWEET SURF: props id %u", id);
++	while ((obj = it->getNextObject()) != NULL) {
++		OSSymbol *key = OSDynamicCast(OSSymbol, obj);
++		int len;
++
++		if (key == NULL) {
++			continue;
++		}
++		sweet_surf_prop_text(props->getObject(key), value, sizeof(value));
++		len = snprintf(entry, sizeof(entry), " %s=%s", key->getCStringNoCopy(), value);
++		if (len < 0) {
++			continue;
++		}
++		if (len > (int)sizeof(entry) - 1) {
++			len = (int)sizeof(entry) - 1;
++		}
++		if (used + len > 180) {
++			IOLog("%s\n", line);
++			used = snprintf(line, sizeof(line), "SWEET SURF: props id %u", id);
++		}
++		if (used + len < (int)sizeof(line)) {
++			memcpy(line + used, entry, len + 1);
++			used += len;
++			any = true;
++		}
++	}
++	if (any) {
++		IOLog("%s\n", line);
++	}
++	it->release();
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ {
+@@ -1071,6 +1154,20 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	/*
++	 * 0140: B1 needs to know what CoreAnimation asks for when it creates its
++	 * per-frame framebuffer surface: the properties of the first six 4 MB+
++	 * creates backboardd makes. props is released just below.
++	 */
++	if (ret == kIOReturnSuccess && s->allocSize >= (4u << 20) &&
++	    sweet_surface_props_logged < 6) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		if (strcmp(name, "backboardd") == 0) {
++			sweet_surface_props_logged++;
++			sweet_surf_log_props(s->id, props);
++		}
++	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		OSIncrementAtomic(&sweet_surface_failed);
