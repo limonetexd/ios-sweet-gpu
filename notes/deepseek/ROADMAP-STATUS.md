@@ -47,7 +47,7 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | C14 | system time not set (RTC/NTP/timed) | BLOCKED | 2026-11-07 | 0144r booted: PM6150 RTC read works but returns 53802463 s = 1971-09-15, so the clock is still wrong; real time needs NTP over Wi-Fi (C1/C3) or a userspace set. Ring logs/xnu-0144r.txt |
 | B13 | flash gpu3 | BLOCKED | | Q4: user's explicit OK |
 | B14 | wallpaper / extensions verification | TODO | | after B13 |
-| C1 | promote the 8 Wi-Fi drafts + boot ladder | DOING | 2026-11-07 | 7 drafts promoted (0130-0137 -> 0147-0153, commit 974c282); CI build running; all 7 apply clean, check-patch ok; boot ladder rungs 1-2 pending (need user present; rung 2 may stall CPU) |
+| C1 | promote the 8 Wi-Fi drafts + boot ladder | DOING | 2026-11-07 | drafts 0147-0153 failed CI 42398886992 (rh_lookup_ex/rh_send_n/RH_BCM missing, pm_rw misplaced); fixed as ONE regenerated 0147 (commit 1ce29b4, 3420 lines, check-patch ok, xnu-tree apply ok); CI 42403022012 building; boot ladder rungs 1-2 pending (need user present; rung 2 may stall CPU) |
 | C2 | ADT --wlan + Wi-Fi root files | TODO | | |
 | C3 | Wi-Fi bring-up verification | TODO | | after B13, C1 rung 3 |
 | C4 | battery verification and polish | TODO | | |

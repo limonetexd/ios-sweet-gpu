@@ -2,9 +2,32 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 (DeepSeek lead): C1 promoted (0147-0153); B2 (0145+0146) done <<<
+### >>> 2026-11-07 (DeepSeek lead): C1 Wi-Fi fixed as a single 0147; CI 42403022012 <<<
 
-**C1 Wi-Fi drafts promoted** (commit `974c282`): seven patches from `patches-pending/` moved to
+**CI `42398886992` failed** (commit `974c282`): the seven drafted patches did not build.
+Root causes: `sweet_rpmh.c` called `rh_lookup_ex`/`rh_send_n`/`RH_BCM` (never existed) and used a
+`rh_send` signature that does not match the tree; `sweet_pmem.c` had the `PMEM_RPMH` block inside
+`pm_rw` instead of `pm_ioctl`; and patches 0150/0151/0152/0153 conflicted when applied in order.
+
+**Fix (commit `1ce29b4`):** the whole Wi-Fi bring-up is regenerated from the fixed tree as ONE patch
+`0147-sweet-wifi-pmem.patch` (3420 added lines; `check-patch.py`: ok; `xnu-mkpatch.sh` apply check:
+ok on the tree without the edits). Patches 0148-0153 are deleted — none of them ever built, so no
+CI-validated patch is lost. The patch contains, boot-arg gated and default off:
+`/dev/pmem` (`sweetpmem=1`), `sweet_rpmh_write`+`sweet_rpmh_bcm_vote` over the existing
+`rh_lookup`/`rh_send`, `sweet_wlan_smmu.c` (`sweetsmmuwlan=1|2`), redwood/flame station stack
+(`/dev/wlan`, en0, Apple80211, `sweetwifid=1`), MiniIONetworkStack + RedwoodWLAN,
+`sweetquiesce=1` IOKit hold skip, and AKS wrap/unwrap 10/11.
+
+CI run `42403022012` (commit `1ce29b4`) is building. If it succeeds: download the kernel, build the
+rung-1 image (`sweetpmem=1 sweetsmmuwlan=2`, low risk) and test with the user present; rung 2
+(`=1`) may stall a CPU and needs a manual force-reboot if it dies.
+
+Four research agents were launched (Wi-Fi C2/C3 remainder, clock path, 60 FPS/PosterBoard, apps
+status); their reports update the roadmap when they land.
+
+### >>> 2026-11-07 (DeepSeek lead): C1 promoted (0147-0153, superseded); B2 (0145+0146) done <<<
+
+**C1 Wi-Fi drafts promoted** (commit `974c282`, superseded by `1ce29b4`): seven patches from `patches-pending/` moved to
 `xnu/patches/` with new consecutive numbers:
 - 0130 → 0147: `/dev/pmem` (raw physical memory + SMC ioctls)
 - 0131 → 0148: RPMh votes via `/dev/pmem` (PMEM_RPMH ioctl, sweet_rpmh_write)
