@@ -33,6 +33,12 @@ A4's decoder was fixed to parse the kernel's `why TEXT t MS` fields; `--selftest
 `IOLog` with `printf` (bsd/dev has no IOLib.h). Apply/check ok; tree 136.
 **Next:** A7 batch gate: one push (0138-0143), CI, 4 images, 4 unattended tests.
 **A7 started:** push `36dd2c8..f4523e1` (0138-0143 + tools + notes); CI run 42373873926.
+**A7 CI 42373873926 failed to compile:** `ml_io_map_with_prot` is inside `PEXPERT_KERNEL_PRIVATE` in
+`machine_routines.h` (bsd/dev does not define it) and `pmap_clear_modify`/`pmap_valid_page` are not
+visible from iokit C++ even with `<vm/pmap.h>`. Fixed in place (0142/0143 never built): 0143 declares
+the extern, as `sweet_gpu.c` does for `ml_io_map`; 0142 drops the pmap dirty-bit loop and keeps `bzero`
++ `redwood_gpu_to_memory` (dc civac). `tools/xnu-tree.sh` rebuilt from base: 136 commits, no SKIP.
+Push `f4523e1..33a27b6`; CI run 42374790152.
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 
