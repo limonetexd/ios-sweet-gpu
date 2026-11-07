@@ -11,7 +11,9 @@ cleans in `toMemoryWritten` (`gGPUStat.wholeCleans/wholeBytes`). `0140` logs the
 `backboardd` IOSurface create property dictionaries (chunked at 180) and the first three calls of every
 IOMFB selector, plus the first two SwapEnd records (0x120 bytes).
 **Guess [G]:** A2 answers B1 (why CA makes a new surface each frame); A1 gives A5 the cache numbers.
-**Next:** A3 0141 `sweetshot` and A4 `tools/sweet-shot.py` (both delegated), then A5/A6/A7.
+**Next:** A3 0141 `sweetshot` (agent running) and A4 `tools/sweet-shot.py` (done: commit 85283c3,
+`--selftest` prints `selftest ok`; stdlib only, regex finds interleaved SWEET SHOT fragments, PackBits
+u16, FNV warn, missing chunks black). Then A5/A6/A7.
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 
