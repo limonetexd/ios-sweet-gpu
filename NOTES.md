@@ -16,6 +16,10 @@ cleans in `toMemoryWritten` (`gGPUStat.wholeCleans/wholeBytes`). `0140` logs the
 `backboardd` IOSurface create property dictionaries (chunked at 180) and the first three calls of every
 IOMFB selector, plus the first two SwapEnd records (0x120 bytes).
 **Guess [G]:** A2 answers B1 (why CA makes a new surface each frame); A1 gives A5 the cache numbers.
+**A6 thermal research:** TSENS map confirmed from sweet's DTB: tsens0 TM `0xc263000`, tsens1 TM
+`0xc265000`; status word at `+0xa0+4n`, bit 21 valid, low 12 signed deci-C; A55 1-6, A76 9-12, GPU
+13-14, DDR tsens1 3. "ios-flame 0255" is actually `Yofuness/ios-sunfish` 0255 (same SM7150).
+Report `reports/research-2026-11-07-tsens.md`. 0143 after A5.
 **Next:** A3 0141 `sweetshot` (agent running) and A4 `tools/sweet-shot.py` (done: commit 85283c3,
 `--selftest` prints `selftest ok`; stdlib only, regex finds interleaved SWEET SHOT fragments, PackBits
 u16, FNV warn, missing chunks black). Then A5/A6/A7.
