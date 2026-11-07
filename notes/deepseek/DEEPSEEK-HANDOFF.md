@@ -1,3 +1,5 @@
+> Historical (2026-11-03). Current state and plan: `HANDOFF.md` and `ROADMAP-2026-11-07.md` (this folder).
+
 # DEEPSEEK — Handoff personal
 
 **Fecha:** 2026-11-03

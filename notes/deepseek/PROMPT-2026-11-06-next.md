@@ -1,5 +1,10 @@
 # Prompt for DeepSeek (opencode): next HakiOS implementation round (written 2026-11-06)
 
+> **SUPERSEDED 2026-11-07** by `PROMPT-2026-11-07-roadmap.md` and `ROADMAP-2026-11-07*.md`; kept for history. Stale here:
+> the widget-picker freeze is fixed (0122); the series is at 0131 + 0138 (not 0121); the Wi-Fi drafts are not 0113-0120;
+> `0144-0146` are superseded by 0125-0127; `xnu/patches-pending/0123` is `0124`. The 512 MiB window and eagl descriptions
+> below are still valid.
+
 Paste everything below the line into `opencode` (model `deepseek/deepseek-v4-pro`), started in
 `D:\pablo\Downloads\CLAUDE\iOS on sweet`.
 

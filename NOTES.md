@@ -44,6 +44,10 @@
   screenshots into the log (+ `tools/sweet-shot.py`), 0142 clean recycled surface memory in the background (A/B vs
   `sweet_surfclean=0`), shim CPU clocks to the top of the LUT (`SHIM_CPUMAX`) with a TSENS thermal log (0143), then one
   push, four images, four unattended runs and the decisions.
+- **Git state:** `mine/main` = `36dd2c8`; local `gpu` = `be26ce8`, 9 commits ahead, none pushed (opencode notes 1b49712, ecf3f83,
+  3aca708; Claude Code notes 682fcd7, 514e6d0, 42f74f9; 0138 8f64aa0; tools 003fb51; roadmap be26ce8). Older notes here that say
+  "pushed to mine/main" for those notes, or that the Wi-Fi drafts become 0132-0139, are superseded: the drafts take the next
+  free numbers when promoted (0138 is taken, roadmap C1), and the first push is roadmap A7.
 - **Not done / unknown:** nothing here was compiled by Apple clang or booted; 0139-0143 exist only as specs; the phone was
   not touched this session (in fastboot).
 
