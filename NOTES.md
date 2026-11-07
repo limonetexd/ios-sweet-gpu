@@ -41,11 +41,18 @@ the extern, as `sweet_gpu.c` does for `ml_io_map`; 0142 drops the pmap dirty-bit
 Push `f4523e1..33a27b6`; CI run 42374790152.
 **CI 42374790152 success** (13m41s). Kernel `xnu/out-0143` sha256 `22b042dd...`. Images built, all
 `SWEETFB_HZ=60 SWEET_SERIAL=0`, args `sweetgpu_reboot=420 sweetgpu_swipe=60 sweetshot=90`:
-`0143r` native `7ef7fd4b...`, `0143rm` CPU max `57bef953...`, `0143r2` 750x1624 `d7404e20...`,
+`0143r` native `9cb94807...` (rebuilt; the first `7ef7fd4b` payload had a quoting bug and no extra
+boot-args), `0143rm` CPU max `57bef953...`, `0143r2` 750x1624 `d7404e20...`,
 `0143rc0` native + `sweet_surfclean=0` `8d0ddd8c...`. Four unattended tests running (540 s each).
 **A7 test `0143r` hung:** booted 14:14:12, did not return to fastboot within 540 s (kernel reboots at
 420 s), no adb/fastboot device now. Waiting for a manual Power+Vol- power cycle, then pull the ring in
 recovery. Suspects: 0138 native canvas path, or 0143's read-only TSENS map/read (first read at 5 s).
+**Not a hang: bad boot-args.** The `0143r` payload ended at `sweetgpu=2 \` (shell quoting bug in the
+build command), so `sweetgpu_reboot`, `sweetgpu_swipe` and `sweetshot` never reached the kernel; the
+phone stayed in iOS and the loop timed out. The other three payloads carry the full line. Ring still
+gave: `SWEET THERM` works (deci-C confirmed: `ts0 ctrl 0de3fff9`, 43-44 C), 181 lines; A2 props show
+`1125x2436 QuartzCore` surfaces of 13881344 bytes; no freeze/panic; PosterBoard sig 5, driverkitd sig 9.
+`0143r` rebuilt with the full args: `9cb94807...`. Four tests restarted.
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 
