@@ -9,7 +9,8 @@
 set -e
 K=${1:?kernel dir}; T=${2:?tag}; EXTRA=${3:-}; HZ=${SWEETFB_HZ:-30}; SER=${SWEET_SERIAL:-0}
 cd "$(dirname "$0")/.."
-python3 -I tools/mkadt.py shim/out/sweet-gpupool.adt --highmem --gpupool
+# SWEET_SCALE=2: 0129's experimental 750x1624 @2x frame (the kernel follows the ADT, 0138)
+python3 -I tools/mkadt.py shim/out/sweet-gpupool.adt --highmem --gpupool $([ "${SWEET_SCALE:-3}" = 2 ] && echo --scale2)
 B="debug=0xc serial=$SER cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=$HZ sweetgpu=2 $EXTRA"
 echo "boot-args: $B"
 python3 -I tools/mkpayload.py "$K/kernel.development.sweet" shim/out/sweet-gpupool.adt "shim/out/payload-$T.bin" --cmdline "$B" | tail -2

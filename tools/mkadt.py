@@ -77,7 +77,7 @@ def node(name, props=(), children=()):
 GPU_POOL_SIZE = 0x10000000
 
 
-def build(seed=None, qemu=False, highmem=False, gpupool=False):
+def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -112,8 +112,11 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False):
         # MobileGestalt's screen class: display-scale (u32, default 0) comes
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
-        # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(2)),
+        # 360x800 points (like iPhone X class devices). The root images are made
+        # for the iPhone X's 1125x2436 @3x (375x812 points); scale2=True
+        # (--scale2) is 0129's experimental 750x1624 @2x frame, which the
+        # kernel (0138) selects from disp0's canvas below.
+        ('display-scale', u32(2 if scale2 else 3)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -193,8 +196,8 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(750)),
-            ('canvas-height', u32(1624)),
+            ('canvas-width', u32(750 if scale2 else 1125)),
+            ('canvas-height', u32(1624 if scale2 else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -251,7 +254,7 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 gpupool='--gpupool' in sys.argv)
+                 gpupool='--gpupool' in sys.argv, scale2='--scale2' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
