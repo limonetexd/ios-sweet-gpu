@@ -47,6 +47,8 @@ boot-args), `0143rm` CPU max `57bef953...`, `0143r2` 750x1624 `d7404e20...`,
 **A7 test `0143r` hung:** booted 14:14:12, did not return to fastboot within 540 s (kernel reboots at
 420 s), no adb/fastboot device now. Waiting for a manual Power+Vol- power cycle, then pull the ring in
 recovery. Suspects: 0138 native canvas path, or 0143's read-only TSENS map/read (first read at 5 s).
+**User backlog (2026-11-07): system time not set.** iOS does not get the correct time (RTC/NTP/timed);
+investigate after A7/A8, not now. [O] user report.
 **Not a hang: bad boot-args.** The `0143r` payload ended at `sweetgpu=2 \` (shell quoting bug in the
 build command), so `sweetgpu_reboot`, `sweetgpu_swipe` and `sweetshot` never reached the kernel; the
 phone stayed in iOS and the loop timed out. The other three payloads carry the full line. Ring still

@@ -44,6 +44,7 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | B10 | crash triage | TODO | | Q2 for symbolication |
 | B11 | App Library blur freeze repro | TODO | | needs the user + A3 |
 | B12 | 60-minute soak | TODO | | after A6 |
+| C14 | system time not set (RTC/NTP/timed) | TODO | 2026-11-07 | user report 2026-11-07; after A7/A8 |
 | B13 | flash gpu3 | BLOCKED | | Q4: user's explicit OK |
 | B14 | wallpaper / extensions verification | TODO | | after B13 |
 | C1 | promote the 8 Wi-Fi drafts + boot ladder | TODO | | own push batch (Q7) |
