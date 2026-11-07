@@ -77,7 +77,7 @@ def node(name, props=(), children=()):
 GPU_POOL_SIZE = 0x10000000
 
 
-def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False):
+def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False, wlan=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -198,7 +198,17 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(750 if scale2 else 1125)),
             ('canvas-height', u32(1624 if scale2 else 2436)),
-        ])])
+        ])] + ([
+        # Wi-Fi port (--wlan / SWEET_WLAN=1): launchd starts wifid only when the
+        # device tree has a node with device_type "wlan" (com.apple.wifid
+        # _LimitLoadToDeviceTree); the kernel's en0 + Apple80211
+        # (bsd/dev/flame_wlan.c, sweetwifid=1) answer it. Use together with
+        # sweetwifid=1, or wifid starts with no en0.
+        node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('flame,wcn3990')),
+        ])] if wlan else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -254,7 +264,8 @@ def build(seed=None, qemu=False, highmem=False, gpupool=False, scale2=False):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 gpupool='--gpupool' in sys.argv, scale2='--scale2' in sys.argv)
+                 gpupool='--gpupool' in sys.argv, scale2='--scale2' in sys.argv,
+                 wlan='--wlan' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 (DeepSeek lead): rung 1 PASSED; clock fix 0159; CI 42407117041 <<<
+### >>> 2026-11-07 (DeepSeek lead): rung 1+2 PASSED; clock 2026; rung 3a testing <<<
 
 **CI `42398886992` failed** (commit `974c282`): the seven drafted patches did not build.
 Root causes: `sweet_rpmh.c` called `rh_lookup_ex`/`rh_send_n`/`RH_BCM` (never existed) and used a
@@ -51,6 +51,24 @@ CI `42407117041` queued.
 prebuilt `shim-boot-0156r2.img` uses the old kernel and must be rebuilt) -> user present, because the
 SMMU stream can stall a CPU (Power+Vol- to recover). The ring must show the WLAN SMMU stream lines and
 a 2026 date.
+
+**RUNG 2 PASSED and the clock is right (2026-11-07 20:52, image `0159r2` = CI `42407117041` kernel +
+`sweetpmem=1 sweetsmmuwlan=1`, ring `logs/xnu-0159r-rung2.txt`):**
+`SWEET SMMU: BCM votes SN15=0 CN0=0 (sweetsmmuwlan=1)` · `WLAN stream thread armed (1 s)` ·
+`sCR0=0x230406` · `ID0=0x4c017e4f ID1=0x6000003d: 79 SMRs, 61 context banks` ·
+`WLAN 0x240/0x1 -> CB4 via SMR6: SMR 0x80010240 S2CR 0x4 SCTLR 0xe0 CBAR 0x1f000 -> ok`. The apps
+SMMU reads did **not** stall the CPU: the BCM votes are effective. 0159 works: launchd logs
+`2026-11-07 11:52:08` (PST); the early 0144 RTC read (53819777 s) is overwritten by sweetepoch.
+
+**Rung 3a (2026-11-07 ~21:0x):** `tools/mkadt.py --wlan` (SWEET_WLAN=1) adds
+`/arm-io/wlan { device_type="wlan", compatible="flame,wcn3990" }`, and
+`tools/sweet-gpu-image.sh` passes it. Image `0159wifi` = 0159 kernel + `sweetpmem=1 sweetsmmuwlan=1
+sweetwifid=1` + the wlan node, 300 s probe running. It should show `/dev/wlan ready` and `exec wifid`;
+en0 cannot come up until the root has `wland` + firmware (C2), which is blocked on HFS+ write access
+in WSL (`hfsplus.ko` is gone after a shutdown; installing the hfsplus tools needs sudo).
+
+**Next:** if rung 3a is clean, C2 must produce a gpu3 root with wland/firmware/launchd job (B4 build,
+then B13 flash needs the user's explicit OK) and C3 does the real scan/join/Safari test.
 
 **Research round (4 agents, 2026-11-07 late):** the Wi-Fi agent found two functional (not compile)
 blockers in 0147, now fixed by `0155` (commit `eaf1a58`): (a) 0147 shipped `/dev/pmem` **without**
