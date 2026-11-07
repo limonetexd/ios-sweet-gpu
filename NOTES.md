@@ -39,6 +39,10 @@ visible from iokit C++ even with `<vm/pmap.h>`. Fixed in place (0142/0143 never 
 the extern, as `sweet_gpu.c` does for `ml_io_map`; 0142 drops the pmap dirty-bit loop and keeps `bzero`
 + `redwood_gpu_to_memory` (dc civac). `tools/xnu-tree.sh` rebuilt from base: 136 commits, no SKIP.
 Push `f4523e1..33a27b6`; CI run 42374790152.
+**CI 42374790152 success** (13m41s). Kernel `xnu/out-0143` sha256 `22b042dd...`. Images built, all
+`SWEETFB_HZ=60 SWEET_SERIAL=0`, args `sweetgpu_reboot=420 sweetgpu_swipe=60 sweetshot=90`:
+`0143r` native `7ef7fd4b...`, `0143rm` CPU max `57bef953...`, `0143r2` 750x1624 `d7404e20...`,
+`0143rc0` native + `sweet_surfclean=0` `8d0ddd8c...`. Four unattended tests running (540 s each).
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 
