@@ -33,7 +33,7 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | A8 | decide defaults from the A/B | DONE | 2026-11-07 | surfclean on stays default (+32 % avg); CPU max opt-in (avg -21 %, 59.8 C); 750 opt-in; NOTES entry |
 | A9 | 750 vs 1125 on screenshots, ask the user (Q1) | DONE | 2026-11-07 | user says the current native boot looks good; 750 deferred to B4/B13; SWEET SHOT tails lost in the ring |
 | B1 | why a new IOSurface per frame | TODO | | needs A2 logs; maybe Q2 |
-| B2 | promote 0124 GPU window 512 MiB | DOING | 2026-11-07 | 0145 (commit 925197a) failed CI 42384618325 at Build: kma_flags_t cast + missing pmap_find_phys declaration; 0146 build fix generated, check-patch ok, CI running; boot test pending |
+| B2 | promote 0124 GPU window 512 MiB | DONE | 2026-11-07 | 0145 (commit 925197a) failed CI 42384618325; 0146 build fix (commit bcbf363) passed CI 42386148293; 0146r booted, ring logs/xnu-0146r.txt shows "SWEET GPU: VA window 512 MiB: 320 tables", 0 freezes, 0 panics |
 | B3 | touch latency probe | TODO | | |
 | B4 | build root gpu3 (no flash) | TODO | | Q3 for the apt package |
 | B5 | SpringBoard commit rate | TODO | | |

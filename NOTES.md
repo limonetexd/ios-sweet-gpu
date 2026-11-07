@@ -2,7 +2,15 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 (DeepSeek lead): C14 0144r booted (RTC read works, RTC stale); B2 0145 failed, 0146 fix <<<
+### >>> 2026-11-07 (DeepSeek lead): B2 (0145 + 0146) done & booted successfully <<<
+
+**B2 done.** CI `42386148293` success (13m32s), kernel `xnu/out-0146`. Image `0146r` booted and completed
+the 420 s unattended test (`logs/xnu-0146r.txt`, 737 KB).
+**Result:** The 512 MiB GPU window initialized cleanly:
+`SWEET GPU: VA window 512 MiB: 320 tables in XNU memory at 0x1047d0000`.
+Zero freezes (`SWEET FREEZE` lines = 0), zero refusals, zero panics. The pool slots mapped correctly.
+FPS summary: 23.3 swaps/s normal avg (p90 41), GL frame p50 9.5 ms / p95 13.5 ms.
+B2 is fully verified and closed. Next is C1 (promoted Wi-Fi drafts + boot ladder) or B4 (root gpu3).
 
 **C14 / 0144r booted** (image `702facbd...`, 240 s reboot, ring `logs/xnu-0144r.txt`, 320 KB).
 The PM6150 RTC read works exactly as written:
