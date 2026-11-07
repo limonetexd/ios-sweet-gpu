@@ -32,6 +32,7 @@ A4's decoder was fixed to parse the kernel's `why TEXT t MS` fields; `--selftest
 `statsReport`; one-shot SROT probe prints deci-C vs raw ADC; `sweettherm=0` off. Review replaced
 `IOLog` with `printf` (bsd/dev has no IOLib.h). Apply/check ok; tree 136.
 **Next:** A7 batch gate: one push (0138-0143), CI, 4 images, 4 unattended tests.
+**A7 started:** push `36dd2c8..f4523e1` (0138-0143 + tools + notes); CI run 42373873926.
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 

@@ -28,8 +28,8 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | A3 | 0141 sweetshot kernel screenshots | DONE | 2026-11-07 | commit d42a076; apply/check ok; tree 134 |
 | A4 | `tools/sweet-shot.py` decoder | DONE | 2026-11-07 | commit 85283c3; selftest ok |
 | A5 | 0142 background clean of recycled surface memory | DONE | 2026-11-07 | commit 55fdd54; apply/check ok; tree 135 |
-| A6 | shim CPU max + 0143 thermal log | DONE | 2026-11-07 | part 1 SHIM_CPUMAX + image env; part 2 commit pending (0143 apply/check ok, tree 136) |
-| A7 | batch gate: push, CI, 4 images, 4 tests | TODO | | needs phone in fastboot |
+| A6 | shim CPU max + 0143 thermal log | DONE | 2026-11-07 | part 1 SHIM_CPUMAX + image env; 0143 commit f4523e1, apply/check ok, tree 136 |
+| A7 | batch gate: push, CI, 4 images, 4 tests | DOING | 2026-11-07 | push f4523e1; CI run 42373873926 |
 | A8 | decide defaults from the A/B | TODO | | |
 | A9 | 750 vs 1125 on screenshots, ask the user (Q1) | TODO | | |
 | B1 | why a new IOSurface per frame | TODO | | needs A2 logs; maybe Q2 |
