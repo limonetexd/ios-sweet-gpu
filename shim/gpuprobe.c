@@ -1297,8 +1297,14 @@ static void cpufreq_dump(void)
  */
 static void cpu_boost(void)
 {
+#ifdef SHIM_CPUMAX
+	/* A6: top of the LUT (gold 13 = 2304 MHz, silver 9 = 1804.8 MHz), opt-in image */
+	wr32(CPUFREQ0 + 0x920, 9);
+	wr32(CPUFREQ1 + 0x920, 13);
+#else
 	wr32(CPUFREQ0 + 0x920, 8);
 	wr32(CPUFREQ1 + 0x920, 10);
+#endif
 	delay_ms(2);
 	con_hex2("CPUFREQ", "silver state=", rd32(CPUFREQ0 + 0x920), "gold state=", rd32(CPUFREQ1 + 0x920));
 }
