@@ -2,6 +2,51 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
+
+**Claude Code (Sonnet 5.5), usage limit reached; DeepSeek/opencode continues from `notes/deepseek/ROADMAP-2026-11-07.md`.**
+- **0138** `xnu/patches/0138-sweet-fb-native-default.patch` (committed locally, **not pushed, never built by CI,
+  never booted**): AppleCLCD (`SweetFramebuffer.cpp`) and `SweetHIDTouch` (`hid/SweetHID.cpp`) read `/arm-io/disp0`
+  `canvas-width`/`canvas-height`. 750x1624 selects 0129's scaled path (crop 15,12 720x1600); anything else is the native
+  1125x2436. `tools/mkadt.py` defaults to `display-scale 3` + canvas 1125x2436 again (`--scale2`: 2 and 750x1624);
+  `tools/sweet-gpu-image.sh` honours `SWEET_SCALE=2`. Boot-arg `sweetfb_scale` is gone, so the kernel can no longer
+  disagree with the ADT (the 0129 trap: every image from `main` booted the @2x UI on the @3x root). [O] checked: the
+  patch applies on the full series (`tools/xnu-tree.sh`), both ADTs dump the right canvas (0x465x0x984, 0x2ee x 0x658).
+  [G] compiles (small code; CI is the only compiler). Proof lines after the first boot: `SWEET FB: device tree canvas
+  1125x2436: 1125x2436 frames`, `SWEET HID: touch registered (1125x2436 frames)`, `SWEET FB: modes published: 1125x2436`.
+- **New tools** (tested): `tools/xnu-tree.sh` (a clean xnu-8796 + every patch applied like CI, one commit per patch;
+  modes rebuild/update/check/status), `tools/xnu-mkpatch.sh` (edits in that tree -> numbered patch, re-applied to the tree
+  without the edits, committed there), `tools/check-patch.py` (odd quotes = literal newline in a string, CR, hunk
+  counts, blank context lines, IOLog lines the ring would cut; zero findings over the 129 existing patches, one on a
+  synthetic bad patch), `tools/sweet-fps-summary.py` (swaps/s, GL frame split, cache work per submission, crashes).
+- **Numbers** from `tools/sweet-fps-summary.py` ("normal" = active seconds, no gap > 100 ms) [O]:
+
+  | log | kernel / ADT | swaps/s avg / p90 | GL frame p50 / p95 | present | cache work per submission |
+  | --- | --- | --- | --- | --- | --- |
+  | `xnu-0122b.txt` | 0122, native 1125 | 26.4 / 41 | 10.5 / 19.6 ms | 3.4 ms | 6189 KB, 678 us |
+  | `xnu-0130r.txt` | 0130, scaled 750 | 26.7 / 47 | 7.2 / 9.1 ms | 11.7 ms | 2117 KB, 232 us |
+  | `xnu-0131r.txt` | 0131, scaled 750 colmap, partial (60 normal s) | 33.0 / 59 | 7.7 / 11.1 ms | 5.9 ms | 2533 KB, 290 us |
+
+  The ring cuts long IOLog lines at ~256 characters; the eagl frame lines lose their tail (`before it for the IOSurfaces`), so
+  the summary matches only up to `N before it`. The RedwoodGPU "GPU worked N us" figure is divided twice and the second
+  line is cut (roadmap A1). [G] the scaled path's gain is real but its UI layout was never looked at (roadmap A9).
+- **Facts that corrected older notes** [O, read in the code]: patches `0107` (sandbox op 4 container path for `.appex`)
+  and `0108` (AMFI sysctl `developer_mode_status` + `AppleMobileFileIntegrity` service) already do items b/c/d of the
+  2026-11-06 ecosystem report, so the wallpaper blocker left is the root side (`sweet-root-fixes.py`, not yet run on a real
+  image) and sandbox ops 5/6 (still ENOENT); `sweet-root-tweaks.py` already removes CommCenter, the VirtualAudio plug-in and
+  the MediaToolbox recorder; the 0104/0105 "super" patches are already in `patches-pending/` (CLAUDE.md said otherwise);
+  `userland.yml` starts by itself on a push that changes `userland/**`; `tools/sweet-crash.py` needs the `ipsw` tool,
+  which is not installed.
+- **Roadmap** `notes/deepseek/ROADMAP-2026-11-07.md` (+ `-B-near`, `-C-connectivity-hardware`, `-D-far`, `ROADMAP-STATUS.md`,
+  `PROMPT-2026-11-07-roadmap.md`): 4 horizons, ~45 task cards each with files, steps and a "Done when" command, recipes,
+  a delegation protocol (roles, brief template, reviewer checklist) and the questions to ask the user. Horizon A (finish the
+  in-flight batch): 0139 RedwoodGPU stats fix, 0140 IOSurface-property and IOMFB-selector diagnostics, 0141 `sweetshot` kernel
+  screenshots into the log (+ `tools/sweet-shot.py`), 0142 clean recycled surface memory in the background (A/B vs
+  `sweet_surfclean=0`), shim CPU clocks to the top of the LUT (`SHIM_CPUMAX`) with a TSENS thermal log (0143), then one
+  push, four images, four unattended runs and the decisions.
+- **Not done / unknown:** nothing here was compiled by Apple clang or booted; 0139-0143 exist only as specs; the phone was
+  not touched this session (in fastboot).
+
 ### >>> 2026-11-07: render scale 750x1624 (0129), presenter retention (0128) <<<
 
 **Claude Code review of the opencode work (2026-11-07).** Checked git, CI, patch list and these notes:
