@@ -1,0 +1,62 @@
+From: HakiOS
+Subject: [PATCH 0159] sweet rtc: apply sweetepoch after clock_initialize_calendar (0156 fix)
+
+Rung 1 (0156) printed the sweetepoch line but userland still showed 1969:
+PE_lockdown_iokit()/StartIOKitMatching() runs before bsd_init, so
+SweetBattery::start() applied sweetepoch early, and then bsd_init ->
+IOKitInitializeTime -> clock_initialize_calendar() replaced the calendar
+with the platform RTC's (no IORTC here, so zero). launchd then logged
+1969-12-31 and SpringBoard followed it.
+
+Call sweet_set_calendar_from_bootarg() right after
+clock_initialize_calendar() in IOKitInitializeTime(): the last calendar
+write before userland starts. The SweetBattery early call (which never had
+an effect) is removed. Function unchanged: sweetepoch= < 2001 ignored.
+
+Verification: the next ring must show userland timestamps in 2026, and
+SWEET RTC: calendar set from sweetepoch appears once, after
+clock_initialize_calendar.
+---
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 567e6b3..12e169f 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -89,6 +89,18 @@ IOKitInitializeTime( void )
+ #endif
+ 
+ 	clock_initialize_calendar();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0159: clock_initialize_calendar() replaces the calendar with the
++	 * platform RTC's (absent here), and it runs after IOKit matching started
++	 * SweetBattery, so 0156's early sweetepoch= was being overwritten. Apply
++	 * it again here, the last write before userland starts.
++	 */
++	{
++		extern void sweet_set_calendar_from_bootarg(void);
++		sweet_set_calendar_from_bootarg();
++	}
++#endif
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 1ca9b83..4339dac 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,7 +17,6 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" void sweet_rtc_set_calendar(void);    /* Wi-Fi 0133 */
+-extern "C" void sweet_set_calendar_from_bootarg(void);  /* host time from the image build */
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -277,7 +276,6 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	sweet_set_calendar_from_bootarg();      /* sweetepoch=: correct date even if SPMI fails */
+ 	int real = 1;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
