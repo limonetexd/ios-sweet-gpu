@@ -12,6 +12,8 @@ are the detailed sources: `research-2026-11-06-wifi-current.md` (the plan, 456 l
 older base; **never booted**). In order: `0130` `/dev/pmem` | `0131` RPMh votes for Wi-Fi rails | `0132` BCM votes +
 WLAN SMMU stream thread | `0133` RTC calendar | `0134` IO80211 / network objects | `0135` `/dev/wlan`, en0, Apple80211
 ioctls (2439 lines, all new files) | `0136` IOKit quiesce | `0137` AKS wrap/unwrap selectors.
+**2026-11-07: `0133` was promoted alone to `xnu/patches/0144-sweet-rtc-calendar.patch` for C14 (system time), body
+unchanged; seven drafts remain here (`0130`, `0131`, `0132`, `0134`, `0135`, `0136`, `0137`).**
 Defaults: everything is gated OFF except the RTC read (acts only when the calendar is before 2001, `sweetrtc=0`
 disables) and the AKS selectors 10/11 (were "unsupported"). A kernel with the drafts and **no** new boot-args must behave
 like today's.

@@ -1,5 +1,5 @@
 From: HakiOS
-Subject: [PATCH 0124] sweet: 512 MiB GPU VA window (L3 tables from XNU memory, sunfish a0b076c)
+Subject: [PATCH 0145] sweet: 512 MiB GPU VA window (L3 tables from XNU memory, sunfish a0b076c)
 
 Port of frokfrdk/ios-sweet branch sunfish commit a0b076c to our SweetAdreno.cpp.
 The GPU context bank 1 walks 4 KiB tables from the shim's L1 page at
