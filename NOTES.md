@@ -26,7 +26,11 @@ boot args. The agent used `kernel_thread_start_priority`, which failed to compil
 replaced it with `kernel_thread_start` (the thread sleeps 250 ms). `check-patch`/apply ok; tree 134.
 A4's decoder was fixed to parse the kernel's `why TEXT t MS` fields; `--selftest` still prints
 `selftest ok`.
-**Next:** A5 0142 (lead), A6 0143 (thermal), A7 batch gate.
+**A5 done:** `0142-sweet-surface-clean-background.patch` (commit 55fdd54): the kept-memory thread now
+bzeroes, cleans to PoC (`dc civac`) and clears the pmap dirty bits; the create marks `s->cleanOnce`, so
+the first submit has no whole 13.9 MB clean. `sweet_surfclean=0` restores today's behaviour. Apply/check
+ok; tree 135. Not built/tested yet.
+**Next:** A6 0143 thermal (flash agent), then A7 batch gate.
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 
