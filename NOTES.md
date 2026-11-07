@@ -70,6 +70,29 @@ in WSL (`hfsplus.ko` is gone after a shutdown; installing the hfsplus tools need
 **Next:** if rung 3a is clean, C2 must produce a gpu3 root with wland/firmware/launchd job (B4 build,
 then B13 flash needs the user's explicit OK) and C3 does the real scan/join/Safari test.
 
+**C2 root image built (2026-11-07 ~21:36): gpu3 with Wi-Fi files.** The iOS root is an HFSX
+(case-sensitive) volume, and the `hfsplus` userspace tools only read HFS+, while the WSL kernel has no
+hfsplus module. Built the image in a QEMU/KVM Ubuntu cloud VM (hfsplus module from
+linux-modules-extra), root attached as /dev/vdb, staging share over 9p. Installed:
+`/private/var/local/bin/wland` 0755 (sha256 951a05a2…, the DC28088 binary), 71 files in
+`/private/var/local/fw/modem` (incl. `bdwlan.b00` copied from `bdwlan.bin`), rmtfs
+`modemst1/modemst2/fsg/fsc.img`, writable `fw/rw`, the merged
+`/System/Library/xpc/launchd.plist` now has 531 jobs including `org.ios-sweet.wland`
+(`/var/local/bin/wland auto`, RunAtLoad, root), and
+`/private/var/preferences/SystemConfiguration/preferences.plist` has the en0/AirPort/DHCP service.
+7-Zip on the HFSX image verifies all paths; `fsck.hfsplus -fy` says OK (the `-fn` "volume header needs
+minor repair" is a Linux-fsck HFSX false positive: it repeats after a successful repair).
+`img2simg` is producing `ipsw/ios16-root-gpu3.simg` (gpu2 stays as rollback).
+
+**Next: B13 flash `fastboot flash userdata ios16-root-gpu3.simg` (destructive; needs the user's OK),
+then rung 3: boot `0159` with `sweetpmem=1 sweetsmmuwlan=1 sweetwifid=1` + the ADT wlan node. Expect
+`wland` from launchd, `flame wlan: the radio is up`, `en0`, wifid, then scan/join in Settings (C3).**
+
+**Update 21:50: gpu3 flashed.** `fastboot flash userdata ipsw/ios16-root-gpu3.simg` OK in 331 s (16
+sparse chunks; sha256 1d7334c5…). gpu2 stays at `ipsw/ios16-root-gpu2.simg` as rollback. Rung-3 boot
+(0159 + `sweetpmem=1 sweetsmmuwlan=1 sweetwifid=1`, ADT wlan node) started; ring will be
+`logs/xnu-0159wifi-gpu3.txt`.
+
 **Research round (4 agents, 2026-11-07 late):** the Wi-Fi agent found two functional (not compile)
 blockers in 0147, now fixed by `0155` (commit `eaf1a58`): (a) 0147 shipped `/dev/pmem` **without**
 `PMEM_RPMH`, so wland's first `pm_rpmh()` got ENOTTY and exited; (b) `rh_lookup()` accepted only VRM
