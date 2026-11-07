@@ -16,8 +16,8 @@ NOTES.md entry title. Cards: `ROADMAP-2026-11-07.md` (A), `-B-near.md`, `-C-conn
 | ID | Task | Status | Updated | Evidence / blocker |
 | --- | --- | --- | --- | --- |
 | A0 | 0138 native default | DONE | 2026-11-07 | local commit; CI pending (A7) |
-| A1 | 0139 RedwoodGPU stats fix | TODO | | |
-| A2 | 0140 diagnostics (IOSurface props, IOMFB trace) | TODO | | |
+| A1 | 0139 RedwoodGPU stats fix | DONE | 2026-11-07 | commit b6e6e35; apply/check ok; tree 133 |
+| A2 | 0140 diagnostics (IOSurface props, IOMFB trace) | DONE | 2026-11-07 | commit 9a73ae4; apply/check ok; tree 133 |
 | A3 | 0141 sweetshot kernel screenshots | TODO | | after A2 (same files) |
 | A4 | `tools/sweet-shot.py` decoder | TODO | | spec in A3/A4 cards |
 | A5 | 0142 background clean of recycled surface memory | TODO | | after A2 |

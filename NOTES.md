@@ -2,6 +2,17 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-07 (DeepSeek lead): A1/A2 patches reviewed and committed (0139/0140) <<<
+
+**Build:** not pushed, not built; `0139`/`0140` apply on the 0138 tree; `check-patch.py` ok; tree 133 commits.
+**Observed [O]:** `0139` removes the double divide (`worked` is already the average; total is
+`worked * timed / 1000`), splits the RedwoodGPU IOLog in three (<200 chars), and counts the first whole
+cleans in `toMemoryWritten` (`gGPUStat.wholeCleans/wholeBytes`). `0140` logs the first six 4 MB+
+`backboardd` IOSurface create property dictionaries (chunked at 180) and the first three calls of every
+IOMFB selector, plus the first two SwapEnd records (0x120 bytes).
+**Guess [G]:** A2 answers B1 (why CA makes a new surface each frame); A1 gives A5 the cache numbers.
+**Next:** A3 0141 `sweetshot` and A4 `tools/sweet-shot.py` (both delegated), then A5/A6/A7.
+
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 
 **Claude Code (Sonnet 5.5), usage limit reached; DeepSeek/opencode continues from `notes/deepseek/ROADMAP-2026-11-07.md`.**
