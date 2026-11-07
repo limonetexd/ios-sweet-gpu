@@ -13,8 +13,12 @@
   scaled-copy column map.
 - Latest built kernel **0131**: CI 42314190705 success 19m36s; `shim-boot-0131r.img` SHA
   `2f169858adff9352e2d589a186ef90242ad845831bc7a2086d8c1a72a9f23d34`, `shim-boot-0131s0.img` SHA
-  `b1ad220ff83229bc379bdcbb8058f1a50e6fa884d5512018227bd55875be4cce`; unattended test started
-  -> `logs/xnu-0131r.txt` (result not written yet). Latest measured: **0130**: `0130r` SHA
+  `b1ad220ff83229bc379bdcbb8058f1a50e6fa884d5512018227bd55875be4cce`. 0131r partial (test
+  interrupted by the user at ~4 min, `logs/xnu-0131r.txt`): `present` **5.77 ms** average (colmap
+  works, was 11.4), GL frame ~8.5-9.6 ms. **The 750x1624 UI and the recovery showed a vertical
+  offset (the dock at the camera cutout) without the root MobileGestalt/status-bar fix**; the old
+  `0123s0` (1125) was booted to restore. Do not manually test the 750 image until the root fix.
+  Latest measured: **0130**: `0130r` SHA
   `9c0bb0d2e1706eb3774932a5787f714085de7b4df1caf98c21acb65a28e82c1c`, `0130s0` SHA
   `f15ba7dce5a2fc59cf985b135c039143afbc62b2720fd87be9fa7a86c26088b5`, log `logs/xnu-0130r.txt`;
   CI 42311771101 (12m15s). Old-ADT fallback `0123s0` SHA
@@ -24,8 +28,11 @@
   wired 47 MB; GL frame p50 **7.21 ms**, p90 **8.64**, p95 **9.59** (was 13.1/21.5). New
   bottleneck: `present` **11.4 ms** average, from the per-pixel divide in the scaled band copy;
   swaps active avg 29.2, p50 30, p90 **51**, max 53. **0131** precomputes a source-column map
-  (`scaleX`); CI 42314190705 success 19m36s; `0131r`/`0131s0` built and `0131r` is running
-  unattended (`logs/xnu-0131r.txt`). Next: analyze present/swaps; target 4-5 ms and higher swaps.
+  (`scaleX`); CI 42314190705 success 19m36s; `0131r`/`0131s0` built. 0131r partial: `present`
+  **5.77 ms** average, GL 8.5-9.6 ms; the test was interrupted by the user at ~4 min
+  (`logs/xnu-0131r.txt`) because the **750x1624 UI/recovery was vertically offset** (dock at the
+  camera) without the root MobileGestalt/status-bar fix. Next: fix the root layout before another
+  manual 750 test, then re-run 0131r.
 - **Defaults/AB** (all in `logs/`): 0123 `sweetfb_bind=1` on (26.0 vs 21.7 avg, p90 41 vs 33);
   `ca_vbl=1` no gain (26.2/39, `xnu-0122bc.txt`); `sweetfb_threads=6` no gain (25.7/40,
   `xnu-0122bt6.txt`); `sweetfb_rate=120` worse (25.4/38, `xnu-0122b120.txt`). 0122 pool clamp
