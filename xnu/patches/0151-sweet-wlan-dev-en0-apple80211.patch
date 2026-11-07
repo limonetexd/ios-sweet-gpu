@@ -1,22 +1,49 @@
+From: HakiOS
+Subject: [PATCH 0151] sweet wifi: /dev/wlan, en0 + Apple80211 for wifid (0135 -> 0151)
+
+Complete Wi-Fi station stack (2439 lines new). Enabled only with
+sweetwifid=1 (default off). Provides /dev/wlan char device, en0
+interface via BSD interface KPI (redwood_net.c), Apple80211 ioctls
+(redwood_apple80211.c) for wifid, and the station logic (flame_sta.c)
+talking to userland wland over /dev/wlan (flame_wlan.c).
+
+bsd/conf/files: add redwood_sta.c, redwood_net.c, redwood_apple80211.c,
+flame_sta.c, flame_wlan.c.
+bsd/sys/redwood_sta.h: station KPI (power, scan, join, leave, state, channels).
+bsd/sys/redwood_net.h: en0 interface glue (ifnet, ifmedia, DLT_IEEE802_11_RADIO).
+bsd/sys/redwood_input.h: one struct for wland -> kernel frames.
+bsd/sys/flame_wlan.h: /dev/wlan message protocol (FW_SCAN, FW_JOIN, FW_TX, etc.).
+bsd/dev/redwood_sta.c: station core (state machine, scan cache, join logic).
+bsd/dev/redwood_net.c: en0 ifnet, if_attach, bpf, media, ioctl pass-through.
+bsd/dev/redwood_apple80211.c: Apple80211 user client (ioctl 0..2438) for wifid.
+bsd/dev/flame_sta.c: redwood_sta_ops impl over flame_wlan_* (wland C API).
+bsd/dev/flame_wlan.c: /dev/wlan char device, wland handshake, frame RX/TX hooks.
+bsd/dev/sweet_ufs.c: call flame_wlan_init() from sweet_ufs_init().
+
+Log check (sweetwifid=1): "SWEET FLAME: /dev/wlan ready (major N)", "SWEET
+REDWOOD: en0 attached", "MiniIONetworkStack: opened by configd ...", no
+configd "*TIMEOUT*". wifid "Falling back to IOCTL path".
+
+Port of ios-sweet 0135; regenerated on current tree after 0150.---
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 70dd04f..dfe4f78 100644
+index 94dfbc2..7b246d7 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -113,6 +113,11 @@ bsd/dev/sweet_spmi.c			standard
- bsd/dev/sweet_usb.c			standard
- bsd/dev/sweet_pmem.c			standard
+@@ -114,6 +114,11 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_pmem.c		standard
  bsd/dev/sweet_wlan_smmu.c		standard
+ bsd/dev/sweet_gpu.c			standard
 +bsd/dev/redwood_sta.c		standard
 +bsd/dev/redwood_net.c		standard
 +bsd/dev/redwood_apple80211.c	standard
 +bsd/dev/flame_sta.c		standard
 +bsd/dev/flame_wlan.c		standard
- bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_thermal.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
 diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
 new file mode 100644
-index 0000000..7e40bda
+index 0000000..0f753cf
 --- /dev/null
 +++ b/bsd/dev/flame_sta.c
 @@ -0,0 +1,242 @@
@@ -262,9 +289,10 @@ index 0000000..7e40bda
 +	MiniIONetworkStackStart();              /* configd waits for it before it calls the registry quiet */
 +	flame_wlan_ready_hook = sta_ready;
 +}
+\ No newline at end of file
 diff --git a/bsd/dev/flame_wlan.c b/bsd/dev/flame_wlan.c
 new file mode 100644
-index 0000000..23edbd2
+index 0000000..71c7b79
 --- /dev/null
 +++ b/bsd/dev/flame_wlan.c
 @@ -0,0 +1,445 @@
@@ -713,9 +741,10 @@ index 0000000..23edbd2
 +	printf("flame wlan: /dev/wlan ready (major %d)\n", major);
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+\ No newline at end of file
 diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
 new file mode 100644
-index 0000000..e2674ee
+index 0000000..37a790d
 --- /dev/null
 +++ b/bsd/dev/redwood_apple80211.c
 @@ -0,0 +1,739 @@
@@ -1458,9 +1487,10 @@ index 0000000..e2674ee
 +	}
 +	return error;
 +}
+\ No newline at end of file
 diff --git a/bsd/dev/redwood_net.c b/bsd/dev/redwood_net.c
 new file mode 100644
-index 0000000..e7b46fd
+index 0000000..22909cb
 --- /dev/null
 +++ b/bsd/dev/redwood_net.c
 @@ -0,0 +1,376 @@
@@ -1840,9 +1870,10 @@ index 0000000..e7b46fd
 +	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 +	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
 +}
+\ No newline at end of file
 diff --git a/bsd/dev/redwood_sta.c b/bsd/dev/redwood_sta.c
 new file mode 100644
-index 0000000..f4e0490
+index 0000000..84a09e9
 --- /dev/null
 +++ b/bsd/dev/redwood_sta.c
 @@ -0,0 +1,371 @@
@@ -2217,8 +2248,9 @@ index 0000000..f4e0490
 +	}
 +	return ops != NULL;
 +}
+\ No newline at end of file
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 0b2f6b2..babba43 100644
+index 10d00ae..5604c5b 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -56,6 +56,7 @@ extern void sweet_usb_probe(void);
@@ -2229,17 +2261,17 @@ index 0b2f6b2..babba43 100644
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -666,6 +667,7 @@ sweet_ufs_init(void)
- 	sweet_gpu_init();
- 	sweet_pmem_init();       /* /dev/pmem, only with sweetpmem=1: bsd/dev/sweet_pmem.c (Wi-Fi 0130) */
- 	sweet_wlan_smmu_start(); /* sweetsmmuwlan=1|2: BCM votes + WLAN SMMU stream (Wi-Fi 0132) */
+@@ -663,6 +664,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
 +	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid, only with sweetwifid=1 (Wi-Fi 0135) */
- 	return 0;
- }
- 
+ 	sweet_wlan_smmu_start(); /* sweetsmmuwlan=1|2: BCM votes + WLAN SMMU stream (Wi-Fi 0132) */
+ 	sweet_pmem_init();       /* /dev/pmem, only with sweetpmem=1: bsd/dev/sweet_pmem.c (Wi-Fi 0130) */
+ 	sweet_gpu_init();
 diff --git a/bsd/sys/flame_wlan.h b/bsd/sys/flame_wlan.h
 new file mode 100644
-index 0000000..9107cbb
+index 0000000..982d36a
 --- /dev/null
 +++ b/bsd/sys/flame_wlan.h
 @@ -0,0 +1,69 @@
@@ -2312,9 +2344,10 @@ index 0000000..9107cbb
 +};
 +
 +#endif
+\ No newline at end of file
 diff --git a/bsd/sys/redwood_input.h b/bsd/sys/redwood_input.h
 new file mode 100644
-index 0000000..c5dbd02
+index 0000000..667c94b
 --- /dev/null
 +++ b/bsd/sys/redwood_input.h
 @@ -0,0 +1,5 @@
@@ -2323,9 +2356,10 @@ index 0000000..c5dbd02
 +#define _SYS_REDWOOD_INPUT_H_
 +#define redwood_wifi_tell(...) printf(__VA_ARGS__)
 +#endif
+\ No newline at end of file
 diff --git a/bsd/sys/redwood_net.h b/bsd/sys/redwood_net.h
 new file mode 100644
-index 0000000..41550ce
+index 0000000..3e58b5f
 --- /dev/null
 +++ b/bsd/sys/redwood_net.h
 @@ -0,0 +1,63 @@
@@ -2392,9 +2426,10 @@ index 0000000..41550ce
 +#endif /* KERNEL */
 +
 +#endif /* _SYS_REDWOOD_NET_H_ */
+\ No newline at end of file
 diff --git a/bsd/sys/redwood_sta.h b/bsd/sys/redwood_sta.h
 new file mode 100644
-index 0000000..c5ed067
+index 0000000..6a1ecd4
 --- /dev/null
 +++ b/bsd/sys/redwood_sta.h
 @@ -0,0 +1,122 @@
@@ -2520,3 +2555,4 @@ index 0000000..c5ed067
 +#endif
 +
 +#endif
+\ No newline at end of file

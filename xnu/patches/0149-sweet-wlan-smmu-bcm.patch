@@ -1,17 +1,41 @@
+From: HakiOS
+Subject: [PATCH 0149] sweet wifi: BCM votes + WLAN SMMU stream (0132 -> 0149)
+
+Adds kernel-side BCM votes for the apps SMMU (SN15+CN0) and a kernel
+thread that programs the WCN3990 SMMU stream (SID 0x240 mask 1) so
+wland never touches the SMMU. Gated by sweetsmmuwlan=1|2 (default off).
+
+bsd/conf/files: add sweet_wlan_smmu.c.
+bsd/dev/sweet_pmem.c: recast BCM votes (SN15+CN0) every 50 ms before
+apps-SMMU access (0x15000000..0x15200000).
+bsd/dev/sweet_rpmh.c: new sweet_rpmh_bcm_vote(res, x, y) for SN15/CN0
+active-only BCM votes (commit|valid|x<<14|y).
+bsd/dev/sweet_ufs.c: call sweet_wlan_smmu_start() from sweet_ufs_init().
+bsd/dev/sweet_wlan_smmu.c: new file. Mode 1 = BCM votes + stream thread
+(1 s delay); Mode 2 = BCM votes only (bisect). Thread reads ID0/ID1,
+finds free SMR/context bank, programs CBAR=0x1f000, SCTLR=0xe0,
+S2CR points to bank, sTLBGSYNC.
+
+Log check (mode 1): "SWEET SMMU: BCM votes SN15=0 CN0=0", "SWEET SMMU:
+ID0=... ID1=...: N SMRs, M banks", "SWEET SMMU: WLAN 0x240/0x1 -> CB<n>
+via SMR<m>: ... -> ok". If ring ends after "reading apps SMMU" = CPU
+stalled (votes not effective).
+
+Port of ios-sweet 0132; regenerated on current tree after 0148.---
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 34e3d08..70dd04f 100644
+index 4df78bc..94dfbc2 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
- bsd/dev/sweet_pmem.c			standard
+ bsd/dev/sweet_pmem.c		standard
 +bsd/dev/sweet_wlan_smmu.c		standard
  bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_thermal.c			standard
  bsd/dev/mem.c				standard
- bsd/dev/munge.c 			optional config_requires_u32_munging
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
-index 0b2fd3e..f753583 100644
+index 530ea5f..cc653b1 100755
 --- a/bsd/dev/sweet_pmem.c
 +++ b/bsd/dev/sweet_pmem.c
 @@ -21,6 +21,8 @@
@@ -31,7 +55,7 @@ index 0b2fd3e..f753583 100644
  
  #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
  #define PMEM_WIN        0x200000ULL
-@@ -136,6 +139,22 @@ pm_rw(struct uio *uio, bool write)
+@@ -144,6 +147,22 @@ pm_rw(struct uio *uio, bool write)
  			err = EINVAL;
  			break;
  		}
@@ -55,17 +79,17 @@ index 0b2fd3e..f753583 100644
  		if (r == NULL) {
  			err = ENOMEM;
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 1ae3874..df06555 100644
+index 6b09084..bb205fd 100644
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -602,4 +602,45 @@ out:
- 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+@@ -391,4 +391,45 @@ sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uin
+ 	error = rh_send(address, values);
  	return error;
  }
 +
 +/*
 + * Wi-Fi port 0132 (DC28088 0149): a bus (BCM) vote from the kernel. The apps
-+ * SMMU (0x15000000) sits behind the path its downstream node votes (msm-bus
++ * SMMU (0x15000000) sits behind the bus path its downstream node votes (msm-bus
 + * 161 -> 627 = BCMs SN15 and CN0, active-only, 1000 KBps). Command:
 + * commit|valid|x<<14|y as Linux's BCM_TCS_CMD. Only those two BCMs and only
 + * small nonzero levels; called by sweet_wlan_smmu.c (sweetsmmuwlan=1|2) and
@@ -105,7 +129,7 @@ index 1ae3874..df06555 100644
 +}
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 1ba4fe4..0b2f6b2 100644
+index de5dd4d..10d00ae 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -55,6 +55,7 @@ extern void sweet_touch_init(void);
@@ -116,17 +140,17 @@ index 1ba4fe4..0b2f6b2 100644
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -664,6 +665,7 @@ sweet_ufs_init(void)
+@@ -662,6 +663,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
  	sweet_usb_probe();
- 	sweet_gpu_init();
- 	sweet_pmem_init();       /* /dev/pmem, only with sweetpmem=1: bsd/dev/sweet_pmem.c (Wi-Fi 0130) */
 +	sweet_wlan_smmu_start(); /* sweetsmmuwlan=1|2: BCM votes + WLAN SMMU stream (Wi-Fi 0132) */
+ 	sweet_pmem_init();       /* /dev/pmem, only with sweetpmem=1: bsd/dev/sweet_pmem.c (Wi-Fi 0130) */
+ 	sweet_gpu_init();
  	return 0;
- }
- 
 diff --git a/bsd/dev/sweet_wlan_smmu.c b/bsd/dev/sweet_wlan_smmu.c
-new file mode 100644
-index 0000000..d306c27
+new file mode 100755
+index 0000000..7ff08f9
 --- /dev/null
 +++ b/bsd/dev/sweet_wlan_smmu.c
 @@ -0,0 +1,182 @@
@@ -312,3 +336,4 @@ index 0000000..d306c27
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+\ No newline at end of file

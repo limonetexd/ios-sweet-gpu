@@ -1,18 +1,35 @@
+From: HakiOS
+Subject: [PATCH 0147] sweet wifi: /dev/pmem for Wi-Fi bring-up (0130 -> 0147)
+
+Adds /dev/pmem device for raw physical memory access and SMC calls from
+userspace (wland). Gated behind boot-arg sweetpmem=1 (default off).
+
+bsd/conf/files: add sweet_pmem.c to the build.
+bsd/dev/sweet_pmem.c: new file (350 lines). /dev/pmem char device (major
+dynamic, 0600 root:wheel). pread/pwrite at physical offset; ioctl for
+contiguous alloc/free (KMA_DATA|KMA_ZERO), SMCCC calls (QCOM interrupted
+quirk), allocation listing. Uses 2 MB round-robin device windows via
+ml_io_map_unmappable. Requires pmap_find_phys (declared in arm/pmap/pmap.h).
+bsd/dev/sweet_ufs.c: call sweet_pmem_init() from sweet_ufs_init().
+
+Log check: with sweetpmem=1, ring shows "SWEET PMEM: /dev/pmem ready (major N)".
+
+Port of ios-sweet 0130; regenerated on current tree after 0146.---
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 7052e81..34e3d08 100644
+index ead0eae..4df78bc 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
-+bsd/dev/sweet_pmem.c			standard
++bsd/dev/sweet_pmem.c		standard
  bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_thermal.c			standard
  bsd/dev/mem.c				standard
- bsd/dev/munge.c 			optional config_requires_u32_munging
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
-new file mode 100644
-index 0000000..8a694dc
+new file mode 100755
+index 0000000..5a05a10
 --- /dev/null
 +++ b/bsd/dev/sweet_pmem.c
 @@ -0,0 +1,350 @@
@@ -366,8 +383,9 @@ index 0000000..8a694dc
 +	printf("SWEET PMEM: /dev/pmem ready (major %d)\n", major);
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+\ No newline at end of file
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 82ea1dd..1ba4fe4 100644
+index 82ea1dd..de5dd4d 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
@@ -378,11 +396,11 @@ index 82ea1dd..1ba4fe4 100644
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -662,6 +663,7 @@ sweet_ufs_init(void)
+@@ -661,6 +662,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
  	sweet_touch_init();
  	sweet_usb_probe();
- 	sweet_gpu_init();
 +	sweet_pmem_init();       /* /dev/pmem, only with sweetpmem=1: bsd/dev/sweet_pmem.c (Wi-Fi 0130) */
+ 	sweet_gpu_init();
  	return 0;
  }
- 
