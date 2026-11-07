@@ -33,7 +33,7 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | A8 | decide defaults from the A/B | DONE | 2026-11-07 | surfclean on stays default (+32 % avg); CPU max opt-in (avg -21 %, 59.8 C); 750 opt-in; NOTES entry |
 | A9 | 750 vs 1125 on screenshots, ask the user (Q1) | DONE | 2026-11-07 | user says the current native boot looks good; 750 deferred to B4/B13; SWEET SHOT tails lost in the ring |
 | B1 | why a new IOSurface per frame | TODO | | needs A2 logs; maybe Q2 |
-| B2 | promote 0124 GPU window 512 MiB | TODO | | after A8 |
+| B2 | promote 0124 GPU window 512 MiB | DOING | 2026-11-07 | 0145 promoted (commit 925197a), applies on 138-commit tree, check-patch ok; CI 42384618325; boot test pending |
 | B3 | touch latency probe | TODO | | |
 | B4 | build root gpu3 (no flash) | TODO | | Q3 for the apt package |
 | B5 | SpringBoard commit rate | TODO | | |
@@ -44,7 +44,7 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | B10 | crash triage | TODO | | Q2 for symbolication |
 | B11 | App Library blur freeze repro | TODO | | needs the user + A3 |
 | B12 | 60-minute soak | TODO | | after A6 |
-| C14 | system time not set (RTC/NTP/timed) | DOING | 2026-11-07 | 0144 (promoted from pending 0133) applies on 137-commit tree, check-patch ok; CI/boot pending |
+| C14 | system time not set (RTC/NTP/timed) | BLOCKED | 2026-11-07 | 0144r booted: PM6150 RTC read works but returns 53802463 s = 1971-09-15, so the clock is still wrong; real time needs NTP over Wi-Fi (C1/C3) or a userspace set. Ring logs/xnu-0144r.txt |
 | B13 | flash gpu3 | BLOCKED | | Q4: user's explicit OK |
 | B14 | wallpaper / extensions verification | TODO | | after B13 |
 | C1 | promote the 8 Wi-Fi drafts + boot ladder | TODO | | own push batch (Q7) |

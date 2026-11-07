@@ -2,6 +2,24 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-07 (DeepSeek lead): C14 0144r booted (RTC read works, RTC stale); B2 0145 pushed <<<
+
+**C14 / 0144r booted** (image `702facbd...`, 240 s reboot, ring `logs/xnu-0144r.txt`, 320 KB).
+The PM6150 RTC read works exactly as written:
+`SWEET RTC: calendar set from the PM6150 RTC: 53802463 s (boot time now 53802463)`.
+But `53802463 s` is **1971-09-15**, so the PM6150 RTC itself is stale; the lock-screen clock is still
+wrong. The patch did its job (read + set); the time source is missing. Real time needs NTP after Wi-Fi
+(C1/C3) or a one-time userspace set. **C14 is blocked on Wi-Fi/NTP**, not on the kernel read.
+The run itself: 33.6 swaps/s normal avg (p90 45), GL p50 10.1 / p95 28 ms, 0 freezes, 0 panics,
+`driverkitd` sig 9 (known), modes 1125x2436@60. 28 normal / 46 active s (the user was on the lock screen).
+
+**B2 / 0145 pushed** (commit `925197a`): `patches-pending/0124` promoted unchanged except the Subject
+number; applies on the 138-commit tree (`xnu-tree.sh update`: ok), `check-patch.py`: ok. CI
+`42384618325` in progress. Next: download `xnu-kernel`, build `0145r` with the 0143r recipe
+(`SWEETFB_HZ=60 SWEET_SERIAL=0 tools/sweet-gpu-image.sh xnu/out-0145 0145r "sweetgpu_reboot=420
+sweetgpu_swipe=60 sweetshot=90"`), run the unattended test, check `SWEET GPU: VA window 512 MiB`,
+0 refusals, 0 `SWEET FREEZE: RedwoodGPU`, same or better fps.
+
 ### >>> 2026-11-07 (DeepSeek lead): A7/A8 done, C14 RTC patch 0144 <<<
 
 **A7 done.** CI `42374790152` success (13m41s), kernel `xnu/out-0143` sha256 `22b042dd...`. All four
