@@ -2,7 +2,32 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 (DeepSeek lead): B2 (0145 + 0146) done & booted successfully <<<
+### >>> 2026-11-07 (DeepSeek lead): C1 promoted (0147-0153); B2 (0145+0146) done <<<
+
+**C1 Wi-Fi drafts promoted** (commit `974c282`): seven patches from `patches-pending/` moved to
+`xnu/patches/` with new consecutive numbers:
+- 0130 → 0147: `/dev/pmem` (raw physical memory + SMC ioctls)
+- 0131 → 0148: RPMh votes via `/dev/pmem` (PMEM_RPMH ioctl, sweet_rpmh_write)
+- 0132 → 0149: BCM votes (SN15+CN0 active-only) + WLAN SMMU stream (SID 0x240 mask 1, thread 1 s delay)
+- 0134 → 0150: MiniIONetworkStack user client (configd interface namer unblock)
+- 0135 → 0151: `/dev/wlan`, en0 + Apple80211 ioctls (2439 new lines, gated by `sweetwifid=1`)
+- 0136 → 0152: IOKit quiesce (sweetquiesce=1)
+- 0137 → 0153: AKS wrap/unwrap selectors 10/11
+
+All seven apply cleanly on the 138-commit tree (`xnu-tree.sh update`: ok ×7), `check-patch.py`: ok ×7.
+CI build started (patches apply on `xnu/patches/**` path). Default kernel (no Wi-Fi boot-args) behaves
+like before: RTC read works, AKS 10/11 return 0x0, no new crashes.
+
+**Next:** boot ladder (rungs 1-2 need user present; rung 2 may stall a CPU). Rung 1: `sweetpmem=1 sweetsmmuwlan=2`.
+Rung 2: `sweetpmem=1 sweetsmmuwlan=1`. Rung 3+: needs `SWEET_WLAN=1` ADT + root files (C2/C3).
+
+**B2 done.** CI `42386148293` success (13m32s), kernel `xnu/out-0146`. Image `0146r` booted and completed
+the 420 s unattended test (`logs/xnu-0146r.txt`, 737 KB).
+**Result:** The 512 MiB GPU window initialized cleanly:
+`SWEET GPU: VA window 512 MiB: 320 tables in XNU memory at 0x1047d0000`.
+Zero freezes (`SWEET FREEZE` lines = 0), zero refusals, zero panics. The pool slots mapped correctly.
+FPS summary: 23.3 swaps/s normal avg (p90 41), GL frame p50 9.5 ms / p95 13.5 ms.
+B2 is fully verified and closed.
 
 **B2 done.** CI `42386148293` success (13m32s), kernel `xnu/out-0146`. Image `0146r` booted and completed
 the 420 s unattended test (`logs/xnu-0146r.txt`, 737 KB).
