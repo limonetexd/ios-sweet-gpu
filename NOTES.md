@@ -20,9 +20,13 @@ IOMFB selector, plus the first two SwapEnd records (0x120 bytes).
 `0xc265000`; status word at `+0xa0+4n`, bit 21 valid, low 12 signed deci-C; A55 1-6, A76 9-12, GPU
 13-14, DDR tsens1 3. "ios-flame 0255" is actually `Yofuness/ios-sunfish` 0255 (same SM7150).
 Report `reports/research-2026-11-07-tsens.md`. 0143 after A5.
-**Next:** A3 0141 `sweetshot` (agent running) and A4 `tools/sweet-shot.py` (done: commit 85283c3,
-`--selftest` prints `selftest ok`; stdlib only, regex finds interleaved SWEET SHOT fragments, PackBits
-u16, FNV warn, missing chunks black). Then A5/A6/A7.
+**A3 done:** `0141-sweet-sweetshot.patch` (commit d42a076) adds the low-priority shot thread,
+point-sampled RGB565/PackBits/base64 SWEET SHOT lines, the freeze and Vol+/Vol- triggers, and the
+boot args. The agent used `kernel_thread_start_priority`, which failed to compile in 0130; review
+replaced it with `kernel_thread_start` (the thread sleeps 250 ms). `check-patch`/apply ok; tree 134.
+A4's decoder was fixed to parse the kernel's `why TEXT t MS` fields; `--selftest` still prints
+`selftest ok`.
+**Next:** A5 0142 (lead), A6 0143 (thermal), A7 batch gate.
 
 ### >>> 2026-11-07 (later): native resolution default (0138), patch tooling, roadmap for DeepSeek <<<
 

@@ -24,7 +24,7 @@ written is the last one.
 | A0 | 0138 native default | DONE | 2026-11-07 | local commit; CI pending (A7) |
 | A1 | 0139 RedwoodGPU stats fix | DONE | 2026-11-07 | commit b6e6e35; apply/check ok; tree 133 |
 | A2 | 0140 diagnostics (IOSurface props, IOMFB trace) | DONE | 2026-11-07 | commit 9a73ae4; apply/check ok; tree 133 |
-| A3 | 0141 sweetshot kernel screenshots | TODO | | after A2 (same files) |
+| A3 | 0141 sweetshot kernel screenshots | DONE | 2026-11-07 | commit d42a076; apply/check ok; tree 134 |
 | A4 | `tools/sweet-shot.py` decoder | DONE | 2026-11-07 | commit 85283c3; selftest ok |
 | A5 | 0142 background clean of recycled surface memory | TODO | | after A2 |
 | A6 | shim CPU max + 0143 thermal log | DOING | 2026-11-07 | part 1 SHIM_CPUMAX built; TSENS map `reports/research-2026-11-07-tsens.md`; 0143 after A3 |
