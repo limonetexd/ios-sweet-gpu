@@ -4,6 +4,18 @@
 
 ### >>> 2026-11-07: render scale 750x1624 (0129), presenter retention (0128) <<<
 
+**Claude Code review of the opencode work (2026-11-07).** Checked git, CI, patch list and these notes:
+local `gpu` = `mine/main` + 4 notes-only commits (682fcd7, unpushed); CI 0131 (42314190705) green; the
+0129 run (42309983037) failed and 0130 is the build fix; phone in fastboot. **Trap:** the 750x1624 path
+is the default twice over: kernel `sweetfb_scale` defaults to 2 (0129) and `tools/mkadt.py` now always
+writes `display-scale` 2 + canvas 750x1624 (3e39278). So every image built from main today boots the
+shifted UI (dock at the top) on the gpu2 root, whose MobileGestalt still says iPhone X @3x 1125x2436 [I:
+likely cause of the shift, as opencode wrote; not proven]. Only the old `0123s0` (old ADT) is usable by
+hand. The report "the recovery was offset too" does not fit a MobileGestalt cause (a root file cannot
+move OrangeFox's picture); unclear what the user saw, ask. Options: (a) gate the scale (new patch
+`sweetfb_scale` default 1 + an mkadt flag) until the root fix; (b) do the root fix (MobileGestalt
+scale 2 / 750x1624 + status bar) in gpu3, which needs a userdata flash.
+
 **HANDOFF 2026-11-07 (opencode -> Claude Code): everything a next agent needs.**
 - Repo `ios-sweet`, branch `gpu`, pushed to `mine/main`. Latest kernel commit `36dd2c8`
   (0131); series `xnu/patches` = 0001..**0131**. `0124-sweet-gpu-window-512m.patch` is in
