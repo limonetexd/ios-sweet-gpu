@@ -1,0 +1,56 @@
+From: HakiOS
+Subject: [PATCH 0157] sweet amfi: answer ExtensionKit bootarg state 0x60 with 0x86 (B14)
+
+ExtensionKit asks AMFI policy syscall 0x60 (query_bootarg_state) before it
+registers app extension points. Our stand-in returned 0 without writing the
+out value, so ExtensionKit read 0 and insisted on the AMFI IOKit service,
+which does not exist on this port: LaunchServices then refused every app
+extension ("does not correspond to a known extension point"), pkd could not
+make records, and PosterBoard had no poster provider (sig 5 on the old
+roots). sunfish 0123 fixes it by returning 0x86.
+
+Additive: only call 0x60 is affected; 0x5a (DYLD policy) and the generic
+"return 0 without touching the output" path are unchanged. Logs once:
+"SWEET AMFI: bootarg state 0x86 for ExtensionKit".
+
+Verification belongs to B14 (after the B4/B13 root with registered appex
+and LaunchServices): expect no "Received 0 extensions", PosterBoard finds a
+provider, widget gallery stops waiting.
+---
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index a50fca4..98c820e 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -377,6 +377,16 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+  */
+ #define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
+ #define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
++/*
++ * ExtensionKit asks AMFI for the boot-arg state before it registers app
++ * extension points (sunfish 0123). With an all-zero answer it insists on an
++ * AMFI IOKit service that does not exist here, LaunchServices then refuses
++ * every extension ("does not correspond to a known extension point"), pkd
++ * makes no records and PosterBoard has no poster provider. 0x86 keeps the
++ * extension path open without any signature check (this AMFI is a stand-in).
++ */
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
++#define SWEET_AMFI_BOOTARG_STATE        0x86ULL
+ 
+ static int
+ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+@@ -385,6 +395,15 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ 	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
+ 	int error;
+ 
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		static bool logged;
++		uint64_t state = SWEET_AMFI_BOOTARG_STATE;
++		if (!logged) {
++			logged = true;
++			printf("SWEET AMFI: bootarg state 0x86 for ExtensionKit\n");
++		}
++		return copyout(&state, arg, sizeof(state));
++	}
+ 	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
+ 		static uint64_t seen;
+ 		if (call >= 0 && call < 64 && !(seen & (1ULL << call))) {

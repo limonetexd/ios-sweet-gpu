@@ -1,0 +1,39 @@
+From: HakiOS
+Subject: [PATCH 0158] sweet fb: sweetfb_scale boot-arg overrides the ADT render choice (60 FPS A/B)
+
+0129 rendered 750x1624 and scaled to the panel (the only configuration ever
+measured at 60 presents/s: 0131r p90 58, 0143r2 p90 49), but 0138 made the
+path ADT-driven (canvas-width/height = 750x1624 selects it) so a native ADT
+could not A/B it without rebuilding the image.
+
+Restore 0129's override on top of 0138:
+  sweetfb_scale=2   force the 750x1624 render + 1.5x panel scale
+  sweetfb_scale=1   force native 1:1 (same as sweetfb_native=1)
+  absent / 0        follow the ADT canvas (current default, native on the
+                    shipped ADT)
+No default change: the shipped boot-args do not set it. The scaled path was
+verified with the 0131 column map and by 0143r2; 750 layout/UX is untested,
+so this stays an experiment.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2c8f2ed..135c8e0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -551,7 +551,16 @@ AppleCLCD::start(IOService *provider)
+ 	 */
+ 	uint32_t canvasW = sweet_dt_u32(provider, "canvas-width");
+ 	uint32_t canvasH = sweet_dt_u32(provider, "canvas-height");
+-	if (canvasW == 750 && canvasH == 1624 && !native && fWidth <= 1080 && fHeight <= 2400) {
++	/*
++	 * 0158: 0129's boot-arg override on top of 0138's ADT choice, so the scaled
++	 * path can be A/B'd without rebuilding the ADT: sweetfb_scale=2 forces the
++	 * 750x1624 render, =1 forces native, absent/0 follows canvas-width/height.
++	 */
++	int scaleArg = 0;
++	PE_parse_boot_argn("sweetfb_scale", &scaleArg, sizeof(scaleArg));
++	const bool wantScale = scaleArg == 2 ||
++	    (scaleArg == 0 && canvasW == 750 && canvasH == 1624);
++	if (wantScale && !native && fWidth <= 1080 && fHeight <= 2400) {
+ 		/* 0129: iPhone X @2x in points, cropped 720x1600 and scaled 1.5x to the panel */
+ 		fLogicalW = 750;
+ 		fLogicalH = 1624;
