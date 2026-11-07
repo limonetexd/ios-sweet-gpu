@@ -1,0 +1,109 @@
+From: HakiOS
+Subject: [PATCH 0142] sweet: clean recycled surface memory in the background (A5 0142)
+
+0120 recycles big surface memory but its first submit still pays a whole
+13.9 MB clean out of the CPU cache. The kept-memory thread now bzeroes,
+cleans to PoC (dc civac) and clears the pmap dirty bits, and the create path
+marks the surface cleanOnce, so the first submit has nothing to clean.
+sweet_surfclean=0 restores today's behaviour. Proof: the RedwoodGPU line (a)
+KB/us per submission and "first cleans" fall, no corruption/freeze.
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index a0aa089..3ef4ebe 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -52,9 +52,11 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/thread_call.h>
+ #include <mach/mach_time.h>
++#include <vm/pmap.h>
+ 
+ extern "C" uint64_t sweet_gpu_pool_range(uint64_t size, uint8_t **kernel);   /* SweetAdreno.cpp */
+ extern "C" void sweet_gpu_pool_range_free(uint64_t pa, uint64_t size);
++extern "C" void redwood_gpu_to_memory(void *start, uint64_t size);      /* A5 0142 */
+ IOMemoryDescriptor *sweet_gpu_pool_md(uint64_t pa, uint64_t size);
+ 
+ enum {
+@@ -162,6 +164,7 @@ static struct {
+ static IOLock        *sweet_surf_kept_lock;
+ static thread_call_t  sweet_surf_clearing;
+ static int            sweet_surf_keep = -1;
++static int            sweet_surf_clean = 1;      /* A5 0142: clean kept memory in the thread call */
+ static uint32_t       sweet_surf_reused, sweet_surf_made;
+ 
+ static void
+@@ -175,7 +178,22 @@ sweet_surf_clear_kept(thread_call_param_t, thread_call_param_t)
+ 		}
+ 		sweet_surf_kept[i].busy = true;
+ 		IOLockUnlock(sweet_surf_kept_lock);
+-		bzero(m->getBytesNoCopy(), m->getCapacity());
++		uint8_t *va = (uint8_t *)m->getBytesNoCopy();
++		uint64_t bytes = m->getCapacity();
++		bzero(va, bytes);
++		if (sweet_surf_clean) {
++			/* A5 0142: push the zeroes out of the cache and clear the dirty bits: the next
++			 * surface's first submit then has nothing to clean (today it cleaned 13.9 MB). */
++			redwood_gpu_to_memory(va, bytes);
++			for (uint64_t off = 0; off < bytes; off += PAGE_SIZE) {
++				IOByteCount len = 0;
++				addr64_t pa = m->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++				ppnum_t pn = (ppnum_t)(pa >> PAGE_SHIFT);
++				if (pa != 0 && pmap_valid_page(pn)) {
++					pmap_clear_modify(pn);
++				}
++			}
++		}
+ 		IOLockLock(sweet_surf_kept_lock);
+ 		sweet_surf_kept[i].busy = false;
+ 		sweet_surf_kept[i].clear = true;
+@@ -188,8 +206,10 @@ static bool
+ sweet_surf_keeping(void)
+ {
+ 	if (sweet_surf_keep < 0) {
+-		int keep = 1;
++		int keep = 1, clean = 1;
+ 		IOLock *lock = IOLockAlloc();
++		(void)PE_parse_boot_argn("sweet_surfclean", &clean, sizeof(clean));
++		sweet_surf_clean = clean != 0;
+ 		(void)PE_parse_boot_argn("sweet_surfkeep", &keep, sizeof(keep));
+ 		thread_call_t call = keep ? thread_call_allocate(&sweet_surf_clear_kept, NULL) : NULL;
+ 		if (lock == NULL || call == NULL) {
+@@ -216,7 +236,7 @@ sweet_surf_keeping(void)
+ 
+ /* Zeroed, wired memory for a surface of `bytes`: a kept piece of that size if there is one. */
+ static IOBufferMemoryDescriptor *
+-sweet_surf_memory(uint32_t bytes)
++sweet_surf_memory(uint32_t bytes, bool *clean_out)
+ {
+ 	IOBufferMemoryDescriptor *m = NULL;
+ 	bool clear = false;
+@@ -251,6 +271,9 @@ sweet_surf_memory(uint32_t bytes)
+ 			bzero(m->getBytesNoCopy(), bytes);
+ 		}
+ 	}
++	if (clean_out != NULL) {
++		*clean_out = m != NULL && clear && sweet_surf_clean;
++	}
+ 	return m;
+ }
+ 
+@@ -1127,9 +1150,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
++		bool clean = false;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = sweet_surf_memory(s->allocSize);        /* 0154: zeroed, kept memory if any */
++			mem = sweet_surf_memory(s->allocSize, &clean);        /* 0154: zeroed, kept memory if any */
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+@@ -1140,6 +1164,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		} else {
+ 			s->memory = mem;
++			s->cleanOnce = clean;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
