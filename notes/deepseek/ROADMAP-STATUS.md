@@ -29,9 +29,9 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | A4 | `tools/sweet-shot.py` decoder | DONE | 2026-11-07 | commit 85283c3; selftest ok |
 | A5 | 0142 background clean of recycled surface memory | DONE | 2026-11-07 | commit 55fdd54; apply/check ok; tree 135 |
 | A6 | shim CPU max + 0143 thermal log | DONE | 2026-11-07 | part 1 SHIM_CPUMAX + image env; 0143 commit f4523e1, apply/check ok, tree 136 |
-| A7 | batch gate: push, CI, 4 images, 4 tests | BLOCKED | 2026-11-07 | CI 42374790152 success; 0143r hung (no fastboot after 540 s), needs manual power cycle + ring |
-| A8 | decide defaults from the A/B | TODO | | |
-| A9 | 750 vs 1125 on screenshots, ask the user (Q1) | TODO | | |
+| A7 | batch gate: push, CI, 4 images, 4 tests | DONE | 2026-11-07 | CI 42374790152 success; logs xnu-0143r/rm/r2/rc0.txt; 0143r quoting bug fixed, not a hang |
+| A8 | decide defaults from the A/B | DONE | 2026-11-07 | surfclean on stays default (+32 % avg); CPU max opt-in (avg -21 %, 59.8 C); 750 opt-in; NOTES entry |
+| A9 | 750 vs 1125 on screenshots, ask the user (Q1) | DONE | 2026-11-07 | user says the current native boot looks good; 750 deferred to B4/B13; SWEET SHOT tails lost in the ring |
 | B1 | why a new IOSurface per frame | TODO | | needs A2 logs; maybe Q2 |
 | B2 | promote 0124 GPU window 512 MiB | TODO | | after A8 |
 | B3 | touch latency probe | TODO | | |
@@ -44,7 +44,7 @@ Agents use `opencode/deepseek-v4.1-flash-free` (free) by default; other free mod
 | B10 | crash triage | TODO | | Q2 for symbolication |
 | B11 | App Library blur freeze repro | TODO | | needs the user + A3 |
 | B12 | 60-minute soak | TODO | | after A6 |
-| C14 | system time not set (RTC/NTP/timed) | TODO | 2026-11-07 | user report 2026-11-07; after A7/A8 |
+| C14 | system time not set (RTC/NTP/timed) | DOING | 2026-11-07 | 0144 (promoted from pending 0133) applies on 137-commit tree, check-patch ok; CI/boot pending |
 | B13 | flash gpu3 | BLOCKED | | Q4: user's explicit OK |
 | B14 | wallpaper / extensions verification | TODO | | after B13 |
 | C1 | promote the 8 Wi-Fi drafts + boot ladder | TODO | | own push batch (Q7) |

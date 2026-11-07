@@ -27,7 +27,7 @@ import struct
 import sys
 import zlib
 
-BEGIN = re.compile(r'SWEET SHOT (\d+) begin (\d+)x(\d+) rgb565 packbits (\d+) ([0-9A-Fa-f]{8}) why (\S+) t (\d+)',
+BEGIN = re.compile(r'SWEET SHOT (\d+) begin (\d+)x(\d+) rgb565 packbits (\d+) (?:sum )?([0-9A-Fa-f]{8}) why (\S+) t (\d+)',
                    re.IGNORECASE)
 CHUNK = re.compile(r'SWEET SHOT (\d+) (\d{4}) ([A-Za-z0-9+/=]+)')
 
@@ -284,7 +284,7 @@ def selftest():
     lines = [
         '[   0.000000] unrelated console line from another thread',
         f'[  12.345678] AppleCLCD: SWEET SHOT 1 begin {w}x{h} rgb565 packbits {len(comp)} '
-        f'{want_sum:08x} why selftest t 7',
+        f'sum {want_sum:08x} why selftest t 7',
     ]
     # Reverse the order and bury every fragment mid-line: the decoder must sort by SEQ4.
     for seq in reversed(range(len(chunks))):

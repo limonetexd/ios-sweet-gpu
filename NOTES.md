@@ -2,6 +2,50 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-07 (DeepSeek lead): A7/A8 done, C14 RTC patch 0144 <<<
+
+**A7 done.** CI `42374790152` success (13m41s), kernel `xnu/out-0143` sha256 `22b042dd...`. All four
+unattended tests completed; the missing `0143rc0` ring exists (`logs/xnu-0143rc0.txt`, 15:00:51). The
+earlier "0143r hung" was the boot-args quoting bug, fixed by rebuilding `0143r` (`9cb94807...`).
+`tools/sweet-fps-summary.py` ("normal" = active seconds with no swap gap > 100 ms) [O]:
+
+| run | config | normal/active s | swaps/s avg / p90 | GL p50 / p95 | present | cache work | VA errors | zombies | max big C |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `0143r` | native, surfclean on | 326/351 | 36.0 / 38 | 14.6 / 17.0 ms | 3.37 ms | 4651 KB / 545 us | 539 | 279 | 51.4 |
+| `0143rm` | native, CPU max 9/13 | 45/88 | 28.5 / 44 | 9.7 / 17.4 | 3.76 | 5828 / 638 | 0 | 286 | 59.8 |
+| `0143r2` | 750x1624 | 36/302 | 28.7 / 49 | 6.3 / 12.6 | 4.89 | 2425 / 292 | 0 | 292 | 55.0 |
+| `0143rc0` | native, surfclean off | 125/255 | 27.2 / 42 | 10.2 / 17.8 | 3.64 | 6296 / 697 | 124 | 364 | 54.3 |
+
+- **A8 decisions.** Surfclean **stays default on**: `0143r` is +32 % avg vs `0143rc0`, p90 -4, GL p95 -0.8 ms;
+  the runs are not the same length/swipes, so this is not a clean rule-2.8 A/B, but it is not worse and the
+  user says the screen looks right. `sweet_surfclean=0` stays the off switch. CPU max **stays opt-in**:
+  avg -21 %, p90 +6, GL p50 better but p95 +0.4, 59.8 C big in a run cut at 205 s; rule 2.8 needs +5 % avg
+  and < 80 C over the whole 540 s, not met. Today's clocks stay (silver 8 / gold 10). Disassembly of the
+  two shim kernels proves `0143rm` writes 9/13 (`mov w1,#9`/`#13` at file 0x3bc0/0x3bd4; `0143r` 8/10);
+  the `CPUFREQ silver state=` readback line is missing from all four shim logs (logging only, [U] why).
+  750 **stays opt-in**: GL p50 6.3 / p95 12.6 is the fastest GL, but swaps avg 28.7 and the layout is
+  unverified; native 1125 stays default.
+- **A9.** The `SWEET SHOT` PNGs are mostly black: the kernel writes the whole shot into the console ring and
+  the pull keeps only the first ~1-22 KB of each compressed blob (missing tail chunks are black). The
+  decoder had a real-format bug (`sum ` before the checksum); fixed, selftest now uses the kernel format.
+  The user says the current boot (native) looks good; 750 waits for the root gpu3 layout fix
+  (B4/B13). 5 shots in r/r2, 3 in rm, 4 in rc0; none usable for the layout check.
+- **GPU VA exhaustion is native-only and grows with run length**: 539 `cannot be entered` in `0143r`,
+  124 in `0143rc0`, 0 in `0143rm`/`0143r2`. Candidate B2/0124 (512 MiB window); the user sees no glitch now.
+- **`SWEET FREEZE` lines are benign**: the 24-25 s one is the boot before SpringBoard's first frame; the
+  1-2 s ones are "frames again" after an idle second. No panic, no RedwoodGPU freeze; `driverkitd` sig 9
+  in all four.
+- Thermals: `0143r` 44-54 C, `0143rm` up to 59.8 C big, `0143r2` up to 55 C; 0143 `SWEET THERM` every 5 s
+  works (87 lines in the 420 s runs, 41 in rm).
+
+**C14 started.** The PM6150 RTC draft was promoted unchanged (`git mv`) from `patches-pending/0133` to
+`xnu/patches/0144-sweet-rtc-calendar.patch`: adds SPMI peripheral 0x60 to the whitelist and
+`sweet_rtc_set_calendar()` called from `SweetBattery::start`; reads control 0x6046 bit 7 and seconds
+0x6048-0x604b, sets the calendar only when it is before 2001, `sweetrtc=0` off. Applies on the 137-commit
+tree (`xnu-tree.sh update`: ok), `check-patch.py` ok. Not built/booted. Proof after boot:
+`SWEET RTC: calendar set from the PM6150 RTC: ...` and a correct clock on the lock screen. Next: push
+(0144 + notes + shot-decoder fix), CI, one image, test.
+
 ### >>> 2026-11-07 (DeepSeek lead): A1/A2 patches reviewed and committed (0139/0140) <<<
 
 **Model budget (user, 2026-11-07): agents use `opencode/deepseek-v4.1-flash-free` (free) by default;
