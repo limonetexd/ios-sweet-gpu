@@ -82,3 +82,13 @@ Host adaptations on Intel macOS 15.7, Xcode 26.3: `sha256sum` wrapper over `shas
 | 2026-11-08 | host | `corpus.py --ir3`, all 142 libraries, A618 | module counts | 16912 modules: reader 16887, translate 5830, ir3 5749. VideoToolbox 2/9, AV1SW 11/11 | work directory `out/` |
 
 Status: Metal `not-tested` on hardware. These results show compiling and linking only, with shaders at default function constants.
+
+## Metal on device, 2026-11-09 (real device; kernel 0160, root gpu3 plus Metal payload, RAM boot)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-08 | 0160, no `sweetmetal` | `tools/sweet-boot-test.sh`, Mac-built image | GL boot, returns | SpringBoard reached, no panic, back in fastboot in 186 s | `logs/xnu-0160base.txt` |
+| 2026-11-08 | 0160m1-m3 | `sweetmetal=1` on roots flashed with zero blocks skipped | Metal discovery | Plug-in loaded, then backboardd crashed 13-14 times on stale data in zeroed memory. **Tool bug: `raw2simg.py` used DONT_CARE for zero blocks; fixed to FILL** | `logs/xnu-0160m1..3.txt` |
+| 2026-11-09 | 0160m4 | Fixed flash, `sweetmetal=1` | backboardd survives | 0 backboardd crashes; pipelines built; 5 swaps and presents, fence 21, then no more swaps. Black screen seen by the user. Returned to fastboot in 185 s | `logs/xnu-0160m4.txt` |
+
+Status: Metal `experimental` on device; no picture yet. Open: pixel formats 550 and 554 unsupported, and why backboardd stops swapping (`SMP backboardd` stacks in the log).
