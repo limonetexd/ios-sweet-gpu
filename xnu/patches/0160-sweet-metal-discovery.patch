@@ -1,0 +1,30 @@
+From: HakiOS
+Subject: [PATCH 0160] sweet-fb: boot-arg sweetmetal=1 publishes Metal's discovery properties
+
+Metal finds a GPU by reading MetalPluginName and MetalPluginClassName off the
+IOAcceleratorES service, then opening /System/Library/Extensions/<name>.bundle.
+The service was deliberately published without them. With sweetmetal=1 it now
+carries RedwoodMetal / RedwoodMetalDevice. Default off: without the boot-arg
+nothing changes, and the GL path is as before.
+
+Proof in the log: "SWEET METAL: discovery properties published (sweetmetal)".
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 135c8e0..79238e9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -752,6 +752,14 @@ AppleCLCD::start(IOService *provider)
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
++		uint32_t metalOn = 0;
++		(void)PE_parse_boot_argn("sweetmetal", &metalOn, sizeof(metalOn));
++		if (metalOn != 0) {
++			/* MTLRegisterDevices opens /System/Library/Extensions/<name>.bundle and asks it for this class */
++			accel->setProperty("MetalPluginName", "RedwoodMetal");
++			accel->setProperty("MetalPluginClassName", "RedwoodMetalDevice");
++			IOLog("SWEET METAL: discovery properties published (sweetmetal)\n");
++		}
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+ 			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
