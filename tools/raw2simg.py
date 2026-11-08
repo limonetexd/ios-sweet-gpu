@@ -11,7 +11,8 @@ def flush():
     if run=='raw':
         o.write(struct.pack('<HHII',0xCAC1,0,n,12+n*BS)); o.writelines(buf)
     else:
-        o.write(struct.pack('<HHII',0xCAC3,0,n,12))
+        # FILL, not DONT_CARE: zero blocks inside files must really be written
+        o.write(struct.pack('<HHII',0xCAC2,0,n,16)); o.write(bytes(4))
     chunks+=1; n=0; buf=[]
 for i in range(total):
     b=f.read(BS); k='hole' if b==zero else 'raw'
