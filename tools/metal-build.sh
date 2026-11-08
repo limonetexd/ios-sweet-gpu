@@ -12,7 +12,7 @@
 #   host/build/.../air2nir, ir3_compiler   shader compiler for this Mac
 #   ios/build/.../libredwoodair.dylib      shader runtime for iOS 16 arm64
 #   obj/RedwoodMetal                       Metal plug-in
-#   metal-payload.img                      raw HFS+ volume, mounted at /Developer on the phone
+#   pay/                                   files to copy into the phone's root, at these paths
 #
 # Needs: Xcode with the iPhoneOS SDK, Homebrew bison and gpatch.
 set -euo pipefail
@@ -21,7 +21,7 @@ DONOR_URL=https://github.com/oosexgang/hackios-xnu-userland.git
 DONOR_SHA=a79ff0772a3454fd1ef127e181e5b3bce6c9ce18
 MESA=25.0.7
 MESA_SHA=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
-PREFIX=/Developer       # where the phone's kernel mounts the payload
+PREFIX=/redwood         # the donor's install prefix on the phone
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 W=${METAL_WORK:-$HOME/Developer/ios-sweet-work/metal-build}
@@ -122,15 +122,11 @@ ios() {
 }
 
 driver() {
-	local sdk f
+	local sdk
 	sdk=$(xcrun --sdk iphoneos --show-sdk-path)
 	rm -rf src obj
 	mkdir -p src obj
-	# the donor hard-codes its install prefix; ours is a mount point
 	cp donor/userland/src/redwoodmetal.m donor/userland/src/redwooddrawable.m donor/userland/src/redwood_drawable.h src/
-	for f in src/redwoodmetal.m src/redwooddrawable.m; do
-		sed -i '' "s#/redwood/lib/libredwoodair.dylib#$PREFIX/lib/libredwoodair.dylib#g" "$f"
-	done
 	xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" -O1 -Isrc -bundle \
 		-framework Foundation -framework IOKit -framework Metal -lobjc \
 		-o obj/RedwoodMetal src/redwoodmetal.m src/redwooddrawable.m 2> obj/clang.log
@@ -139,18 +135,17 @@ driver() {
 
 payload() {
 	local air=ios/build/src/gallium/drivers/freedreno/libredwoodair.dylib
-	rm -rf pay metal-payload.img metal-payload.cdr
-	mkdir -p pay/lib pay/RedwoodMetal.bundle
-	cp "$air" pay/lib/libredwoodair.dylib
-	xcrun strip -x pay/lib/libredwoodair.dylib
-	install_name_tool -id $PREFIX/lib/libredwoodair.dylib pay/lib/libredwoodair.dylib 2>/dev/null
-	cp obj/RedwoodMetal pay/RedwoodMetal.bundle/RedwoodMetal
-	cp donor/userland/src/metal_plugin.plist pay/RedwoodMetal.bundle/Info.plist
-	codesign -f -s - pay/lib/libredwoodair.dylib
-	codesign -f -s - pay/RedwoodMetal.bundle
-	hdiutil create -quiet -layout NONE -fs HFS+ -volname SweetMetal -format UDTO -srcfolder pay metal-payload
-	mv metal-payload.cdr metal-payload.img
-	shasum -a 256 metal-payload.img
+	local b=pay/System/Library/Extensions/RedwoodMetal.bundle
+	rm -rf pay
+	mkdir -p pay$PREFIX/lib "$b"
+	cp "$air" pay$PREFIX/lib/libredwoodair.dylib
+	xcrun strip -x pay$PREFIX/lib/libredwoodair.dylib
+	install_name_tool -id $PREFIX/lib/libredwoodair.dylib pay$PREFIX/lib/libredwoodair.dylib 2>/dev/null
+	cp obj/RedwoodMetal "$b/RedwoodMetal"
+	cp donor/userland/src/metal_plugin.plist "$b/Info.plist"
+	codesign -f -s - pay$PREFIX/lib/libredwoodair.dylib
+	codesign -f -s - "$b"
+	(cd pay && find . -type f | sort | xargs shasum -a 256)
 }
 
 tools

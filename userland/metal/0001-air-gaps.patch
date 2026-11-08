@@ -1,0 +1,1194 @@
+diff --git a/tools/mesa/air/air_intrinsics.c b/tools/mesa/air/air_intrinsics.c
+index f79de2b..1708104 100644
+--- a/tools/mesa/air/air_intrinsics.c
++++ b/tools/mesa/air/air_intrinsics.c
+@@ -1369,6 +1369,34 @@ tex_dest_type(struct air_ctx *c, const struct air_type *ret, const struct air_na
+    return nir_type_uint | bits;
+ }
+ 
++/* A sampler CHOSEN between two (a `select` of sampler pointers, which is how a
++ * shader falls back on a constexpr sampler when the one it was given is
++ * absent). Both are real bindings, so the choice is only which index: the
++ * tex instruction takes the lower one as its index and the run-time distance
++ * to the chosen one as a sampler_offset, and no other sampler is touched.
++ */
++static bool
++sampler_choice(struct air_ctx *c, const struct air_val *v, struct air_ptr *out)
++{
++   const struct air_val *a = v->elems[0], *b = v->elems[1];
++   if (a->kind != AIR_VAL_PTR || b->kind != AIR_VAL_PTR ||
++       a->ptr.class != AIR_PTR_SAMPLER || b->ptr.class != AIR_PTR_SAMPLER ||
++       a->ptr.offset || b->ptr.offset)
++      return air_error(c, "intrinsic: a sampler chosen between things that are not two "
++                          "plain samplers");
++   if (a->ptr.binding == b->ptr.binding) {
++      *out = a->ptr;
++      return true;
++   }
++   unsigned lo = MIN2(a->ptr.binding, b->ptr.binding);
++   struct air_ptr p = a->ptr;
++   p.binding = lo;
++   p.offset = nir_bcsel(&c->b, v->def, nir_imm_int(&c->b, a->ptr.binding - lo),
++                        nir_imm_int(&c->b, b->ptr.binding - lo));
++   *out = p;
++   return true;
++}
++
+ /* The pointer a texture or sampler argument carries. */
+ static bool
+ tex_handle(struct air_ctx *c, const struct air_inst *in, unsigned operand,
+@@ -1377,13 +1405,36 @@ tex_handle(struct air_ctx *c, const struct air_inst *in, unsigned operand,
+    struct air_val *v = air_get(c, in->operands[operand]);
+    if (!v)
+       return false;
+-   if (v->kind != AIR_VAL_PTR || v->ptr.class != want)
++   if (want == AIR_PTR_SAMPLER && v->kind == AIR_VAL_PTR_SELECT)
++      return sampler_choice(c, v, out);
++   /* Metal's null texture is a texture handle like any other */
++   if (v->kind != AIR_VAL_PTR ||
++       (v->ptr.class != want &&
++        !(want == AIR_PTR_TEXTURE && v->ptr.class == AIR_PTR_NULL_TEXTURE)))
+       return air_error(c, "intrinsic: argument %u is not a %s", operand - 1,
+                        want == AIR_PTR_TEXTURE ? "texture" : "sampler");
+    *out = v->ptr;
+    return true;
+ }
+ 
++/* `air.get_null_texture_<dim>`: Metal's null texture. No binding, no size,
++ * no texels; what each operation does with one is null_texture_op.
++ */
++static bool
++null_texture_handle(struct air_ctx *c, const struct air_inst *in, const char *dim)
++{
++   char probe[64];
++   struct air_tex_name t;
++   snprintf(probe, sizeof(probe), "read_texture_%s", dim);
++   if (!parse_tex_name(probe, &t) || t.is_buffer || in->num_operands != 1 ||
++       in->base.type->kind != AIR_TYPE_POINTER)
++      return air_error(c, "intrinsic: air.get_null_texture_%s (a null texture of a shape "
++                          "this does not know)", dim);
++   struct air_ptr p = { .class = AIR_PTR_NULL_TEXTURE, .pointee = in->base.type->elem };
++   air_set(c, &in->base, air_val_ptr(c, p));
++   return true;
++}
++
+ /* a constant i1/i32 argument, which these intrinsics use as flags */
+ static bool
+ tex_flag(struct air_ctx *c, const struct air_inst *in, unsigned operand, uint64_t *out)
+@@ -1547,6 +1598,53 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
+    return coord;
+ }
+ 
++/* What Metal's null texture does, which is nothing, quietly: a read (sample,
++ * gather, read, compare) returns zero in every component and a zero
++ * sparse-residency byte, a size or count query returns zero, and a write is
++ * discarded. This is the behaviour the Metal Shading Language documents for a
++ * texture that was never set; it is stated here once so that one place says
++ * what null means. A level-of-detail query has no zero that is also a level,
++ * so it is refused rather than made up.
++ */
++static bool
++null_texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_tex_name *t,
++                const struct air_name *n, unsigned dest_bits)
++{
++   if (!strcmp(t->op, "write"))
++      return true;
++   if (!strcmp(t->op, "lod"))
++      return air_error(c, "intrinsic: air.%s through a null texture (a level of detail "
++                          "that does not exist)", n->part[0]);
++   if (!strcmp(t->op, "get")) {
++      air_set(c, &in->base, air_val_ssa(c, nir_imm_intN_t(&c->b, 0, dest_bits)));
++      return true;
++   }
++   const struct air_type *vt = in->base.type;
++   if (vt->kind == AIR_TYPE_STRUCT && vt->num_members)
++      vt = vt->members[0];
++   set_tex_result(c, in, nir_imm_zero(&c->b, air_nir_components(vt), dest_bits));
++   return true;
++}
++
++/* A value read through a handle that is null on some paths: zero where it is
++ * (null_texture_op), the read where it is not. The read itself is made either
++ * way, on the real binding -- NIR has no conditional fetch in this translator's
++ * unstructured form -- so the runtime has to keep that binding pointing at a
++ * valid descriptor even when Metal's pipeline would have none there.
++ */
++static nir_def *
++if_live(struct air_ctx *c, const struct air_ptr *tex, nir_def *v)
++{
++   if (!tex->non_null)
++      return v;
++   air_note(c, "a texture that is null on some paths (Metal's null texture): the real "
++               "binding is read on every path and the result replaced with zero where "
++               "the texture is null, so that binding must always hold a valid "
++               "descriptor");
++   return nir_bcsel(&c->b, tex->non_null, v, nir_imm_zero(&c->b, v->num_components,
++                                                          v->bit_size));
++}
++
+ static bool
+ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
+ {
+@@ -1610,6 +1708,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
+    nir_alu_type dest_type = tex_dest_type(c, in->base.type, n);
+    unsigned dest_bits = nir_alu_type_get_type_size(dest_type);
+ 
++   if (tex.class == AIR_PTR_NULL_TEXTURE)
++      return null_texture_op(c, in, &t, n, dest_bits);
++
+    if (!strcmp(t.op, "get")) {
+       /* the queries: a size, a level count or a sample count */
+       nir_def *res;
+@@ -1637,11 +1738,15 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
+                              n->part[0], comp, size->num_components);
+          res = nir_channel(&c->b, size, comp);
+       }
+-      air_set(c, &in->base, air_val_ssa(c, nir_u2uN(&c->b, res, dest_bits)));
++      air_set(c, &in->base,
++              air_val_ssa(c, if_live(c, &tex, nir_u2uN(&c->b, res, dest_bits))));
+       return true;
+    }
+ 
+    if (!strcmp(t.op, "write")) {
++      if (tex.non_null)
++         return air_error(c, "intrinsic: air.%s to a texture that is null on some paths, "
++                             "which would need a conditional store", n->part[0]);
+       nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
+       if (!coord)
+          return false;
+@@ -1681,7 +1786,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
+                                     nir_imm_int(&c->b, t.is_ms ? 0 : extra),
+                                     .image_dim = t.dim, .image_array = t.is_array,
+                                     .dest_type = dest_type);
+-      set_tex_result(c, in, res);
++      set_tex_result(c, in, if_live(c, &tex, res));
+       return true;
+    }
+ 
+@@ -1728,7 +1833,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
+     * exactly six, and the next source anyone adds should not be the one that overflows
+     * this silently.
+     */
+-   nir_tex_src srcs[7];
++   nir_tex_src srcs[8];
+    unsigned nsrc = 0;
+    srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_coord,
+                                  .src = nir_src_for_ssa(coord) };
+@@ -1856,6 +1961,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
+       };
+    }
+ 
++   if (have_sampler && samp.offset)
++      srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_sampler_offset,
++                                    .src = nir_src_for_ssa(samp.offset) };
+    nir_tex_instr *tex_instr = nir_tex_instr_create(c->nir, nsrc);
+    tex_instr->op = op;
+    tex_instr->sampler_dim = t.dim;
+@@ -1902,7 +2010,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
+    else if (want > nir_comps)
+       return air_error(c, "intrinsic: air.%s gives %u components, the shader wants %u",
+                        n->part[0], nir_comps, want);
+-   set_tex_result(c, in, res);
++   set_tex_result(c, in, if_live(c, &tex, res));
+    return true;
+ }
+ 
+@@ -1923,6 +2031,8 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
+ 
+    if (!strcmp(n.part[0], "is_function_constant_defined"))
+       return fc_defined_op(c, in);
++   if (!strncmp(n.part[0], "get_null_texture_", 17))
++      return null_texture_handle(c, in, n.part[0] + 17);
+    if (n.num >= 2 && !strcmp(n.part[0], "wg") && !strcmp(n.part[1], "barrier"))
+       return barrier_op(c, in);
+    if (!strcmp(n.part[0], "atomic"))
+diff --git a/tools/mesa/air/air_private.h b/tools/mesa/air/air_private.h
+index 16d6667..51551cc 100644
+--- a/tools/mesa/air/air_private.h
++++ b/tools/mesa/air/air_private.h
+@@ -37,6 +37,20 @@ enum air_ptr_class {
+     * why argument buffers need no addresses here.
+     */
+    AIR_PTR_ARGBUF,
++
++   /* A local that holds a POINTER (an `alloca ptr`), kept as a translation-time
++    * cell instead of memory: .binding is its number in air_ctx.cells and the
++    * cell's content is the one resolved pointer stored into it. Only made when
++    * cell_is_resolvable has proved the cell is written once, in the entry
++    * block, before every read, and that its address never leaves the function.
++    */
++   AIR_PTR_CELL,
++
++   /* `air.get_null_texture_*`: Metal's null texture, a texture handle that
++    * names no texture. It has no binding. A read through it gives zeros, a
++    * query gives zero, a write is discarded -- see null_texture_op.
++    */
++   AIR_PTR_NULL_TEXTURE,
+ };
+ 
+ struct air_ptr {
+@@ -45,6 +59,24 @@ struct air_ptr {
+    bool is_image;                    /* a texture the shader writes: an image, not a view */
+    nir_def *offset;                  /* bytes, 32-bit; NULL means zero */
+    const struct air_type *pointee;   /* for sizes, and for loads without a type */
++
++   /* AIR_PTR_TEXTURE only: a 1-bit def that is true where this handle is the
++    * real texture and false where Metal would have a null texture in its place
++    * (a phi or select between a null texture and this one). NULL means always
++    * the real one.
++    */
++   nir_def *non_null;
++
++   /* AIR_PTR_SAMPLER only: .offset is a run-time addition to .binding (a
++    * sampler chosen between two by a select), NULL when the binding is exact.
++    */
++
++   /* A module-scope variable's pointer remembers which one it is and where its
++    * storage starts, so that a POINTER read out of a constant one can be
++    * answered from its initializer (const_global_pointer).
++    */
++   const struct air_global *global;
++   uint32_t global_base;
+ };
+ 
+ enum air_val_kind {
+@@ -58,8 +90,9 @@ enum air_val_kind {
+     * load_ubo at Metal's own index with no descriptor indirection; a pointer
+     * CHOSEN at run time has no such resolution, so the choice itself is kept
+     * and made where the pointer is used. A pointer STORED to memory is the
+-    * other half of the same problem and has no form here at all -- see
+-    * docs/air.md section 3 for what that costs.
++    * other half of the same problem and has no form here, except into a cell
++    * that is provably written once and never escapes (AIR_PTR_CELL); every
++    * other store of a pointer is refused -- see docs/air.md section 3.
+     */
+ 
+    /* `select i1 %c, ptr %a, ptr %b`: .def is the condition and .elems[0..1]
+@@ -114,6 +147,11 @@ struct air_argbuf {
+    struct air_argbuf_member *members;
+ };
+ 
++/* A pointer cell: what the one store into an `alloca ptr` stored */
++struct air_cell {
++   struct air_val *content;   /* NULL until the store is translated */
++};
++
+ struct air_ctx {
+    void *mem_ctx;
+    const struct air_module *m;
+@@ -132,6 +170,9 @@ struct air_ctx {
+    struct hash_table *phi_cursors;
+    /* phi -> nir register decl */
+    struct hash_table *phi_regs;
++   /* phi of pointers -> the 1-bit register saying "this edge brought the real
++    * texture and not a null one" (resolve_pointer_phi) */
++   struct hash_table *phi_live;
+    /* Where this function's constants are built: the top of its entry block,
+     * which dominates every use of them. air_get caches a constant the first
+     * time it is asked for, so the def has to be somewhere every later block
+@@ -146,6 +187,11 @@ struct air_ctx {
+     * itself will go, which put a vec before the components it reads */
+    bool in_const;
+ 
++   /* the pointer cells (AIR_PTR_CELL) made so far; ids are never reused, so
++    * they survive a callee being translated in the middle of a caller */
++   struct air_cell *cells;
++   unsigned num_cells;
++
+    /* A call of another function in the module becomes a nir_call, and
+     * nir_inline_functions folds it in afterwards. These two carry the state
+     * that needs: the functions already translated, so a callee shared by two
+diff --git a/tools/mesa/air/air_to_nir.c b/tools/mesa/air/air_to_nir.c
+index 7c971ae..370f35a 100644
+--- a/tools/mesa/air/air_to_nir.c
++++ b/tools/mesa/air/air_to_nir.c
+@@ -89,6 +89,12 @@ val_is_pointerish(const struct air_val *v)
+    return v && (v->kind == AIR_VAL_PTR || v->kind == AIR_VAL_PTR_SELECT);
+ }
+ 
++static bool
++is_null_texture(const struct air_val *v)
++{
++   return v && v->kind == AIR_VAL_PTR && v->ptr.class == AIR_PTR_NULL_TEXTURE;
++}
++
+ /* Two resolutions that are the same resolution.
+  *
+  * This is what lets a `phi` or a `select` between pointers be answered without
+@@ -2038,6 +2044,271 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
+ 
+ /* -- instructions ------------------------------------------------------- */
+ 
++/* -- pointer cells ------------------------------------------------------ */
++
++/* Metal's compiler keeps a `sampler` argument that is later chosen between two
++ * (the argument, or a constexpr one when a function constant says the argument
++ * is absent) in an `alloca ptr`, stores the argument there once at the top of
++ * the function, reaches the cell through a bitcast and a `select` against a
++ * constant global that wraps the other sampler, and loads the sampler back out
++ * through the chosen address. Memory is the wrong model for that here: a
++ * pointer is a resolution, not bytes (docs/air.md section 3), so there is
++ * nothing to put in the cell.
++ *
++ * It is still answerable, and exactly, when the cell behaves like a name for
++ * ONE value: it is written once, before anything reads it, and its address is
++ * never seen by anything that could write it again or compare it. Then every
++ * load from the cell, however it is reached, yields the one stored value, and
++ * the cell can be a translation-time slot (AIR_PTR_CELL) instead of memory.
++ * This function proves that, over the whole function body, or says no -- and
++ * a no leaves the alloca as scratch memory, so the store of a pointer into it
++ * is refused by name exactly as before.
++ *
++ * What the proof demands:
++ *   - the values that can hold the cell's address (the alloca, and bitcasts,
++ *     selects, phis and all-zero geps of those) are used ONLY as the pointer
++ *     operand of a load of a POINTER, as such another alias, or as the pointer
++ *     operand of the store below. Passed to a call, stored as a value,
++ *     compared, cast to an integer, indexed with a non-zero index or loaded
++ *     as anything but a pointer all let the address or its bytes out;
++ *   - there is exactly ONE store, its pointer operand is the alloca itself or
++ *     a bitcast of it (not a select or a phi: those could pick another
++ *     cell), and it is in the entry block -- which has no predecessor, so it
++ *     runs once and before every other block;
++ *   - a load in the entry block comes after the store in it.
++ * A cell addressed through a select with another object is fine to LOAD
++ * through: the select is kept as a choice of pointers (AIR_VAL_PTR_SELECT)
++ * and the load answers each side from its own object.
++ */
++static bool
++cell_is_resolvable(struct air_ctx *c, const struct air_inst *alloca)
++{
++   const struct air_function *f = c->fn;
++   if (!f || !f->num_blocks)
++      return false;
++   void *tmp = ralloc_context(NULL);
++   struct set *alias = _mesa_pointer_set_create(tmp);
++   struct set *direct = _mesa_pointer_set_create(tmp);
++   _mesa_set_add(alias, &alloca->base);
++   _mesa_set_add(direct, &alloca->base);
++
++   bool changed;
++   do {
++      changed = false;
++      for (unsigned bi = 0; bi < f->num_blocks; bi++) {
++         for (unsigned i = 0; i < f->blocks[bi].num_insts; i++) {
++            const struct air_inst *in = f->blocks[bi].insts[i];
++            bool derived = false;
++            switch (in->op) {
++            case AIR_OP_CAST:
++               if (in->sub == AIR_CAST_BITCAST &&
++                   _mesa_set_search(alias, in->operands[0])) {
++                  derived = true;
++                  if (_mesa_set_search(direct, in->operands[0]) &&
++                      !_mesa_set_search(direct, &in->base)) {
++                     _mesa_set_add(direct, &in->base);
++                     changed = true;
++                  }
++               }
++               break;
++            case AIR_OP_SELECT:
++               derived = _mesa_set_search(alias, in->operands[1]) ||
++                         _mesa_set_search(alias, in->operands[2]);
++               break;
++            case AIR_OP_PHI:
++               for (unsigned k = 0; k < in->num_operands; k++)
++                  derived |= _mesa_set_search(alias, in->operands[k]) != NULL;
++               break;
++            case AIR_OP_GEP:
++               derived = _mesa_set_search(alias, in->operands[0]) != NULL;
++               break;
++            default:
++               break;
++            }
++            if (derived && !_mesa_set_search(alias, &in->base)) {
++               _mesa_set_add(alias, &in->base);
++               changed = true;
++            }
++         }
++      }
++   } while (changed);
++
++   unsigned stores = 0;
++   bool ok = true;
++   for (unsigned bi = 0; bi < f->num_blocks && ok; bi++) {
++      for (unsigned i = 0; i < f->blocks[bi].num_insts && ok; i++) {
++         const struct air_inst *in = f->blocks[bi].insts[i];
++         if (in == alloca)
++            continue;
++         for (unsigned k = 0; k < in->num_operands && ok; k++) {
++            if (!_mesa_set_search(alias, in->operands[k]))
++               continue;
++            switch (in->op) {
++            case AIR_OP_CAST:
++               ok = in->sub == AIR_CAST_BITCAST && in->base.type->kind == AIR_TYPE_POINTER;
++               break;
++            case AIR_OP_SELECT:
++               ok = k >= 1;
++               break;
++            case AIR_OP_PHI:
++               break;
++            case AIR_OP_GEP: {
++               ok = k == 0;
++               for (unsigned j = 1; ok && j < in->num_operands; j++) {
++                  uint64_t idx;
++                  ok = air_const_uint(in->operands[j], &idx) && idx == 0;
++               }
++               break;
++            }
++            case AIR_OP_LOAD:
++               /* before the store, in the entry block, it would read nothing */
++               ok = k == 0 && in->base.type->kind == AIR_TYPE_POINTER &&
++                    (bi != 0 || stores == 1);
++               break;
++            case AIR_OP_STORE:
++               ok = k == 1 && bi == 0 && _mesa_set_search(direct, in->operands[1]) &&
++                    in->operands[0]->type->kind == AIR_TYPE_POINTER;
++               if (ok)
++                  stores++;
++               break;
++            default:
++               ok = false;
++               break;
++            }
++         }
++      }
++   }
++   ralloc_free(tmp);
++   return ok && stores == 1;
++}
++
++/* The pointer a constant global's initializer holds at byte `rel`: the cell of
++ * a `constexpr sampler` wrapper, for one. Walks the initializer by type, so a
++ * member found at that offset is the member and nothing else is guessed; a
++ * zeroinitializer yields a null pointer for any pointer-typed leaf.
++ */
++static struct air_val *
++const_global_pointer(struct air_ctx *c, const struct air_ptr *p)
++{
++   const struct air_global *g = p->global;
++   if (!g || !g->is_const || !g->init || g->externally_initialized) {
++      air_error(c, "instruction: a pointer loaded from memory that is not a constant "
++                   "global (argument buffers)");
++      return NULL;
++   }
++   uint64_t rel;
++   if (!p->offset) {
++      rel = 0;
++   } else {
++      uint64_t abs;
++      if (!nir_src_is_const(nir_src_for_ssa(p->offset)) ||
++          (abs = nir_src_as_uint(nir_src_for_ssa(p->offset))) < p->global_base) {
++         air_error(c, "instruction: a pointer loaded from a constant global at a "
++                      "run-time offset");
++         return NULL;
++      }
++      rel = abs - p->global_base;
++   }
++
++   const struct air_type *t = g->value_type;
++   const struct air_value *v = g->init;
++   bool zero = false;
++   for (;;) {
++      const struct air_constant *k = air_value_as_constant(v);
++      if (k && (k->ckind == AIR_CONST_NULL || k->ckind == AIR_CONST_UNDEF ||
++                k->ckind == AIR_CONST_POISON))
++         zero = true;
++      if (t->kind == AIR_TYPE_POINTER) {
++         if (rel) {
++            air_error(c, "instruction: a pointer loaded from the middle of a pointer "
++                         "in a constant global");
++            return NULL;
++         }
++         if (zero) {
++            struct air_ptr np = { .class = AIR_PTR_NONE, .pointee = t->elem };
++            return air_val_ptr(c, np);
++         }
++         return air_get(c, v);
++      }
++      const struct air_type *et = NULL;
++      const struct air_value *ev = NULL;
++      uint64_t erel = 0;
++      if (t->kind == AIR_TYPE_STRUCT) {
++         for (unsigned n = 0; n < t->num_members && !et; n++) {
++            uint64_t off = air_struct_member_offset(c->m, t, n);
++            uint64_t size = air_type_alloc_size(c->m, t->members[n]);
++            if (rel >= off && rel < off + size) {
++               et = t->members[n];
++               erel = rel - off;
++               if (!zero && k && k->ckind == AIR_CONST_AGGREGATE && n < k->num_elems)
++                  ev = k->elems[n];
++            }
++         }
++      } else if (t->kind == AIR_TYPE_ARRAY) {
++         uint64_t es = air_type_alloc_size(c->m, t->elem);
++         uint64_t n = es ? rel / es : 0;
++         if (es && n < t->count) {
++            et = t->elem;
++            erel = rel - n * es;
++            if (!zero && k && k->ckind == AIR_CONST_AGGREGATE && n < k->num_elems)
++               ev = k->elems[n];
++         }
++      }
++      if (!et || (!zero && !ev)) {
++         air_error(c, "instruction: a pointer loaded from a constant global at an "
++                      "offset where it holds none");
++         return NULL;
++      }
++      t = et;
++      v = ev;
++      rel = erel;
++   }
++}
++
++/* A load of a POINTER, answered while translating: the pointer was never in
++ * memory, so it is read out of wherever this frontend kept it. Through a
++ * chosen pointer each side is answered from its own object and the choice is
++ * kept, which is exact: the loaded pointer is the one the chosen side holds.
++ */
++static struct air_val *
++load_pointer(struct air_ctx *c, struct air_val *p)
++{
++   if (p->kind == AIR_VAL_PTR_SELECT) {
++      struct air_val *a = load_pointer(c, p->elems[0]);
++      struct air_val *b = a ? load_pointer(c, p->elems[1]) : NULL;
++      if (!a || !b)
++         return NULL;
++      if (a->kind == AIR_VAL_PTR && b->kind == AIR_VAL_PTR &&
++          same_ptr(&a->ptr, &b->ptr) && a->ptr.non_null == b->ptr.non_null)
++         return a;
++      return air_val_ptr_select(c, p->def, a, b);
++   }
++   if (p->kind != AIR_VAL_PTR) {
++      air_error(c, "instruction: a load from something that is not a pointer");
++      return NULL;
++   }
++   switch (p->ptr.class) {
++   case AIR_PTR_CELL: {
++      struct air_cell *cell = &c->cells[p->ptr.binding];
++      if (p->ptr.offset && !(nir_src_is_const(nir_src_for_ssa(p->ptr.offset)) &&
++                             nir_src_as_uint(nir_src_for_ssa(p->ptr.offset)) == 0)) {
++         air_error(c, "instruction: a pointer cell addressed at a non-zero offset");
++         return NULL;
++      }
++      if (!cell->content) {
++         air_error(c, "instruction: a pointer cell read before its store");
++         return NULL;
++      }
++      return cell->content;
++   }
++   case AIR_PTR_SCRATCH:
++      return const_global_pointer(c, &p->ptr);
++   default:
++      air_error(c, "instruction: a pointer loaded from memory (argument buffers)");
++      return NULL;
++   }
++}
++
+ /* A load through a pointer this frontend could not resolve: load through BOTH
+  * sides of the choice and select the values. That is the only form NIR has --
+  * there is no select of pointers in the 32bit_index_offset model -- and it is
+@@ -2057,6 +2328,23 @@ load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type
+       air_error(c, "instruction: a load through something that is not a pointer");
+       return NULL;
+    }
++   /* A choice between a null pointer and a real one (`cond ? null : buf`, which
++    * is how a shader keeps an optional buffer argument behind a function
++    * constant). Reading through the null side is undefined in Metal -- a
++    * pointer that is null is a pointer the shader promises not to read -- so
++    * the only load whose value can ever be observed is the real side's, and it
++    * is the one made, with no select. That is a refinement of the undefined
++    * case, and it is said so: the null side's value, were the shader to read
++    * it, is whatever the real buffer holds.
++    */
++   bool null0 = v->elems[0]->kind == AIR_VAL_PTR && v->elems[0]->ptr.class == AIR_PTR_NONE;
++   bool null1 = v->elems[1]->kind == AIR_VAL_PTR && v->elems[1]->ptr.class == AIR_PTR_NONE;
++   if (null0 != null1) {
++      air_note(c, "a load through a pointer that is null on one side of a `select`: "
++                  "only the non-null side is loaded, since reading the null side is "
++                  "undefined in Metal");
++      return load_through_choice(c, v->elems[null0 ? 1 : 0], t, align);
++   }
+    nir_def *a = load_through_choice(c, v->elems[0], t, align);
+    nir_def *b = load_through_choice(c, v->elems[1], t, align);
+    if (!a || !b)
+@@ -2096,10 +2384,15 @@ gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
+    uint64_t stride = air_type_alloc_size(c->m, t);
+    uint64_t first_const;
+    if (!air_const_uint(in->operands[1], &first_const) || first_const != 0) {
+-      nir_def *first = air_get_ssa(c, in->operands[1]);
+-      if (!first)
+-         return false;
+-      p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, first), stride));
++      uint64_t k;
++      if (air_const_uint(in->operands[1], &k)) {
++         p = air_ptr_add(c, p, nir_imm_int(&c->b, (uint32_t)(k * stride)));
++      } else {
++         nir_def *first = air_get_ssa(c, in->operands[1]);
++         if (!first)
++            return false;
++         p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, first), stride));
++      }
+    }
+ 
+    for (unsigned i = 2; i < in->num_operands; i++) {
+@@ -2120,7 +2413,13 @@ gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
+       } else if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_VECTOR) {
+          uint64_t es = t->kind == AIR_TYPE_ARRAY ? air_type_alloc_size(c->m, t->elem)
+                                                  : MAX2(air_type_bit_size(t->elem) / 8, 1);
+-         p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, idx), es));
++         /* a constant index is a constant offset, and stays one: a pointer
++          * with a constant offset can cross a call (rebuild_ptr_defs) */
++         uint64_t k;
++         if (air_const_uint(in->operands[i], &k))
++            p = air_ptr_add(c, p, nir_imm_int(&c->b, (uint32_t)(k * es)));
++         else
++            p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, idx), es));
+          t = t->elem;
+       } else {
+          return air_error(c, "instruction: getelementptr into a scalar");
+@@ -2185,6 +2484,63 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
+    return true;
+ }
+ 
++/* The general bitcast between vectors of different shape but the same total
++ * width: <4 x half> to <2 x i32>, <8 x i8> to <2 x i32>, <2 x i32> to
++ * <4 x i16>. Bits are laid out as LLVM lays out a vector in memory: element 0
++ * at the LOWEST bits, so a wider element is its narrower parts joined with the
++ * lowest-indexed part lowest, and a narrower element is a field of the wider
++ * one taken from the bottom up. That is the only order that agrees with what a
++ * store of the vector followed by a load of the other would see on this
++ * little-endian target, which is the definition of the cast.
++ *
++ * Done for the case where one width divides the other, which for the 8/16/32/64
++ * widths NIR has is every case with equal totals (a <3 x half> to <1.5 x i32>
++ * has no destination). Booleans are not bit fields here: refused.
++ */
++static nir_def *
++repack_bits(struct air_ctx *c, nir_def *x, unsigned dn, unsigned db)
++{
++   unsigned sn = x->num_components, sb = x->bit_size;
++   if (sb == 1 || db == 1 || sn * sb != dn * db || dn > NIR_MAX_VEC_COMPONENTS)
++      return NULL;
++   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
++   if (db > sb && db % sb == 0) {
++      unsigned r = db / sb;
++      for (unsigned j = 0; j < dn; j++) {
++         nir_def *acc = nir_u2uN(&c->b, nir_channel(&c->b, x, j * r), db);
++         for (unsigned k = 1; k < r; k++) {
++            nir_def *part = nir_u2uN(&c->b, nir_channel(&c->b, x, j * r + k), db);
++            acc = nir_ior(&c->b, acc, nir_ishl_imm(&c->b, part, k * sb));
++         }
++         comps[j] = acc;
++      }
++   } else if (sb > db && sb % db == 0) {
++      unsigned r = sb / db;
++      for (unsigned j = 0; j < dn; j++) {
++         nir_def *src = nir_channel(&c->b, x, j / r);
++         unsigned shift = (j % r) * db;
++         comps[j] = nir_u2uN(&c->b, shift ? nir_ushr_imm(&c->b, src, shift) : src, db);
++      }
++   } else {
++      return NULL;
++   }
++   return nir_vec(&c->b, comps, dn);
++}
++
++/* the same resolution under a new pointee type, on both sides of a choice */
++static struct air_val *
++retype_pointer(struct air_ctx *c, struct air_val *v, const struct air_type *pointee)
++{
++   if (v->kind == AIR_VAL_PTR_SELECT) {
++      struct air_val *a = retype_pointer(c, v->elems[0], pointee);
++      struct air_val *b = retype_pointer(c, v->elems[1], pointee);
++      return a && b ? air_val_ptr_select(c, v->def, a, b) : NULL;
++   }
++   struct air_ptr p = v->ptr;
++   p.pointee = pointee;
++   return air_val_ptr(c, p);
++}
++
+ static bool
+ translate_cast(struct air_ctx *c, const struct air_inst *in)
+ {
+@@ -2193,11 +2549,12 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
+ 
+    if (in->sub == AIR_CAST_BITCAST && dt->kind == AIR_TYPE_POINTER) {
+       struct air_val *v = air_get(c, in->operands[0]);
+-      if (!v || v->kind != AIR_VAL_PTR)
++      if (!v || !val_is_pointerish(v))
+          return air_error(c, "instruction: a bitcast of something that is not a pointer");
+-      struct air_ptr p = v->ptr;
+-      p.pointee = dt->elem;
+-      air_set(c, &in->base, air_val_ptr(c, p));
++      struct air_val *r = retype_pointer(c, v, dt->elem);
++      if (!r)
++         return false;
++      air_set(c, &in->base, r);
+       return true;
+    }
+ 
+@@ -2287,7 +2644,7 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
+          res = nir_unpack_32_2x16(&c->b, x);
+       else if (sn == 2 && sb == 16 && dn == 1 && db == 32)
+          res = nir_pack_32_2x16(&c->b, x);
+-      else
++      else if (!(res = repack_bits(c, x, dn, db)))
+          return air_error(c, "instruction: a bitcast from %u x %u bits to %u x %u bits, "
+                              "which is a repacking this frontend does not do",
+                           sn, sb, dn, db);
+@@ -2446,6 +2803,35 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
+          if (!val_is_pointerish(pa) || !val_is_pointerish(pb))
+             return air_error(c, "instruction: a select between a pointer and "
+                                 "something that is not one");
++         /* A choice between Metal's null texture and a real one. Neither side
++          * is a place to load from, and the real one is a binding that is
++          * known: the choice is whether that binding is the texture or the
++          * null one, and that is a boolean the sampling code applies to its
++          * result (AIR_PTR_TEXTURE.non_null).
++          */
++         if (is_null_texture(pa) || is_null_texture(pb)) {
++            if (is_null_texture(pa) && is_null_texture(pb)) {
++               air_set(c, &in->base, pa);
++               return true;
++            }
++            bool a_null = is_null_texture(pa);
++            struct air_val *real = a_null ? pb : pa;
++            if (real->kind != AIR_VAL_PTR || real->ptr.class != AIR_PTR_TEXTURE)
++               return air_error(c, "instruction: a select between a null texture and "
++                                   "something that is not a texture");
++            nir_def *pc = air_get_ssa(c, in->operands[0]);
++            if (!pc)
++               return false;
++            if (pc->num_components != 1)
++               return air_error(c, "instruction: a vector select between pointers");
++            nir_def *live = a_null ? nir_inot(&c->b, pc) : pc;
++            if (real->ptr.non_null)
++               live = nir_iand(&c->b, live, real->ptr.non_null);
++            struct air_ptr np = real->ptr;
++            np.non_null = live;
++            air_set(c, &in->base, air_val_ptr(c, np));
++            return true;
++         }
+          /* A choice between two members of an argument buffer cannot be kept
+           * the way a choice between two buffers can: AIR_VAL_PTR_SELECT loads
+           * both sides and selects the values, and a texture or a sampler is
+@@ -2495,8 +2881,15 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
+       nir_def *i = air_get_ssa(c, in->operands[2]);
+       if (!v || !x || !i)
+          return false;
+-      if (!nir_src_is_const(nir_src_for_ssa(i)))
+-         return air_error(c, "instruction: insertelement at a run-time index");
++      if (!nir_src_is_const(nir_src_for_ssa(i))) {
++         /* a lane chosen at run time: every lane keeps its value except the one
++          * whose number equals the index, which takes the new one. An index
++          * past the last lane is poison in LLVM, so no lane matching it is one
++          * of the answers allowed. */
++         air_set(c, &in->base,
++                 air_val_ssa(c, nir_vector_insert(&c->b, v, x, nir_u2u32(&c->b, i))));
++         return true;
++      }
+       air_set(c, &in->base,
+               air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x,
+                                                    nir_src_as_uint(nir_src_for_ssa(i)))));
+@@ -2598,11 +2991,22 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
+          return air_error(c, "instruction: an alloca of a run-time size");
+       /* A local holding a POINTER. Scratch memory cannot hold one -- a pointer
+        * here is a resolution and not bytes -- so it becomes a translation-time
+-       * slot instead, when and only when that is sound: see AIR_VAL_SLOT. The
+-       * two GL-on-Metal fragment shaders store their last two buffer arguments
+-       * into such a local and never read them back, which LLVM left behind and
+-       * which used to stop the module at "a pointer where a number belongs".
++       * cell instead, when and only when that is sound: see
++       * cell_is_resolvable. Otherwise it stays scratch and a store of a
++       * pointer into it is refused by name.
+        */
++      if (in->aux_type->kind == AIR_TYPE_POINTER && count == 1 &&
++          cell_is_resolvable(c, in)) {
++         c->cells = reralloc(c->mem_ctx, c->cells, struct air_cell, c->num_cells + 1);
++         c->cells[c->num_cells] = (struct air_cell){ 0 };
++         struct air_ptr cp = {
++            .class = AIR_PTR_CELL,
++            .binding = c->num_cells++,
++            .pointee = in->aux_type,
++         };
++         air_set(c, &in->base, air_val_ptr(c, cp));
++         return true;
++      }
+       uint64_t size = air_type_alloc_size(c->m, in->aux_type) * count;
+       unsigned align = MAX2(in->align, air_type_abi_align(c->m, in->aux_type));
+       c->scratch_size = ALIGN_POT(c->scratch_size, MAX2(align, 1));
+@@ -2619,6 +3023,14 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
+       struct air_val *p = air_get(c, in->operands[0]);
+       if (!p)
+          return false;
++      if (in->base.type->kind == AIR_TYPE_POINTER &&
++          !(p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_ARGBUF)) {
++         struct air_val *res = load_pointer(c, p);
++         if (!res)
++            return false;
++         air_set(c, &in->base, res);
++         return true;
++      }
+       if (p->kind == AIR_VAL_PTR_SELECT) {
+          nir_def *res = load_through_choice(c, p, in->base.type, in->align);
+          if (!res)
+@@ -2659,9 +3071,22 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
+       struct air_val *sv = air_get(c, in->operands[0]);
+       if (!sv)
+          return false;
+-      if (val_is_pointerish(sv))
++      if (val_is_pointerish(sv)) {
++         /* into a cell cell_is_resolvable proved to be written once */
++         if (p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_CELL) {
++            struct air_cell *cell = &c->cells[p->ptr.binding];
++            if (cell->content)
++               return air_error(c, "instruction: a second store into a pointer cell");
++            if (p->ptr.offset && !(nir_src_is_const(nir_src_for_ssa(p->ptr.offset)) &&
++                                   nir_src_as_uint(nir_src_for_ssa(p->ptr.offset)) == 0))
++               return air_error(c, "instruction: a pointer cell addressed at a non-zero "
++                                   "offset");
++            cell->content = sv;
++            return true;
++         }
+          return air_error(c, "instruction: a store of a pointer into memory, which this "
+                              "frontend has no address to write");
++      }
+       if (p->kind == AIR_VAL_PTR_SELECT)
+          return air_error(c, "instruction: a store through a chosen pointer, which would "
+                              "have to write both of them");
+@@ -2835,6 +3260,85 @@ val_holds_ptr(const struct air_val *v)
+    return false;
+ }
+ 
++/* The defs a pointer ARGUMENT carries from its caller: the condition of a
++ * choice between pointers, and the "this is the real texture" boolean of one
++ * that may be null. The pointer itself is a resolution and is handed to the
++ * callee as such (it takes no parameter), but these are values of the CALLER's
++ * impl, so each one crosses the call as a boolean parameter of its own and the
++ * callee rebuilds the same pointer around its own copy. collect_ptr_defs and
++ * rebuild_ptr_defs walk the value in the same order, which is what ties the
++ * i-th def of the call site to the i-th parameter of the callee.
++ *
++ * A pointer with a computed byte offset (a buffer at a run-time index) has no
++ * such form and is refused by the caller of this, as before.
++ */
++static bool
++collect_ptr_defs(struct air_ctx *c, const struct air_val *v, nir_def **out, unsigned *n,
++                 bool in_choice)
++{
++   if (!v)
++      return true;
++   switch (v->kind) {
++   case AIR_VAL_PTR:
++      if (v->ptr.offset && in_choice && !nir_src_is_const(nir_src_for_ssa(v->ptr.offset)))
++         return air_error(c, "intrinsic: a call passing a pointer at a computed offset "
++                             "inside a pointer chosen at run time");
++      if (v->ptr.non_null) {
++         if (out)
++            out[*n] = v->ptr.non_null;
++         (*n)++;
++      }
++      return true;
++   case AIR_VAL_PTR_SELECT:
++      if (out)
++         out[*n] = v->def;
++      (*n)++;
++      return collect_ptr_defs(c, v->elems[0], out, n, true) &&
++             collect_ptr_defs(c, v->elems[1], out, n, true);
++   case AIR_VAL_AGG:
++      for (unsigned i = 0; i < v->num_elems; i++)
++         if (!collect_ptr_defs(c, v->elems[i], out, n, in_choice))
++            return false;
++      return true;
++   default:
++      return true;
++   }
++}
++
++static struct air_val *
++rebuild_ptr_defs(struct air_ctx *c, const struct air_val *v, nir_def **in, unsigned *n)
++{
++   if (!v)
++      return NULL;
++   struct air_val *r = rzalloc(c->mem_ctx, struct air_val);
++   *r = *v;
++   switch (v->kind) {
++   case AIR_VAL_PTR:
++      if (v->ptr.non_null)
++         r->ptr.non_null = in[(*n)++];
++      /* a constant offset is remade here: the caller's immediate is the
++       * caller's def */
++      if (v->ptr.offset && nir_src_is_const(nir_src_for_ssa(v->ptr.offset)))
++         r->ptr.offset = nir_imm_int(&c->b,
++                                     nir_src_as_uint(nir_src_for_ssa(v->ptr.offset)));
++      break;
++   case AIR_VAL_PTR_SELECT:
++      r->def = in[(*n)++];
++      r->elems = rzalloc_array(c->mem_ctx, struct air_val *, 2);
++      r->elems[0] = rebuild_ptr_defs(c, v->elems[0], in, n);
++      r->elems[1] = rebuild_ptr_defs(c, v->elems[1], in, n);
++      break;
++   case AIR_VAL_AGG:
++      r->elems = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(v->num_elems, 1));
++      for (unsigned i = 0; i < v->num_elems; i++)
++         r->elems[i] = rebuild_ptr_defs(c, v->elems[i], in, n);
++      break;
++   default:
++      break;
++   }
++   return r;
++}
++
+ /* A function of the module, translated as a nir_function so that
+  * nir_inline_functions can fold it into its callers afterwards.
+  *
+@@ -2862,11 +3366,14 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+     * callee to its call site -- so it is not cached. Each of the four modules
+     * that needs this has exactly one call site, counted beforehand.
+     *
+-    * A pointer carrying a byte offset is refused instead: that offset is an
+-    * nir_def of the CALLER's impl, and using it here would be the same
+-    * cross-function def/use that the globals used to cause.
++    * A pointer carrying a byte offset is refused instead when the offset is
++    * computed: that offset is an nir_def of the CALLER's impl, and using it
++    * here would be the same cross-function def/use that the globals used to
++    * cause. A CONSTANT offset is not a def worth sharing -- the callee makes
++    * its own immediate of the same value (rebuild_ptr_defs).
+     */
+    bool specialised = false;
++   unsigned num_extra = 0;   /* the caller's defs a pointer argument carries */
+    for (unsigned i = 0; i < f->num_args; i++) {
+       /* A struct holding a pointer counts as one too: CoreImage passes a
+        * texture and a sampler as metal::texture2d and metal::sampler, which
+@@ -2877,22 +3384,21 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+        */
+       bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
+                                      val_holds_ptr(argv[i]));
+-      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
++      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset &&
++          !nir_src_is_const(nir_src_for_ssa(argv[i]->ptr.offset))) {
+          air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
+                       "argument %u, which would use the caller's own value here", i);
+          return NULL;
+       }
+-      /* The same reason, for the two pointers that are values: a chosen
+-       * pointer's condition is a def of the CALLER's impl, and a slot's
+-       * soundness rests on every use being in one block of one function.
+-       */
+-      if (argv && argv[i] && argv[i]->kind == AIR_VAL_PTR_SELECT) {
+-         air_error(c, "intrinsic: a call passing a pointer chosen at run time as "
+-                      "argument %u", i);
+-         return NULL;
+-      }
+       is_param[i] = !ptr;
+       specialised |= ptr;
++      if (ptr) {
++         unsigned dummy = 0;
++         if (!collect_ptr_defs(c, argv[i], NULL, &dummy, false)) {
++            return NULL;
++         }
++         num_extra += dummy;
++      }
+    }
+ 
+    struct hash_entry *e = specialised ? NULL : _mesa_hash_table_search(c->fns, f);
+@@ -2922,7 +3428,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+    } else if (has_ret) {
+       nret = 1;
+    }
+-   unsigned nparams = f->num_args + nret;
++   unsigned nparams = f->num_args + nret + num_extra;
+    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
+    fn->num_params = nparams;
+    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
+@@ -2959,7 +3465,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+          .bit_size = (uint8_t)air_nir_bit_size(c, at),
+       };
+    }
+-   fn->num_params = idx;   /* the pointers took no parameter */
++   /* ... except for the defs they carry from the caller, one boolean each */
++   for (unsigned i = 0; i < num_extra; i++)
++      fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 1 };
++   fn->num_params = idx;   /* the pointers took no parameter of their own */
+ 
+    /* cached before the body is translated, so that a callee which calls itself
+     * meets its own declaration rather than being translated for ever */
+@@ -2971,7 +3480,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+    nir_builder saved_b = c->b;
+    const struct air_function *saved_fn = c->fn;
+    struct hash_table *sv = c->values, *sb = c->blocks,
+-                     *sp = c->phi_cursors, *sr = c->phi_regs;
++                     *sp = c->phi_cursors, *sr = c->phi_regs, *sl = c->phi_live;
+    nir_deref_instr *saved_ret = c->ret_deref;
+    nir_deref_instr **saved_ret_fields = c->ret_fields;
+    unsigned saved_num_ret_fields = c->num_ret_fields;
+@@ -2985,6 +3494,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+    c->blocks = _mesa_pointer_hash_table_create(c->mem_ctx);
+    c->phi_cursors = _mesa_pointer_hash_table_create(c->mem_ctx);
+    c->phi_regs = _mesa_pointer_hash_table_create(c->mem_ctx);
++   c->phi_live = _mesa_pointer_hash_table_create(c->mem_ctx);
+    c->b = nir_builder_at(nir_before_impl(nir_function_impl_create(fn)));
+    /* as for the entry point: this translator emits an unstructured CFG with
+     * nir_goto, and nir_goto_if asserts on a structured impl. A new impl is
+@@ -3022,9 +3532,22 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+                                           nir_var_function_temp, ret_glsl, 0);
+    }
+    unsigned pidx = nret;
++   /* the caller's defs, as this function's own parameters: they follow the
++    * numeric ones, in the order the call site passes them */
++   nir_def *extra[64];
++   unsigned extra_base = nret;
++   for (unsigned i = 0; is_param && i < f->num_args; i++)
++      extra_base += is_param[i];
++   if (num_extra > ARRAY_SIZE(extra))
++      ok = air_error(c, "intrinsic: a call passing more chosen pointers than this "
++                        "can carry"), false;
++   for (unsigned i = 0; ok && i < num_extra; i++)
++      extra[i] = nir_load_param(&c->b, extra_base + i);
++   unsigned extra_used = 0;
+    for (unsigned i = 0; i < f->num_args && ok; i++) {
+       if (!is_param[i]) {
+-         air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
++         /* the caller's own resolution, around this function's own defs */
++         air_set(c, &f->args[i], rebuild_ptr_defs(c, argv[i], extra, &extra_used));
+          continue;
+       }
+       air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));
+@@ -3038,6 +3561,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
+    c->blocks = sb;
+    c->phi_cursors = sp;
+    c->phi_regs = sr;
++   c->phi_live = sl;
+    c->const_cursor = saved_consts;
+    c->ret_deref = saved_ret;
+    c->ret_fields = saved_ret_fields;
+@@ -3126,6 +3650,20 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
+                           i, name);
+       call->params[idx++] = nir_src_for_ssa(a);
+    }
++   /* the defs the pointer arguments carry, in the order translate_callee made
++    * its parameters from them */
++   for (unsigned i = 0; i < f->num_args; i++) {
++      if (is_param[i])
++         continue;
++      unsigned n = 0;
++      nir_def *defs[64];
++      if (!collect_ptr_defs(c, argv[i], NULL, &n, false) || n > ARRAY_SIZE(defs))
++         return false;
++      n = 0;
++      collect_ptr_defs(c, argv[i], defs, &n, false);
++      for (unsigned k = 0; k < n; k++)
++         call->params[idx++] = nir_src_for_ssa(defs[k]);
++   }
+    nir_builder_instr_insert(&c->b, &call->instr);
+ 
+    if (ret_struct) {
+@@ -3354,7 +3892,8 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
+ static bool
+ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
+ {
+-   struct air_val *first = NULL;
++   struct air_val *first = NULL, *null_tex = NULL;
++   bool any_live = false;
+    for (unsigned k = 0; k < in->num_operands; k++) {
+       if (!in->targets[k] || !reachable[in->targets[k]->index])
+          continue;
+@@ -3369,15 +3908,45 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
+                              "%s", v && v->kind == AIR_VAL_PTR_SELECT
+                                       ? "itself a pointer chosen at run time"
+                                       : "not a resolved pointer");
++      if (is_null_texture(v)) {
++         null_tex = v;
++         continue;
++      }
++      any_live |= v->ptr.non_null != NULL;
+       if (!first)
+          first = v;
+       else if (!same_ptr(&first->ptr, &v->ptr))
+          return air_error(c, "instruction: a phi between pointers that name different "
+                              "places, which would have to be chosen at run time");
+    }
+-   if (!first)
++   if (!first) {
++      if (null_tex) {
++         air_set(c, &in->base, null_tex);   /* null on every edge there is */
++         return true;
++      }
+       return air_error(c, "instruction: a phi of pointers with no reachable operand");
+-   air_set(c, &in->base, first);
++   }
++   if (!null_tex && !any_live) {
++      air_set(c, &in->base, first);
++      return true;
++   }
++
++   /* A phi between Metal's null texture and a real one, or whose real operands
++    * are themselves only sometimes real. Which it is depends on the edge taken,
++    * so it is a boolean carried by a register exactly as a phi of numbers is:
++    * each edge stores whether it brought the real texture, and the phi's
++    * result is the real binding with that boolean as its non_null. The edge
++    * stores are made with the others, at the end of translate_body.
++    */
++   if (first->ptr.class != AIR_PTR_TEXTURE)
++      return air_error(c, "instruction: a phi between a null texture and something "
++                          "that is not a texture");
++   nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
++   nir_def *reg = nir_decl_reg(&entry, 1, 1, 0);
++   _mesa_hash_table_insert(c->phi_live, in, reg);
++   struct air_ptr np = first->ptr;
++   np.non_null = nir_load_reg(&c->b, reg);
++   air_set(c, &in->base, air_val_ptr(c, np));
+    return true;
+ }
+ 
+@@ -3565,6 +4134,24 @@ translate_body(struct air_ctx *c)
+          const struct air_inst *in = blk->insts[i];
+          if (in->op != AIR_OP_PHI)
+             continue;
++         struct hash_entry *le = _mesa_hash_table_search(c->phi_live, in);
++         if (le) {
++            /* a phi of textures, some of them null: store, per edge, whether
++             * that edge brought the real texture */
++            for (unsigned k = 0; k < in->num_operands; k++) {
++               struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
++               struct hash_entry *ve = _mesa_hash_table_search(c->values, in->operands[k]);
++               if (!ce || !ve)
++                  continue; /* an edge from a block the entry cannot reach */
++               const struct air_val *v = ve->data;
++               c->b.cursor = *(nir_cursor *)ce->data;
++               nir_def *live = is_null_texture(v) ? nir_imm_false(&c->b) :
++                               v->ptr.non_null ? v->ptr.non_null : nir_imm_true(&c->b);
++               nir_store_reg(&c->b, live, le->data);
++               *(nir_cursor *)ce->data = c->b.cursor;
++            }
++            continue;
++         }
+          struct hash_entry *re = _mesa_hash_table_search(c->phi_regs, in);
+          if (!re)
+             continue; /* a phi in an unreachable block, or one of pointers */
+@@ -3743,6 +4330,8 @@ materialise_globals(struct air_ctx *c)
+          .class = pl->class,
+          .binding = pl->binding,
+          .offset = pl->has_offset ? nir_imm_int(&c->b, pl->offset) : NULL,
++         .global = g,
++         .global_base = pl->has_offset ? pl->offset : 0,
+       };
+       air_set(c, &g->base, air_val_ptr(c, p));
+    }
+@@ -3887,6 +4476,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
+    c.blocks = _mesa_pointer_hash_table_create(ctx);
+    c.phi_cursors = _mesa_pointer_hash_table_create(ctx);
+    c.phi_regs = _mesa_pointer_hash_table_create(ctx);
++   c.phi_live = _mesa_pointer_hash_table_create(ctx);
+    c.num_params = fn->num_args;
+    c.params = rzalloc_array(ctx, struct air_val *, MAX2(c.num_params, 1));
+ 
+@@ -4026,7 +4616,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
+       NIR_PASS(_, c.nir, nir_opt_dce);
+    }
+ 
+-   nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
++      nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
+ 
+    if (info) {
+       /* The info's arrays live under mem_ctx, not under the scratch context --
