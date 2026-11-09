@@ -1,3 +1,5 @@
+> **State 2026-11-09, read this first.** Metal is not the blocker right now. Plain GL (`logs/xnu-0160base.txt`) and Metal both stop with SpringBoard t0 waiting in `_LSContextInitCommon` (LaunchServices), so the gpu3 root has its own fault; old roots reached UI at 65 s. Formats 550/554 look like probes. Last flash (0160m7, NOT booted): gpu3.raw with `*.csstore*` removed and the `org.ios-sweet.wland` launchd job removed; originals in `~/Developer/ios-sweet-work/root/saved/`. Next: boot `shim/out/shim-boot-0160m5.img` with `tools/sweet-boot-test.sh ... 0160m7 350`. If still stuck, rebuild a fresh root (needs the user to run sudo).
+
 # Phase M2 — Metal: first picture
 
 Read `CLAUDE.md`, `PROJECT_STATE.md`, `TEST_LOG.md` (Metal on device). Metal is the primary path. Reply style: caveman lite. `fastboot boot`, `userdata` flash (user's yes given), REA under protocol, and GitHub CI are allowed. Do not use any password the user pasted.
