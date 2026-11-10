@@ -92,3 +92,25 @@ Status: Metal `not-tested` on hardware. These results show compiling and linking
 | 2026-11-09 | 0160m4 | Fixed flash, `sweetmetal=1` | backboardd survives | 0 backboardd crashes; pipelines built; 5 swaps and presents, fence 21, then no more swaps. Black screen seen by the user. Returned to fastboot in 185 s | `logs/xnu-0160m4.txt` |
 
 Status: Metal `experimental` on device; no picture yet. Open: pixel formats 550 and 554 unsupported, and why backboardd stops swapping (`SMP backboardd` stacks in the log).
+
+
+## Stage A rows, 2026-11-10 (facts from the `NEXT_PROMPT.md` state note and recent commit messages only; no new run)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-09 | 0160m5 | Shim image `shim/out/shim-boot-0160m5.img` exists; boot procedure not described in the records | result not recorded | result not recorded | none recorded |
+| 2026-11-09 | 0160m6 | Not described in the state note or commit messages | result not recorded | result not recorded | none recorded |
+| 2026-11-09 | 0160m7, prepared | Root flashed: gpu3.raw with `*.csstore*` removed and the `org.ios-sweet.wland` launchd job removed; originals in `~/Developer/ios-sweet-work/root/saved/` | not booted yet | NOT booted. Context: plain GL (`xnu-0160base`) and Metal both stop with SpringBoard waiting in `_LSContextInitCommon` | none |
+
+## GL boot with root fixes, 2026-11-10 (real device; GL path, kernel 0160, no sweetmetal)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-10 | 0160m7 (root with csstore removed) | Boot of the gpu3 root with `*.csstore*` removed | not recorded | NOT run. First attempt hung because the Mac did not see the phone on USB; superseded by the fixed root below | none |
+| 2026-11-10 | gpu3 root fixes | `tools/sweet-root-fixes.py` default steps applied on the Mac without sudo. Checked on the image before: 32 apps still in staged_system_apps, no migrate sentinel, 0 PNG wallpapers, no SystemConfiguration/preferences.plist, no FeatureFlags | default steps applied | Applied. 3 chown warnings (image mounted noowners; intended owners of ExtensionKit.plist, preferences.plist and the migrate sentinel not set). Flashed to userdata (331 s + 216 s) | gpu3 root (userdata) |
+| 2026-11-10 | 0160f1 | `shim-boot-0160base.img`, reboot 150 s | not recorded | Apple logo with progress bar seen by the user. 169 FPS records, 60 swaps/s, GL frame counter reached 7200. Before the fix the same image gave 3 presents in total | `logs/xnu-0160f1.txt` |
+| 2026-11-10 | 0160f2 | `shim-boot-0160base600.img`, 600 s | not recorded | Logo, bar stops near half (user photo). 619 FPS records, about 30 presents/s from record 46 to the end; GL frame 34520; same scene throughout (5 draws, 10 triangles). com.apple.migrationpluginwrapper exec'd; fairplayd.H2 and bluetoothd exec'd 59 times each | `logs/xnu-0160f2.txt` |
+| 2026-11-10 | 0160f3 | `shim-boot-0160base1800.img`, 1800 s | not recorded | Still logo and bar; home screen not reached. 1818 FPS records; GL frame 106300. com.apple.datamigrator exec'd once, migrationpluginwrapper 3 times, installd once, SpringBoard once, lsd once; lskdd exec'd 544 times, fairplayd.H2 178, bluetoothd 177; driverkitd killed once (sig 9) | `logs/xnu-0160f3.txt` |
+| 2026-11-10 | 0160f4 | `shim-boot-0160base4500.img`, 4500 s | not recorded | Started; result pending | none yet |
+
+NOTES.md:661, :983, :1142-1144 (upstream): first-boot migration takes 15-60 min on this port; after it, upstream saw SpringBoard and backboardd stay up with nothing new drawn. Label for the GL logo/progress screen: partially-working (real device, three runs, one root).

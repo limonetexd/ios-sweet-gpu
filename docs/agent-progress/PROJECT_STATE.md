@@ -21,11 +21,13 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 
 ## Top three next tasks
 
-From `GPU_DECISION.md`:
+Re-planned 2026-11-10 (staging: `DECISIONS.md`; routing: `SUBAGENTS.md`).
 
-1. M1: reproducible Metal build script in this repository, driven from the pinned donor.
-2. M1: close the shader gaps (2 QuartzCore pointer stores, 2 VideoToolbox classes).
-3. M1: boot-arg-gated kernel patch publishing the two Metal discovery properties.
+1. Stage A baseline: let first-boot data migration finish (0160f4, 75 min), then find what keeps the home screen from drawing; consider stopping the lskdd / fairplayd.H2 / bluetoothd restart loops.
+2. Loop tooling: delta flash (write only changed blocks); kernel-log picture metric (present count and non-black pixel count).
+3. Static REA survey: Metal selectors, formats and features that QuartzCore and WebKit require, against what `RedwoodMetalDevice` implements; host-compiler coverage of the shipped shaders.
+
+Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 
 ## Handoff
 
