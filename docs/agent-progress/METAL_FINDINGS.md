@@ -118,3 +118,19 @@ Not found upstream: XR/10-bit format support, layered-render fixes, MPS beyond c
 9. Frame pacing measurement against the GL baseline.
 
 Later: evaluate porting upstream's HakiosMetal to Adreno 618, using only Mesa's public register tables.
+
+## 9. Lead from user video, run 0160t2 (real device, one boot, not yet tested)
+
+Frames show: lock screen wallpaper right, but clock, date and flashlight button drawn solid blue
+(vibrancy materials); home screen mostly black with icons appearing only where something changed
+(one icon, then the dock, then rows); App Library shows all icons at once; rainbow blocks behind
+dock, folders and App Library tiles.
+
+Hypothesis: CoreAnimation redraws only dirty regions and expects the previous frame's contents to
+be kept (load action Load on the drawable / preserved render targets); the driver hands back empty
+contents. Self-test 05, 15, 16 (wrong pixels on readback of kept content) point the same way.
+
+Check without code: set `CA_DISABLE_DIRTY_REGIONS=1` in backboardd's environment (launchd.plist
+EnvironmentVariables; root change, needs a flash). If the home screen fills in, the hypothesis
+holds. Fix: honour kept contents for render targets in the driver. Do this before work-list item 3.
+The rainbow blocks are a separate fault (blur scratch surfaces, XR formats).
