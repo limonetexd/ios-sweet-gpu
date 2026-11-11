@@ -1,0 +1,102 @@
+diff --git a/userland/src/redwoodmetal.m b/userland/src/redwoodmetal.m
+index 2b7f853..56643c7 100644
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -1127,6 +1127,82 @@ - (instancetype)initWithDevice:(RedwoodMetalDevice *)device
+ 			length:(NSUInteger)length;
+ @end
+ 
++/*
++ * Which processes are offered this device: boot-arg sweetmetal_procs=, a comma-separated list
++ * of at most 16 process names matched exactly against getprogname(), or the single value `*`
++ * for every process. Absent, empty or malformed (an empty name, more than 16 names, a `*`
++ * inside a list, boot-args longer than the buffer) means no process. Decided once per
++ * process -- Metal's discovery runs once per process too -- and said once.
++ */
++#define RW_ALLOW_KEY "sweetmetal_procs="
++#define RW_ALLOW_MAX 16
++
++static bool
++rw_allow_decide(const char *args, const char *me)
++{
++	const char *at = args, *value, *end, *name;
++	unsigned names = 0;
++	bool found = false;
++
++	while ((at = strstr(at, RW_ALLOW_KEY)) != NULL) {
++		if (at == args || at[-1] == ' ') {
++			break;
++		}
++		at += strlen(RW_ALLOW_KEY);
++	}
++	if (at == NULL || me == NULL) {
++		return false;
++	}
++	value = at + strlen(RW_ALLOW_KEY);
++	end = value + strcspn(value, " \t\n");
++	if (end == value) {
++		return false;
++	}
++	if (end - value == 1 && value[0] == '*') {
++		return true;
++	}
++	for (name = value; name <= end; ) {
++		const char *stop = memchr(name, ',', (size_t)(end - name));
++		size_t len;
++
++		if (stop == NULL) {
++			stop = end;
++		}
++		len = (size_t)(stop - name);
++		if (len == 0 || ++names > RW_ALLOW_MAX || memchr(name, '*', len) != NULL) {
++			return false;
++		}
++		if (strlen(me) == len && memcmp(name, me, len) == 0) {
++			found = true;
++		}
++		name = stop + 1;
++	}
++	return found;
++}
++
++static bool
++rw_process_allowed(void)
++{
++	static dispatch_once_t once;
++	static bool allowed;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *me = getprogname();
++
++		allowed = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
++		          rw_allow_decide(args, me);
++		if (allowed) {
++			rw_print("Metal device allowed for %s\n", me != NULL ? me : "?");
++		} else {
++			rw_print("Metal device not offered to %s (sweetmetal_procs)\n",
++			         me != NULL ? me : "?");
++		}
++	});
++	return allowed;
++}
++
+ @implementation RedwoodMetalDevice
+ 
+ + (void)load
+@@ -1136,6 +1212,14 @@ + (void)load
+ 
+ - (instancetype)initWithAcceleratorPort:(io_service_t)port
+ {
++	/* Before anything else, and before [super init]: a refused process gets nil from an
++	 * object that was only allocated -- no gpu client, no compiler library, no retained
++	 * port -- and Metal's discovery skips a nil device. */
++	if (!rw_process_allowed()) {
++		[self release];
++		return nil;
++	}
++
+ 	ensure_spi([self class]);
+ 
+ 	self = [super init];

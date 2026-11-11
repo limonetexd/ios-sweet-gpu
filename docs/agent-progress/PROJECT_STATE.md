@@ -1,8 +1,8 @@
-# Project state — 2026-11-08
+# Project state — 2026-11-11
 
 **Revision:** branch `gpu`; see `git log` for the commit holding these records. Local only, nothing pushed. Untracked and left alone: `.claude/`, `CLAUDE.md`, `SUBAGENTS.md`, and the kickoff, protocol and subagent files in this directory.
 
-**Phase:** 0, 1, 1b done. Metal viability passed at host fidelity 2026-11-08 (user chose Metal over patch 0160). Next phase M1 not started. `fix-in-place` still governs GL, which stays the default. No kernel or device changes.
+**Phase:** 0, 1, 1b done. Metal is the primary path (user, 2026-11-08). Metal draws the UI on the phone with `metal_profile=1` (0160mp1); on-device self-test 7 of 17 pass (0160t2). Details and work list: `METAL_FINDINGS.md`. `fix-in-place` still governs GL, which stays the default. No kernel or device changes.
 
 ## What works, at what evidence level
 
@@ -10,8 +10,9 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 
 - `partially-working` (real device, `NOTES.md` only): boot to SpringBoard, UFS/HFSX root, CPU-copy display, touch, CoreAnimation on the A618 via Mesa GL, 512 MiB GPU VA.
 - `partially-working` (real device, two boots, `TEST_LOG` 0160s2, 0160w1): GL home screen (SpringBoard, lock screen, Control Centre, Settings, touch; laggy); second boot about 2 min.
+- `partially-working` (real device, one boot, 0160mp1): Metal UI (lock screen, home screen, folders, touch) with visible faults: black frames, blur/backdrop colours, no home wallpaper, slow. Self-test 7 of 17 (0160t2).
 - `experimental`: Wi-Fi (rungs 1–2 passed; rung 3 result unrecorded), battery.
-- `not-working`: sustained 60 fps (best no-idle run 36 swaps/s; swipe runs are bursts with no per-frame data), 120 Hz, Metal (absent here), wallpaper, automated screenshots, blur-dismiss stability.
+- `not-working`: sustained 60 fps (best no-idle run 36 swaps/s; swipe runs are bursts with no per-frame data), 120 Hz, wallpaper on both paths, automated screenshots, blur-dismiss stability.
 - Host: `check-patch.py` 144/144; `validate-repo.py` fails on known numbering.
 
 ## Environment gaps
@@ -22,11 +23,11 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 
 ## Top three next tasks
 
-Re-planned 2026-11-10 (staging: `DECISIONS.md`; routing: `SUBAGENTS.md`).
+Re-planned 2026-11-11 (full list: `METAL_FINDINGS.md` section 8; routing: `SUBAGENTS.md`).
 
-1. Stage B: make SpringBoard survive with the Metal device present (MPSDevice refusal, 0160mh1).
-2. Find why backboardd stops after 3 presents under Metal.
-3. Loop tooling: delta flash; picture metric in the kernel log.
+1. Install the Metal Toolchain (needs the user's yes: download); have the self-test reviewed against expectations.
+2. Fix readback/clear (self-test 05, 15, 16) and the draw crash (08-11).
+3. `CAEnableDeepFramebuffer=NO` for backboardd to stop XR formats (root change, needs a flash).
 
 Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 

@@ -29,8 +29,11 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | 512 MiB GPU VA window | partially-working | NOTES:144; before it 539 VA errors in 0143r, NOTES:209 | `bcbf363` |
 | 60 fps sustained, frame-paced | not-working | Best no-idle run 36.0 swaps/s (0143r, 539 VA errors); swipe runs are bursts, so their 23–34 swaps/s is not a frame-rate limit. No per-frame data. `TEST_LOG.md` Phase 1b | 0143–0159 |
 | 120 Hz mode | not-working | `sweetfb_rate=120` no better than 60 (25.4 vs 26.4), NOTES:371 | 0122 |
-| Metal | not-tested | No device run here. Host only: donor driver cross-builds, 135/141 QuartzCore shaders compile for A618. `TEST_LOG.md` | not in tree |
-| Metal: SpringBoard with Metal device | not-working | TEST_LOG 0160mh1: aborts, MPSDevice refused | this commit |
+| Metal | partially-working | See the Metal rows below. Host: donor driver cross-builds, 135/141 QuartzCore shaders compile for A618 | this commit |
+| Metal: SpringBoard with Metal device, profile 0 | not-working | TEST_LOG 0160mh1: aborts, MPSDevice refused. Fixed by profile 1 | this commit |
+| Metal UI (compositor + SpringBoard on Metal, profile 1) | partially-working | TEST_LOG 0160mp1, real device, one boot, visible faults | this commit |
+| Metal self-test | 7 of 17 pass | TEST_LOG 0160t2, real device, one boot; test program unreviewed | this commit |
+| Metal per-process allow-list | experimental | works for refusal; backboardd crashes when refused (0160t1) | this commit |
 | Automated image correctness (`sweetshot`) | not-working | PNGs mostly black, ring truncates blobs, NOTES:204 | 0143 |
 | Visual correctness of UI | partially-working | user's eyes only: "looks good" NOTES:207, "still lags/glitches" NOTES:448. No reference image | 0143 |
 | GL home screen (SpringBoard, lock screen, Control Centre, Settings, touch) | partially-working | TEST_LOG 0160s2 and 0160w1, real device, two boots, laggy | this commit |

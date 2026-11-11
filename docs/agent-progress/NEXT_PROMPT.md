@@ -1,14 +1,13 @@
-> State 2026-11-11: GL home screen works on the phone, first boot ~18 min (lsd seeding), second boot ~2 min (0160s2, 0160w1); laggy, no second with 45+ presents. Metal on the same root (0160mh1): black screen; SpringBoard aborts in a loop because MetalPerformanceShaders refuses our device (`[MPSImageGaussianBlur initWithDevice:] Failed to get MPSDevice`); backboardd presents 3 frames then stops. Next (Stage B): 1) static REA question, one artifact: in MPSCore, what does MPSDevice require of an MTLDevice to accept it; 2) decide between satisfying that and hiding the Metal device from SpringBoard at first (per-process gate in the plug-in); 3) find why backboardd stops after 3 presents under Metal; 4) remove the DBG instrumentation (`DBG bss`, `DBG semaphore`) from the work-dir donor before the next Metal build. Root on the phone: gpu3 + sweet-root-fixes default steps minus the migrate sentinel, LaunchServices database seeded; do not reflash without need.
+> State 2026-11-11 (device unless noted):
+> - Metal draws the UI with `metal_profile=1` (0160mp1): lock screen, home, folders, touch; faults remain.
+> - On-device self-test (`userland/metaltest`) passes 7 of 17 (0160t2).
+> - Root on the phone is `work1` (seeded root + allow-list plug-in + metaltest job); do not reflash without need.
+> - Boot image args: `sweetmetal=1 metal_profile=1 sweetmetal_procs=* sweetnull=backboardd,SpringBoard,metaltest`.
+> - First boot after flashing the seeded root takes about 2 min, not 18.
+> - Work list and findings: `docs/agent-progress/METAL_FINDINGS.md`.
 
-# Phase Stage A: known-good GL baseline
+# Phase: Metal driver, make the self-test pass
 
-Read `CLAUDE.md`, `PROJECT_STATE.md`, `DECISIONS.md` (2026-11-10 staging), and the state note above. Routing: see `docs/agent-progress/SUBAGENTS.md`; the lead plans and reviews, and delegates bulk work per that table. Do Stage A only; do not start B or C.
+Read `CLAUDE.md`, `docs/agent-progress/METAL_FINDINGS.md` (sections 5 and 8) and the routing in `docs/agent-progress/SUBAGENTS.md`. The lead plans and reviews; `opus-impl` writes driver code from a written spec; `reviewer` checks each diff. One fix at a time, in work-list order, starting with the readback/clear and draw-crash failures. Each fix is proved by the `metaltest` lines in the pulled log, not by a picture. Ask before any download (Metal Toolchain), flash or sudo.
 
-Stages: A) GL home screen on an explainable root; B) Metal in app processes only, backboardd stays on GL; C) backboardd on Metal last, after it passes the same tests as GL.
-
-Tasks, in order:
-1. Diagnose why SpringBoard waits in `_LSContextInitCommon` (lsd/LaunchServices) from the existing logs (`logs/xnu-0160base.txt`, `logs/xnu-0160m4.txt`); log-triage may classify, the lead judges.
-2. Boot the prepared m7 image: `tools/sweet-boot-test.sh ... 0160m7 350` with `shim/out/shim-boot-0160m5.img`. Confirm the boot-arg that returns the phone to fastboot is in the payload first.
-3. If still stuck, plan a fresh root from stock with a recorded change list. Building it needs the user to run sudo; ask before that.
-
-REA is used statically, one artifact and one question per call, per `docs/agent-progress/REA_SAFE_PROTOCOL.md`. Record results in `TEST_LOG.md`. Stop at a GL home screen on a root you can explain, or at 70% context.
+Static analysis (REA) is allowed on graphics frameworks only, per `REA_SAFE_PROTOCOL.md`. Record results in `TEST_LOG.md` and `FEATURE_MATRIX.md`. Do not start a later phase. Stop at 70% context.

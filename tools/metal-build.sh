@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the Metal path on macOS from pinned sources. Nothing lands in git.
 #
-#   tools/metal-build.sh [all|host|ios|driver|payload]    (default all)
+#   tools/metal-build.sh [all|host|ios|driver|test|payload]    (default all)
 #
 # Donor: oosexgang/hackios-xnu-userland (MIT), Mesa 25.0.7 (MIT).
 # Our changes to the donor: userland/metal/*.patch, applied in name order.
@@ -12,6 +12,7 @@
 #   host/build/.../air2nir, ir3_compiler   shader compiler for this Mac
 #   ios/build/.../libredwoodair.dylib      shader runtime for iOS 16 arm64
 #   obj/RedwoodMetal                       Metal plug-in
+#   obj/metaltest, obj/default.metallib    on-device Metal self-test (userland/metaltest)
 #   pay/                                   files to copy into the phone's root, at these paths
 #
 # Needs: Xcode with the iPhoneOS SDK, Homebrew bison and gpatch.
@@ -133,6 +134,25 @@ driver() {
 	echo "driver: $W/obj/RedwoodMetal"
 }
 
+test() {
+	local sdk src=$REPO/userland/metaltest
+	sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+	mkdir -p obj
+	xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" -O1 -fobjc-arc -Wall -Wextra \
+		-framework Foundation -framework Metal -framework IOSurface \
+		-o obj/metaltest "$src/metaltest.m" 2> obj/metaltest-clang.log
+	codesign -f -s - obj/metaltest
+	echo "test: $W/obj/metaltest"
+	rm -f obj/default.metallib
+	if xcrun -sdk iphoneos metal -c -mios-version-min=16.0 -o obj/metaltest.air "$src/shaders.metal" 2> obj/metaltest-metal.log &&
+		xcrun -sdk iphoneos metallib -o obj/default.metallib obj/metaltest.air 2>> obj/metaltest-metal.log; then
+		echo "test: $W/obj/default.metallib"
+	else
+		rm -f obj/default.metallib
+		echo "test: no metallib (Metal Toolchain missing? see $W/obj/metaltest-metal.log); tests 07-11,14 will FAIL/SKIP" >&2
+	fi
+}
+
 payload() {
 	local air=ios/build/src/gallium/drivers/freedreno/libredwoodair.dylib
 	local b=pay/System/Library/Extensions/RedwoodMetal.bundle
@@ -145,13 +165,22 @@ payload() {
 	cp donor/userland/src/metal_plugin.plist "$b/Info.plist"
 	codesign -f -s - pay$PREFIX/lib/libredwoodair.dylib
 	codesign -f -s - "$b"
+	if [ -f obj/metaltest ]; then
+		mkdir -p pay$PREFIX/bin
+		cp obj/metaltest pay$PREFIX/bin/metaltest
+		codesign -f -s - pay$PREFIX/bin/metaltest
+	fi
+	if [ -f obj/default.metallib ]; then
+		mkdir -p pay$PREFIX/share/metaltest
+		cp obj/default.metallib pay$PREFIX/share/metaltest/default.metallib
+	fi
 	(cd pay && find . -type f | sort | xargs shasum -a 256)
 }
 
 tools
 donor
 case "$STAGE" in
-all) host; ios; driver; payload ;;
-host | ios | driver | payload) "$STAGE" ;;
+all) host; ios; driver; test; payload ;;
+host | ios | driver | test | payload) "$STAGE" ;;
 *) echo "unknown stage $STAGE" >&2; exit 2 ;;
 esac

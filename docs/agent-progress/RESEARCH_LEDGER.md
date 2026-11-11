@@ -92,3 +92,16 @@ No REA calls this session. Blocked: none.
 
 - Metal shader failure classes on 20H392, A618: QuartzCore pointer store (2) and `air.imageblock` (4); VideoToolbox bitcast 4x16 to 2x32 (4) and `air.get_null_texture_2d` (3); across all libraries mostly `air.visible` library functions (5283) | `corpus.py` output in the work directory; tool `air2nir`/`ir3_compiler`, donor `a79ff07` | 2026-11-08 | host compile | high for compile status; says nothing about correctness
 - Full MIT text present at donor root, SHA-256 starts `f6cfd96f40e34d36` | local clone | 2026-11-08 | n/a | high
+
+## Metal donors and static analyses (2026-11-11; nothing imported from any of these)
+
+| Claim | Source | Date | Hardware | Confidence |
+| --- | --- | --- | --- | --- |
+| `oosexgang/hakios-metal`: direct PM4 Metal driver, no Gallium; licence MIT (NOTICE records Mesa-derived facts); targets Adreno 660 chip 0x06030500; not imported | github.com/oosexgang/hakios-metal at d36f329 | 2026-11-05 | a660, not A618 | licence read from LICENSE; capability claims self-reported, not reproduced |
+| `oosexgang/hakios-xnu-kernel`: kernel patch, `xnu/files/`, `drivers/` APSL-2.0; the rest MIT, per its LICENSE (GitHub shows NOASSERTION); a660 GPU code only; not imported | github.com/oosexgang/hakios-xnu-kernel at 63fc2b4 | 2026-11-06 | a660 | licence read from LICENSE; rest self-reported |
+| `ry-diffusion/Chlorophyll`: README says MIT, GitHub shows NOASSERTION, relays donor code; licence unresolved; fixes in `docs/FIXES.md` are ideas only; not imported | github.com/ry-diffusion/Chlorophyll | 2026-11-11 | Adreno 630 | unresolved licence; fix claims self-reported, not reproduced |
+| `UniXNU/AdrenoMetal`: MIT; Metal via metal2vulkan + Turnip; not imported | github.com/UniXNU/AdrenoMetal | 2026-11-11 | A740 per README | licence per research report; behaviour self-reported |
+| `steelbrain/metal2vulkan`: GPL-2.0-or-later OR LGPL-3.0-or-later per hakios-xnu-kernel; GitHub shows NOASSERTION; excluded | github.com/steelbrain/metal2vulkan | 2026-11-11 | n/a | licence as stated by another repo, not checked here |
+| MPSCore `MPSDevice::GetMPSDevice` (0x1d40702e8) queries `supportsFamily:` 1008 down to 1002, never 1001; profile 0 (Apple1 only) is refused | iOS 16.7.16 dyld shared cache (20H392), `ipsw`/`otool` disassembly, static only | 2026-11-11 | n/a (host); matches device 0160mh1 | high for the query order; the refusal path is consistent with device 0160mh1 |
+| Metal discovery: nil from `initWithAcceleratorPort:` is skipped (0x181b14584); empty array gives nil default device; runs once per process | iOS 16.7.16 dyld shared cache, `ipsw`/`otool` disassembly, static only | 2026-11-11 | n/a (host) | high for the skip; "once per process" and "two devices fail" medium (not run). Device 0160t1 crash on refusal is not explained by it |
+| QuartzCore format selection: XR formats 550-555 gated by a MobileGestalt answer plus `CAEnableDeepFramebuffer`; RG8 is YCbCr plane 1; no depth outputs in the metallib | iOS 16.7.16 dyld shared cache, `ipsw`/`otool` disassembly, static only | 2026-11-11 | n/a (host) | medium; interpreted by script from disassembly, no device check yet |
