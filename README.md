@@ -1,5 +1,18 @@
-# ios-sweet
-## This is a fork with the objective of making the GPU work. Everything or 99% of the updates are vibe coded (AI generated) with Claude Opus 5.5
+# ios-sweet-gpu: iOS 16 on a Redmi Note 10 Pro, with an AI-written GPU driver
+
+> ## Most of the progress is on the [`gpu` branch](https://github.com/limonetexd/ios-sweet-gpu/tree/gpu)
+>
+> **Apple's Metal graphics API now runs on the phone's Qualcomm Adreno 618 there**: lock screen, home screen, App Library, Control Centre and Settings composited by the GPU through an open-source Metal driver (partially working, experimental). The driver, its on-device self-test (15 of 19 pass), the bug write-ups and the test logs all live on `gpu`. Start with its [README](https://github.com/limonetexd/ios-sweet-gpu/blob/gpu/README.md) and [`METAL_FINDINGS.md`](https://github.com/limonetexd/ios-sweet-gpu/blob/gpu/docs/agent-progress/METAL_FINDINGS.md).
+>
+> This `main` branch is the earlier line of work and is kept separate for now.
+
+> **Who wrote this.** The work in this fork was not written by a human. It was written by AI models: **DeepSeek**, **Big Pickle**, and **Claude** (Haiku, Sonnet, Opus and Fable). The repository owner gave the direction, ran every boot on the real phone, filmed the screen and said what looked wrong. The models planned, wrote, reviewed and debugged the code.
+
+This is a fork of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (MIT), which booted iOS 16 to the home screen with CPU-only drawing. The goal of this fork is to make the GPU work.
+
+---
+
+# Base project description
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 
