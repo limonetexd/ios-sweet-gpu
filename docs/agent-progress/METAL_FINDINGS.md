@@ -151,7 +151,7 @@ Remaining in 0160vA (user report, photos, log): respring on app exit; dotted pat
 
 Work list, in order:
 1. Respring on app exit: get the backboardd backtraces (sig 11 once, sig 6 once) from `logs/xnu-0160vA.txt` and symbolize. Then the other crashes (assetsd x7, MapKit sig 11 x2).
-2. (withdrawn) Blue tint of whites: the user confirmed in person that white is white; the tint was the camera. Lesson: colour judgements from photos need the user's eyes; the dot pattern in blur may also be partly camera moire and needs the same check.
+2. (withdrawn) Blue tint of whites: the user confirmed in person that white is white; the tint was the camera. Lesson: colour judgements from photos need the user's eyes; the dot pattern in blur was checked the same way and is REAL (user, 2026-11-12): a fine dot pattern on the screen inside the blur material behind the App Library folders, around the app icons.
 3. Dotted pattern in blur, missing glyphs, blank widgets, dashed outlines. Candidates: XR formats 550-555 via `CAEnableDeepFramebuffer` (section 4), RG8 plane-1 IOSurface textures, framebuffer-fetch handling (section 7).
 4. Blit encoder (self-test 12, 13).
 5. Self-test 18, 19 descriptor: add attribute 4 (point_size, float).
