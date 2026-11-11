@@ -788,6 +788,183 @@ t17(void)
 	return R_PASS;
 }
 
+/*
+ * 18/19: ONE quad with CoreAnimation's own shaders and CoreAnimation's own vertex layout
+ * (QuartzCore vertex_layout_info[0]): buffer 1, per-vertex, stride 48, Float4 position @0,
+ * Float2 texcoord @16, Float2 texcoord @24, Half4 colour @32. Vertices and UInt16 indices
+ * share one buffer, vertices bound at a non-zero offset, as MetalBufferPool does. The four
+ * vertices carry four different opaque colours; a quad whose second triangle reads its
+ * colour varying from the wrong registers splits along the diagonal.
+ *
+ * Function constants: an EMPTY MTLFunctionConstantValues is tried first; this driver's
+ * -newFunctionWithName:constantValues: returns nil (redwoodmetal.m, Metal's nil compiler),
+ * and the library takes every constant as zero either way, so the fallback is the plain
+ * -newFunctionWithName:, and the line says which one was used (fc=empty / fc=none).
+ * Fragment buffers 0-5 are bound zero-filled because the shader declares them.
+ */
+#define QC_LIB "/System/Library/Frameworks/QuartzCore.framework/default.metallib"
+
+static id<MTLFunction>
+qcFunction(id<MTLLibrary> lib, NSString *name, BOOL *viaConstants)
+{
+	NSError *e = nil;
+	MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+	id<MTLFunction> f = [lib newFunctionWithName:name constantValues:cv error:&e];
+	*viaConstants = f != nil;
+	return f ? f : [lib newFunctionWithName:name];
+}
+
+static void
+hexpx(const uint8_t *px, int x, int y, char *out, size_t n)
+{
+	const uint8_t *p = px + ((size_t)y * W + (size_t)x) * 4;
+	snprintf(out, n, "%02x%02x%02x%02x", p[2], p[1], p[0], p[3]);   /* RGBA */
+}
+
+static int
+caQuad(NSString *vsName, NSString *fsName)
+{
+	if (!g_q) {
+		return skip("no queue");
+	}
+	NSError *err = nil;
+	id<MTLLibrary> lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@QC_LIB] error:&err];
+	if (!lib) {
+		snprintf(g_why, sizeof(g_why), "newLibraryWithURL %s: %s", QC_LIB, errstr(err));
+		return R_SKIP;
+	}
+	BOOL vc = NO, fc = NO;
+	id<MTLFunction> vs = qcFunction(lib, vsName, &vc);
+	id<MTLFunction> fs = qcFunction(lib, fsName, &fc);
+	if (!vs || !fs) {
+		return fail("function nil (vs %s, fs %s)", vs ? "ok" : "nil", fs ? "ok" : "nil");
+	}
+	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+	static const MTLVertexFormat fmts[4] = { MTLVertexFormatFloat4, MTLVertexFormatFloat2,
+		MTLVertexFormatFloat2, MTLVertexFormatHalf4 };
+	static const NSUInteger offs[4] = { 0, 16, 24, 32 };
+	for (NSUInteger i = 0; i < 4; i++) {
+		vd.attributes[i].format = fmts[i];
+		vd.attributes[i].offset = offs[i];
+		vd.attributes[i].bufferIndex = 1;
+	}
+	vd.layouts[1].stride = 48;
+	vd.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+	vd.layouts[1].stepRate = 1;
+	MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+	d.vertexFunction = vs;
+	d.fragmentFunction = fs;
+	d.vertexDescriptor = vd;
+	d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:d error:&err];
+	if (!p) {
+		return fail("pipeline nil: %s", errstr(err));
+	}
+
+	/* one pool buffer: vertices at offset 96, the six indices right after them (4-aligned) */
+	enum { VOFF = 96, IOFF = VOFF + 4 * 48, POOL = 512 };
+	static const float pos[4][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } };
+	/* half 1.0 = 0x3c00: red, green, blue, white, all opaque */
+	static const uint16_t col[4][4] = { { 0x3c00, 0, 0, 0x3c00 }, { 0, 0x3c00, 0, 0x3c00 },
+		{ 0, 0, 0x3c00, 0x3c00 }, { 0x3c00, 0x3c00, 0x3c00, 0x3c00 } };
+	static const uint16_t idx[6] = { 0, 1, 2, 2, 1, 3 };
+	id<MTLBuffer> pool = [g_dev newBufferWithLength:POOL options:MTLResourceStorageModeShared];
+	static const float ident[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	id<MTLBuffer> mvp = [g_dev newBufferWithBytes:ident length:64 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> tm = [g_dev newBufferWithBytes:ident length:64 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> cm = [g_dev newBufferWithBytes:ident length:64 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> zero = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
+	if (!pool || !mvp || !tm || !cm || !zero) {
+		return fail("buffer nil");
+	}
+	uint8_t *m = [pool contents];
+	memset(m, 0, POOL);
+	memset([zero contents], 0, 256);
+	for (int v = 0; v < 4; v++) {
+		float *f = (float *)(void *)(m + VOFF + v * 48);
+		f[0] = pos[v][0];
+		f[1] = pos[v][1];
+		f[2] = 0;
+		f[3] = 1;
+		f[4] = f[6] = (pos[v][0] + 1) * 0.5f;   /* texcoords: unused by the colour, but defined */
+		f[5] = f[7] = (1 - pos[v][1]) * 0.5f;
+		memcpy(m + VOFF + v * 48 + 32, col[v], 8);
+	}
+	memcpy(m + IOFF, idx, sizeof(idx));
+
+	id<MTLTexture> t = newTarget();
+	id<MTLCommandBuffer> cb = t ? [g_q commandBuffer] : nil;
+	id<MTLRenderCommandEncoder> e = cb ? beginPass(cb, t, MTLClearColorMake(0, 0, 0, 1), nil) : nil;
+	if (!e) {
+		return fail("render encoder nil");
+	}
+	[e setRenderPipelineState:p];
+	[e setVertexBuffer:pool offset:VOFF atIndex:1];
+	[e setVertexBuffer:mvp offset:0 atIndex:2];
+	[e setVertexBuffer:tm offset:0 atIndex:3];
+	[e setVertexBuffer:cm offset:0 atIndex:4];
+	for (NSUInteger i = 0; i <= 5; i++) {
+		[e setFragmentBuffer:zero offset:0 atIndex:i];
+	}
+	[e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16
+		indexBuffer:pool indexBufferOffset:IOFF];
+	[e endEncoding];
+	if (!finish(cb, "ca quad")) {
+		return R_FAIL;
+	}
+	static uint8_t px[W * H * 4];
+	readTex(t, px, W, H);
+
+	/* NDC (-1,-1) is the bottom-left pixel: v0 (1,62) red, v1 (62,62) green, v2 (1,1) blue,
+	 * v3 (62,1) white. The diagonal joins v1 and v2, the line y == x; (32,31) is in the
+	 * triangle 2-1-3 and (31,32) in 0-1-2. RGBA expectations, tolerance 40. */
+	static const int corner[4][2] = { { 1, 62 }, { 62, 62 }, { 1, 1 }, { 62, 1 } };
+	static const uint8_t want[4][4] = { { 255, 0, 0, 255 }, { 0, 255, 0, 255 }, { 0, 0, 255, 255 },
+		{ 255, 255, 255, 255 } };
+	char c[4][12], ma[12], mb[12];
+	BOOL ok = YES;
+	for (int i = 0; i < 4; i++) {
+		const uint8_t *q = px + ((size_t)corner[i][1] * W + (size_t)corner[i][0]) * 4;
+		const uint8_t rgba[4] = { q[2], q[1], q[0], q[3] };
+		for (int k = 0; k < 4; k++) {
+			int dd = (int)rgba[k] - (int)want[i][k];
+			if (dd < -40 || dd > 40) {
+				ok = NO;
+			}
+		}
+		hexpx(px, corner[i][0], corner[i][1], c[i], sizeof(c[i]));
+	}
+	const uint8_t *a = px + ((size_t)31 * W + 32) * 4, *b = px + ((size_t)32 * W + 31) * 4;
+	for (int k = 0; k < 4; k++) {
+		int dd = (int)a[k] - (int)b[k];
+		if (dd <= -60 || dd >= 60) {
+			ok = NO;
+		}
+	}
+	hexpx(px, 32, 31, ma, sizeof(ma));
+	hexpx(px, 31, 32, mb, sizeof(mb));
+	if (!ok) {
+		return fail("fc=%s c0 %s c1 %s c2 %s c3 %s mid %s/%s", vc && fc ? "empty" : "none", c[0], c[1],
+			c[2], c[3], ma, mb);
+	}
+	note("fc=%s c0 %s c1 %s c2 %s c3 %s mid %s/%s", vc && fc ? "empty" : "none", c[0], c[1], c[2], c[3],
+		ma, mb);
+	return R_PASS;
+}
+
+static int
+t18(void)
+{
+	return caQuad(@"fixed_vert_lph_spc", @"fixed_frag_lph_cph");
+}
+
+/* QuartzCore has no fixed_frag_lpf_* (only fixed_frag_lph_cph and _cpf), so the same fragment */
+static int
+t19(void)
+{
+	return caQuad(@"fixed_vert_lpf_spc", @"fixed_frag_lph_cph");
+}
+
 typedef struct { const char *name; int (*fn)(void); unsigned timeout; } Test;
 
 int
@@ -808,6 +985,7 @@ main(int argc, char **argv)
 		{ "alpha blend", t10, 10 }, { "depth test", t11, 10 }, { "blit texture copy", t12, 10 },
 		{ "blit mipmaps+tex2buf", t13, 10 }, { "compute", t14, 10 }, { "iosurface texture", t15, 10 },
 		{ "100 passes", t16, 30 }, { "completion handler+GPU times", t17, 10 },
+		{ "CA quad lph", t18, 30 }, { "CA quad lpf", t19, 30 },
 	};
 	int counts[3] = { 0, 0, 0 };
 	int tmo_in_row = 0;

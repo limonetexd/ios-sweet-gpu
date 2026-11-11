@@ -1,0 +1,389 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -5327,18 +5327,22 @@
+  * while moving everything after it -- which is the failure that leaves no trace. The
+  * blend state took rwa_render_shape from 792 bytes to 1052 (260 bytes at offset 792,
+  * nothing above it moved) and rwa_render_info from 108 to 116 (8 bytes at offset 108).
++ * keep_16bit_varyings took rwa_render_shape from 1052 to 1056 (4 bytes at offset 1052),
++ * and varyings_mode rwa_render_info from 116 to 120 (4 bytes at offset 116).
+  */
+ static_assert(sizeof(struct rwa_color_blend) == 32 &&
+-                 sizeof(struct rwa_render_shape) == 1052 &&
++                 sizeof(struct rwa_render_shape) == 1056 &&
+                  offsetof(struct rwa_render_shape, vertex_attribute) == 48 &&
+                  offsetof(struct rwa_render_shape, vertex_layout) == 420 &&
+                  offsetof(struct rwa_render_shape, color_blend) == 792 &&
+-                 offsetof(struct rwa_render_shape, color_blend_count) == 1048,
++                 offsetof(struct rwa_render_shape, color_blend_count) == 1048 &&
++                 offsetof(struct rwa_render_shape, keep_16bit_varyings) == 1052,
+               "struct rwa_render_shape is not the shape redwoodmetal.m asserts: a field "
+               "was added in the middle, or only one of the two copies was rebuilt");
+-static_assert(sizeof(struct rwa_render_info) == 116 &&
++static_assert(sizeof(struct rwa_render_info) == 120 &&
+                  offsetof(struct rwa_render_info, vertex_argbuf_mask) == 100 &&
+-                 offsetof(struct rwa_render_info, blend_enabled_mask) == 108,
++                 offsetof(struct rwa_render_info, blend_enabled_mask) == 108 &&
++                 offsetof(struct rwa_render_info, varyings_mode) == 116,
+               "struct rwa_render_info is not the shape redwoodmetal.m asserts, and this "
+               "one the LIBRARY writes into: a driver with a shorter one is overrun");
+ 
+@@ -6017,6 +6021,11 @@
+    render->shape = *shape;
+ 
+    struct rwa_render_info out = { 0 };
++   /* the same decision make_io_var in air_to_nir.c takes, reported so the driver can
++    * say which one this process is running */
++   out.varyings_mode = shape && shape->keep_16bit_varyings ? RWA_VARYINGS_KEPT_FORCED :
++                       device->nir_options->support_16bit_alu ? RWA_VARYINGS_32BIT :
++                       RWA_VARYINGS_KEPT_NO_16BIT;
+ 
+    /* The fragment shader first. Its AIR -> NIR errors surface here, at creation, which
+     * is the half of docs/metal.md 10.18 a driver must put in the right NSError: a link
+@@ -6026,7 +6035,10 @@
+    struct air_constant_value *ffc;
+    unsigned num_ffc =
+       air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
+-   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
++   const struct air_to_nir_options fopts = {
++      .constants = ffc, .num_constants = num_ffc,
++      .keep_16bit_varyings = shape->keep_16bit_varyings != 0,
++   };
+    const char *error;
+    nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
+                                fragment_entry, &fopts, device->nir_options, &render->finfo,
+@@ -6081,7 +6093,10 @@
+       struct air_constant_value *vfc;
+       unsigned num_vfc =
+          air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
+-      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
++      const struct air_to_nir_options vopts = {
++         .constants = vfc, .num_constants = num_vfc,
++         .keep_16bit_varyings = shape->keep_16bit_varyings != 0,
++      };
+       vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
+                       device->nir_options, &render->vinfo, &error);
+       if (!vs) {
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -852,6 +852,15 @@
+ 	 */
+ 	struct rwa_color_blend color_blend[8];
+ 	unsigned color_blend_count;
++
++	/*
++	 * APPENDED, 4 bytes at the END, by the same rule as the blend state. Non-zero keeps
++	 * 16-bit vertex outputs and fragment inputs 16-bit, as the front end did before
++	 * (air_to_nir_options.keep_16bit_varyings); 0, the default and what a zeroed shape
++	 * says, makes every stage-boundary varying 32-bit. The driver sets it from the
++	 * boot-arg sweetmetal_f16vary=1.
++	 */
++	unsigned keep_16bit_varyings;
+ };
+ 
+ /*
+@@ -949,7 +958,17 @@
+ 	 */
+ 	unsigned blend_enabled_mask;
+ 	unsigned color_write_masks;
++
++	/*
++	 * APPENDED, by the same warning: what became of 16-bit stage-boundary varyings.
++	 * RWA_VARYINGS_32BIT widened them (the compiler has 16-bit ALU, and the shape did not
++	 * ask to keep them); RWA_VARYINGS_KEPT_NO_16BIT kept them because the compiler holds
++	 * everything in 32 bits anyway (softpipe); RWA_VARYINGS_KEPT_FORCED kept them because
++	 * shape.keep_16bit_varyings asked (boot-arg sweetmetal_f16vary=1).
++	 */
++	unsigned varyings_mode;
+ };
++enum { RWA_VARYINGS_32BIT = 1, RWA_VARYINGS_KEPT_NO_16BIT = 2, RWA_VARYINGS_KEPT_FORCED = 3 };
+ 
+ /*
+  * MTLDepthStencilDescriptor, which is a device object in Metal and a created state here
+--- a/tools/mesa/air/air_private.h
++++ b/tools/mesa/air/air_private.h
+@@ -250,6 +250,9 @@
+       unsigned location;      /* gl_varying_slot or gl_frag_result */
+       unsigned index;         /* dual-source index */
+       nir_variable *var;
++      /* nir_type_{float,int,uint}16 when the varying was widened to 32 bits
++       * and the stored value has to be converted up; 0 otherwise */
++      nir_alu_type narrow;
+    } *outputs;
+ 
+    unsigned scratch_size;
+--- a/tools/mesa/air/air_to_nir.c
++++ b/tools/mesa/air/air_to_nir.c
+@@ -938,15 +938,44 @@
+    return &info->resources[info->num_resources++];
+ }
+ 
++/* A stage-boundary varying -- a vertex output or a fragment input -- whose
++ * value is 16-bit is declared 32-bit (air_to_nir_options.keep_16bit_varyings
++ * says why). *narrow is set to the 16-bit type the value has inside the
++ * shader, so the store can convert up and the load can convert down; it is 0
++ * for every variable that keeps its own width, fragment outputs included.
++ * The sign of a 16-bit integer comes from air.arg_type_name, Metal's own
++ * reflection string (`ushort`, `uint16_t`), since the LLVM type has none.
++ */
+ static nir_variable *
+ make_io_var(struct air_ctx *c, nir_variable_mode mode, const struct air_type *t,
+-            unsigned location, const char *name)
++            unsigned location, const char *name, const struct air_md *node,
++            nir_alu_type *narrow)
+ {
+    const struct glsl_type *gt;
+    unsigned comps = air_nir_components(t);
+    unsigned bits = air_nir_bit_size(c, t);
+-   if (air_type_is_float(air_type_scalar(t)))
++   bool is_float = air_type_is_float(air_type_scalar(t));
++   bool varying = (mode == nir_var_shader_out && c->nir->info.stage == MESA_SHADER_VERTEX) ||
++                  (mode == nir_var_shader_in && c->nir->info.stage == MESA_SHADER_FRAGMENT);
++   /* Only for a compiler that keeps 16-bit values 16-bit (ir3 sets
++    * support_16bit_alu). One that does not -- softpipe through nir_to_tgsi --
++    * holds every value in 32 bits already, has no half registers to link
++    * wrongly, and has no f2f16 to convert back down with, so it keeps the
++    * declaration exactly as it was. */
++   bool widen = varying && bits == 16 && c->nir->options->support_16bit_alu &&
++                !(c->options && c->options->keep_16bit_varyings);
++   const char *tn = node ? md_key_str(node, "air.arg_type_name") : NULL;
++   bool is_unsigned = tn && tn[0] == 'u';
++
++   *narrow = 0;
++   if (widen) {
++      *narrow = is_float ? nir_type_float16 : is_unsigned ? nir_type_uint16 : nir_type_int16;
++      bits = 32;
++   }
++   if (is_float)
+       gt = bits == 16 ? glsl_f16vec_type(comps) : glsl_vec_type(comps);
++   else if (widen)
++      gt = glsl_vector_type(is_unsigned ? GLSL_TYPE_UINT : GLSL_TYPE_INT, comps);
+    else
+       gt = glsl_vector_type(bits == 16 ? GLSL_TYPE_INT16 : GLSL_TYPE_INT, comps);
+ 
+@@ -955,6 +984,27 @@
+    return var;
+ }
+ 
++/* the value a widened vertex output stores: the 16-bit def made 32-bit */
++static nir_def *
++widen_varying(struct air_ctx *c, nir_def *d, nir_alu_type narrow)
++{
++   if (!narrow || d->bit_size != 16)
++      return d;
++   return narrow == nir_type_float16 ? nir_f2f32(&c->b, d) :
++          narrow == nir_type_uint16 ? nir_u2u32(&c->b, d) : nir_i2i32(&c->b, d);
++}
++
++/* the value a widened fragment input gives the shader: the 32-bit load made
++ * 16-bit again, so everything after the load sees the type it always saw */
++static nir_def *
++narrow_varying(struct air_ctx *c, nir_def *d, nir_alu_type narrow)
++{
++   if (!narrow)
++      return d;
++   return narrow == nir_type_float16 ? nir_f2f16(&c->b, d) :
++          narrow == nir_type_uint16 ? nir_u2u16(&c->b, d) : nir_i2i16(&c->b, d);
++}
++
+ /* fragment inputs and vertex outputs take the slots in the order they appear;
+  * the runtime links the two sides by name (docs/air.md section 7.5)
+  */
+@@ -1916,7 +1966,8 @@
+          return translate_vertex_attribute(c, node, param, t);
+       unsigned slot = VARYING_SLOT_VAR0 + (*next_varying)++;
+       const char *name = md_key_str(node, "air.arg_name");
+-      nir_variable *var = make_io_var(c, nir_var_shader_in, t, slot, name);
++      nir_alu_type narrow;
++      nir_variable *var = make_io_var(c, nir_var_shader_in, t, slot, name, node, &narrow);
+       var->data.driver_location = c->nir->num_inputs++;
+       if (md_key(node, "air.flat") >= 0)
+          var->data.interpolation = INTERP_MODE_FLAT;
+@@ -1928,7 +1979,7 @@
+       var->data.sample = md_key(node, "air.sample") >= 0;
+       if (c->nir->info.stage == MESA_SHADER_FRAGMENT)
+          add_varying(c, name, slot, air_nir_components(t), node);
+-      c->params[param] = air_val_ssa(c, nir_load_var(&c->b, var));
++      c->params[param] = air_val_ssa(c, narrow_varying(c, nir_load_var(&c->b, var), narrow));
+       return true;
+    }
+ 
+@@ -2033,12 +2084,14 @@
+                        name ? name : "unnamed", tn ? tn : "an aggregate", t->num_members);
+    }
+ 
+-   nir_variable *var = make_io_var(c, nir_var_shader_out, t, location, name);
++   nir_alu_type narrow;
++   nir_variable *var = make_io_var(c, nir_var_shader_out, t, location, name, node, &narrow);
+    var->data.index = index;
+    var->data.driver_location = c->nir->num_outputs++;
+    c->outputs[field].location = location;
+    c->outputs[field].index = index;
+    c->outputs[field].var = var;
++   c->outputs[field].narrow = narrow;
+    return true;
+ }
+ 
+@@ -3184,8 +3237,8 @@
+             return air_error(c, "interface: field %u of the result has no output", i);
+          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
+             continue; /* a field left undef is a target nothing writes */
+-         nir_store_var(&c->b, c->outputs[i].var, v->elems[i]->def,
+-                       BITFIELD_MASK(v->elems[i]->def->num_components));
++         nir_def *d = widen_varying(c, v->elems[i]->def, c->outputs[i].narrow);
++         nir_store_var(&c->b, c->outputs[i].var, d, BITFIELD_MASK(d->num_components));
+       }
+       return true;
+    }
+@@ -3193,7 +3246,8 @@
+       return air_error(c, "instruction: a returned value that is not a number");
+    if (!c->num_outputs || !c->outputs[0].var)
+       return air_error(c, "interface: a returned value with no output");
+-   nir_store_var(&c->b, c->outputs[0].var, v->def, BITFIELD_MASK(v->def->num_components));
++   nir_def *d = widen_varying(c, v->def, c->outputs[0].narrow);
++   nir_store_var(&c->b, c->outputs[0].var, d, BITFIELD_MASK(d->num_components));
+    return true;
+ }
+ 
+--- a/tools/mesa/air/nir_air.h
++++ b/tools/mesa/air/nir_air.h
+@@ -346,6 +346,17 @@
+     * entry point of the corpus and is counted separately.
+     */
+    bool library_wrapper;
++
++   /* Keep 16-bit stage-boundary varyings 16-bit, as this frontend did before.
++    * Off (the default), every 16-bit vertex output is converted to 32 bits
++    * before its store and every 16-bit fragment input is loaded as 32 bits and
++    * converted back down, so the varying itself is always 32-bit -- on a
++    * compiler with support_16bit_alu only; without it nothing changes. ir3 lowers
++    * mediump only for fragment outputs, and its VS->FS linkage takes an
++    * output's regid without the half flag, so a half vertex output can be read
++    * as full registers. Fragment outputs are not varyings and are untouched.
++    */
++   bool keep_16bit_varyings;
+ };
+ 
+ /* Translates one AIR module (one function of a .metallib). entry_point may
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -221,6 +221,9 @@
+ 	 * writeMask is All. */
+ 	struct rwa_color_blend color_blend[8];
+ 	unsigned color_blend_count;
++	/* APPENDED, 4 bytes at the END: non-zero keeps 16-bit varyings 16-bit
++	 * (boot-arg sweetmetal_f16vary=1); 0 makes every varying 32-bit */
++	unsigned keep_16bit_varyings;
+ };
+ struct rwa_render_info {
+ 	unsigned vertex_buffers, fragment_buffers, fragment_textures, fragment_samplers;
+@@ -248,7 +251,10 @@
+ 	 * shorter than the library's. */
+ 	unsigned blend_enabled_mask;
+ 	unsigned color_write_masks;
++	/* APPENDED: what became of 16-bit varyings, RWA_VARYINGS_* below */
++	unsigned varyings_mode;
+ };
++enum { RWA_VARYINGS_32BIT = 1, RWA_VARYINGS_KEPT_NO_16BIT = 2, RWA_VARYINGS_KEPT_FORCED = 3 };
+ struct rwa_vertex_stream {
+ 	struct rwa_buffer *buffer;
+ 	size_t offset;
+@@ -416,16 +422,18 @@
+  * the failure that is invisible.
+  */
+ _Static_assert(sizeof(struct rwa_color_blend) == 32 &&
+-		   sizeof(struct rwa_render_shape) == 1052 &&
++		   sizeof(struct rwa_render_shape) == 1056 &&
+ 		   offsetof(struct rwa_render_shape, vertex_attribute) == 48 &&
+ 		   offsetof(struct rwa_render_shape, vertex_layout) == 420 &&
+ 		   offsetof(struct rwa_render_shape, color_blend) == 792 &&
+-		   offsetof(struct rwa_render_shape, color_blend_count) == 1048,
++		   offsetof(struct rwa_render_shape, color_blend_count) == 1048 &&
++		   offsetof(struct rwa_render_shape, keep_16bit_varyings) == 1052,
+ 	       "struct rwa_render_shape here is not the shape air_metal.c asserts: a field "
+ 	       "was added in the middle, or only one of the two copies was rebuilt");
+-_Static_assert(sizeof(struct rwa_render_info) == 116 &&
++_Static_assert(sizeof(struct rwa_render_info) == 120 &&
+ 		   offsetof(struct rwa_render_info, vertex_argbuf_mask) == 100 &&
+-		   offsetof(struct rwa_render_info, blend_enabled_mask) == 108,
++		   offsetof(struct rwa_render_info, blend_enabled_mask) == 108 &&
++		   offsetof(struct rwa_render_info, varyings_mode) == 116,
+ 	       "struct rwa_render_info here is not the shape air_metal.c asserts, and this "
+ 	       "one the LIBRARY writes into: too short is a buffer overrun");
+ 
+@@ -1218,6 +1226,60 @@
+ 	return allowed;
+ }
+ 
++/*
++ * Whether 16-bit varyings stay 16-bit: boot-arg sweetmetal_f16vary=1 keeps the front end's
++ * old behaviour, anything else (absent included) makes every vertex output and fragment
++ * input 32-bit, converted at the store and after the load. ir3 lowers mediump only for
++ * fragment outputs and links a half vertex output by its regid without the half flag, which
++ * is how one triangle of a CoreAnimation quad drew a saturated colour. Decided once per
++ * process and said once.
++ */
++#define RW_F16VARY_KEY "sweetmetal_f16vary="
++
++static bool
++rw_keep_16bit_varyings(void)
++{
++	static dispatch_once_t once;
++	static bool keep;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_F16VARY_KEY)) != NULL;
++			     at += strlen(RW_F16VARY_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		keep = at != NULL && at[strlen(RW_F16VARY_KEY)] == '1';
++	});
++	return keep;
++}
++
++/* The one line per process: what the library actually did, from the first pipeline it
++ * made, since only the library knows whether its compiler has 16-bit ALU. */
++static void
++rw_varyings_said(unsigned mode)
++{
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		rw_print("varyings: %s\n",
++			 mode == RWA_VARYINGS_32BIT ?
++				 "16-bit widened to 32-bit (compiler has 16-bit ALU; "
++				 "sweetmetal_f16vary=1 keeps them)" :
++			 mode == RWA_VARYINGS_KEPT_FORCED ?
++				 "16-bit kept as declared (forced by boot-arg sweetmetal_f16vary=1)" :
++			 mode == RWA_VARYINGS_KEPT_NO_16BIT ?
++				 "16-bit kept as declared (compiler has no 16-bit ALU)" :
++				 "mode not reported by the library");
++	});
++}
++
+ @implementation RedwoodMetalDevice
+ 
+ + (void)load
+@@ -1482,6 +1544,7 @@
+ 		shape.color_blend[i].write_mask = (unsigned)[attachment writeMask];
+ 	}
+ 	shape.color_blend_count = 8;
++	shape.keep_16bit_varyings = rw_keep_16bit_varyings() ? 1 : 0;
+ 	/*
+ 	 * And the measurement this was built to make: what the window server actually asks
+ 	 * for, one line per attachment it has, printed BEFORE the library can refuse any of
+@@ -1608,6 +1671,7 @@
+ 	if (shape.color_count > 0) {
+ 		rw_blend_result(info.blend_enabled_mask, info.color_write_masks);
+ 	}
++	rw_varyings_said(info.varyings_mode);
+ 	return [[RedwoodMetalRenderPipeline alloc] initWithRedwoodDevice:self
+ 								 render:render
+ 								   info:&info

@@ -125,3 +125,16 @@ Status: Metal `experimental` on device; no picture yet. Open: pixel formats 550 
 Phone root from 2026-11-11 on: `work1.raw` = seeded root (copied back from the phone as `seeded1.raw`, LaunchServices database included) + new plug-in with allow-list + `/redwood/bin/metaltest` + launchd job `org.ios-sweet.metaltest`.
 
 NOTES.md:661, :983, :1142-1144 (upstream): first-boot migration takes 15-60 min on this port; after it, upstream saw SpringBoard and backboardd stay up with nothing new drawn. Label for the GL logo/progress screen: partially-working (real device, three runs, one root).
+
+## Metal fixes on device, 2026-11-11 (real device, RAM boot, one boot per run; patches in `userland/metal/`)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-11 | 0160c1 (patch 0003: load actions once per pass; clear-only passes clear) | `sweetmetal=1 metal_profile=1 sweetmetal_procs=*` | not recorded | Self-test 7 -> 11 of 17. Wallpaper visible. backboardd did not crash in this run | `logs/xnu-0160c1.txt` |
+| 2026-11-11 | 0160f2c (patch 0004: `flatshade_first=1`) | Same boot-args plus `flatshade_first=1` | not recorded | No visible change. Kept as correct for Metal's provoking-vertex rule | `logs/xnu-0160f2c.txt` |
+| 2026-11-11 | 0160vA (patches 0003-0007; 0006 widens 16-bit stage-boundary varyings to 32-bit) | Same boot-args, default varyings | not recorded | Diagonal half-rectangle garbage and saturated magenta/yellow/blue blocks gone (user photos). Settings, home screen with labels, App Library, Control Centre render recognisably. Self-test 15 passed, 4 failed of 19. Draws 08-11 no longer SIGSEGV (0005, 0007). Test 16: 100 passes in 18 ms. Faults: low frame rate; respring on app exit (backboardd sig 11 once, sig 6 once, exec'd 6 times; SpringBoard exec'd 3 times); light-blue tint on whites (Settings background, widgets); fine dotted/checker pattern in blurred materials; Control Centre button glyphs mostly missing; thin dashed outlines on some rounded rectangles; some widgets blank. assetsd aborts 7 times; com.apple.MapKit sig 11 twice | `logs/xnu-0160vA.txt` |
+| 2026-11-11 | 0160vB (same root, `sweetmetal_f16vary=1`: old 16-bit varyings) | A/B against 0160vA | diagonal garbage absent if widening is the cause | Same diagonal garbage as before (user stopped early). Self-test 15 passed, 4 failed of 19. Cause confirmed by A/B: ir3 mishandles half-precision vertex outputs in VS->FS linkage for CoreAnimation's lph shaders | `logs/xnu-0160vB.txt` |
+
+Self-test failures in vA and vB: 12 and 13 (`blitCommandEncoder` returns nil); 18 and 19 (new CoreAnimation-quad tests: pipeline nil, `fixed_vert_lph_spc` reads vertex attribute 4 (point_size, float) and the test's vertex descriptor configures no format there). The test is at fault for 18 and 19, not the driver.
+
+Status: Metal UI `partially-working` (real device, one boot, 0160vA). Self-test 15 of 19 (0160vA, 0160vB). Not a frame-rate result: no per-frame data and no sustained run.

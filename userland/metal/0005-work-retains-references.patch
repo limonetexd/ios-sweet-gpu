@@ -1,0 +1,82 @@
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -1070,7 +1070,10 @@
+ 	id samplers[RW_MAX_BUFFERS];
+ 	unsigned count, textureCount, samplerCount;
+ 	unsigned groups[3], size[3];
++	/* set by -retainReferences: everything above that is an object is then owned */
++	BOOL retained;
+ }
++- (void)retainReferences;
+ @end
+ 
+ @interface RedwoodMetalTexture : _MTLResource {
+@@ -3356,7 +3359,60 @@
+ 
+ @end
+ 
++/*
++ * A recorded command OWNS what it names, from -recordWork: until it is gone, which is
++ * Metal's retainedReferences (this driver's command buffers answer YES): the encoder's
++ * tables hold plain pointers, and this plug-in is not ARC, so nothing else keeps an
++ * application's buffer alive between the draw that names it and the -commit that reads
++ * it. metaltest's draw() holds its vertex buffers in locals under ARC, so they were
++ * freed when draw() returned and -commit sent -mesaBuffer to a dead object: tests 08-11
++ * died of SIGSEGV inside the draw while compute (whose buffer outlives -commit) passed.
++ */
+ @implementation RedwoodMetalWork
++
++- (void)retainReferences
++{
++	if (retained) {
++		return;
++	}
++	retained = YES;
++	[pipeline retain];
++	[render retain];
++	[depth retain];
++	[depthStencilState retain];
++	[indexBuffer retain];
++	for (unsigned i = 0; i < 8; i++) {
++		[color[i] retain];
++	}
++	for (unsigned i = 0; i < RW_MAX_BUFFERS; i++) {
++		[vertexBuffers[i] retain];
++		[buffers[i] retain];
++		[textures[i] retain];
++		[samplers[i] retain];
++	}
++}
++
++- (void)dealloc
++{
++	if (retained) {
++		[pipeline release];
++		[render release];
++		[depth release];
++		[depthStencilState release];
++		[indexBuffer release];
++		for (unsigned i = 0; i < 8; i++) {
++			[color[i] release];
++		}
++		for (unsigned i = 0; i < RW_MAX_BUFFERS; i++) {
++			[vertexBuffers[i] release];
++			[buffers[i] release];
++			[textures[i] release];
++			[samplers[i] release];
++		}
++	}
++	[super dealloc];
++}
++
+ @end
+ 
+ /*
+@@ -3858,6 +3914,7 @@
+ 
+ - (void)recordWork:(RedwoodMetalWork *)work
+ {
++	[work retainReferences];   /* Metal's retainedReferences: see RedwoodMetalWork */
+ 	[_work addObject:work];
+ }
+ 

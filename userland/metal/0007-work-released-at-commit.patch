@@ -1,0 +1,16 @@
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -4055,6 +4055,13 @@
+ 	}
+ 	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
+ done:
++	/* What the work named is let go here, on the thread that committed: every item has
++	 * run and been waited for (or was abandoned by a failure), so nothing below needs
++	 * it. Left to -dealloc, the last release could come from the completion queue's
++	 * thread and destroy a buffer or texture while this thread is inside a draw -- the
++	 * library has no lock -- and a command buffer somebody keeps would pin a whole
++	 * frame's attachments. */
++	[_work removeAllObjects];
+ 	/* The queue's slot goes back here and on every way out of this method, a failed draw
+ 	 * included: a buffer that errored is as finished as one that drew, and a slot kept
+ 	 * because of an error would turn one bad draw into a queue that blocks for ever. */

@@ -1,0 +1,14 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -6250,6 +6250,11 @@
+     */
+    render->rast = device->pipe->create_rasterizer_state(device->pipe,
+       &(struct pipe_rasterizer_state){
++         /* Metal's provoking vertex is the first one of a primitive; Gallium's default
++          * is the last. A [[flat]] value differs per vertex in CoreAnimation's quads, so
++          * with the last vertex each of a quad's two triangles took a different value
++          * and every rectangle came out split along its diagonal in two colours. */
++         .flatshade_first = 1,
+          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+          .multisample = samples > 1 });

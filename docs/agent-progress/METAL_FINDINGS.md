@@ -126,6 +126,8 @@ Frames show: lock screen wallpaper right, but clock, date and flashlight button 
 (one icon, then the dock, then rows); App Library shows all icons at once; rainbow blocks behind
 dock, folders and App Library tiles.
 
+Superseded by section 10: the real cause was the per-draw clear (patch 0003).
+
 Hypothesis: CoreAnimation redraws only dirty regions and expects the previous frame's contents to
 be kept (load action Load on the drawable / preserved render targets); the driver hands back empty
 contents. Self-test 05, 15, 16 (wrong pixels on readback of kept content) point the same way.
@@ -134,3 +136,24 @@ Check without code: set `CA_DISABLE_DIRTY_REGIONS=1` in backboardd's environment
 EnvironmentVariables; root change, needs a flash). If the home screen fills in, the hypothesis
 holds. Fix: honour kept contents for render targets in the driver. Do this before work-list item 3.
 The rainbow blocks are a separate fault (blur scratch surfaces, XR formats).
+
+## 10. Fixes on 2026-11-11 and what remains
+
+Patches in `userland/metal/`; device, one boot per run; logs in `logs/`.
+- 0003 load actions once per pass; clear-only passes clear. 0160c1: self-test 7 -> 11 of 17; wallpaper visible; no backboardd crash in that run. The real cause of section 9's symptoms was the per-draw clear.
+- 0004 `flatshade_first=1`, correct for Metal's provoking-vertex rule. 0160f2c: no visible change.
+- 0005 recorded work retains the objects it names; 0007 work released at end of commit, on the committing thread (from review). Self-test draws 08-11 no longer SIGSEGV.
+- 0006 16-bit stage-boundary varyings widened to 32-bit when the compiler has 16-bit ALU; `sweetmetal_f16vary=1` restores the old behaviour. A/B on one root: 0160vA (widened) removes the diagonal garbage and saturated blocks; 0160vB (old) shows them again. Cause: ir3 mishandles half-precision vertex outputs in VS->FS linkage for CoreAnimation's lph shaders.
+
+Self-test 15 of 19 in both vA and vB. Failing: 12, 13 (blit encoder nil); 18, 19 (test's vertex descriptor lacks attribute 4, point_size float, that `fixed_vert_lph_spc` reads; fix the test, not the driver).
+
+Remaining in 0160vA (user report, photos, log): respring on app exit; light-blue tint on whites; dotted pattern in blur; missing Control Centre glyphs; blank widgets; dashed outlines; low frame rate.
+
+Work list, in order:
+1. Respring on app exit: get the backboardd backtraces (sig 11 once, sig 6 once) from `logs/xnu-0160vA.txt` and symbolize. Then the other crashes (assetsd x7, MapKit sig 11 x2).
+2. Blue tint of whites (Settings background, widgets).
+3. Dotted pattern in blur, missing glyphs, blank widgets, dashed outlines. Candidates: XR formats 550-555 via `CAEnableDeepFramebuffer` (section 4), RG8 plane-1 IOSurface textures, framebuffer-fetch handling (section 7).
+4. Blit encoder (self-test 12, 13).
+5. Self-test 18, 19 descriptor: add attribute 4 (point_size, float).
+6. Frame rate: each draw waits for the GPU (finish per draw). Measure first, then batch.
+7. Open review items: encoder tables do not yet retain objects between set and draw; no runtime size/version handshake between RedwoodMetal and libredwoodair (build and flash together); the 0006 widened path has no host render test (softpipe lacks 16-bit ALU).
