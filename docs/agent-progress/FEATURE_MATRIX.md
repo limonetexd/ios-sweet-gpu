@@ -30,9 +30,10 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | 60 fps sustained, frame-paced | not-working | Best no-idle run 36.0 swaps/s (0143r, 539 VA errors); swipe runs are bursts, so their 23–34 swaps/s is not a frame-rate limit. No per-frame data. `TEST_LOG.md` Phase 1b | 0143–0159 |
 | 120 Hz mode | not-working | `sweetfb_rate=120` no better than 60 (25.4 vs 26.4), NOTES:371 | 0122 |
 | Metal | not-tested | No device run here. Host only: donor driver cross-builds, 135/141 QuartzCore shaders compile for A618. `TEST_LOG.md` | not in tree |
+| Metal: SpringBoard with Metal device | not-working | TEST_LOG 0160mh1: aborts, MPSDevice refused | this commit |
 | Automated image correctness (`sweetshot`) | not-working | PNGs mostly black, ring truncates blobs, NOTES:204 | 0143 |
 | Visual correctness of UI | partially-working | user's eyes only: "looks good" NOTES:207, "still lags/glitches" NOTES:448. No reference image | 0143 |
-| GL home screen (SpringBoard, lock screen, Control Centre, Settings, touch) | partially-working | TEST_LOG 0160s2, real device, one boot, laggy (no second with 45+ presents) | this commit |
+| GL home screen (SpringBoard, lock screen, Control Centre, Settings, touch) | partially-working | TEST_LOG 0160s2 and 0160w1, real device, two boots, laggy | this commit |
 | Blur-dismiss stability (App Library / Control Center) | not-working | intermittent freeze NOTES:535,802; roadmap B11 still TODO | 0101–0108 |
 | Long soak | not-tested | roadmap B12 TODO; longest run recorded 420–632 s | n/a |
 | Wallpaper / PosterBoard | not-working | NOTES:111-113,997; 0157 AMFI fix and gpu3 root not yet observed to fix it | 0159 |
