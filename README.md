@@ -27,7 +27,7 @@ This is a fork of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-swe
 ### Known faults (not fixed yet)
 
 - Leaving an app causes a respring (the compositor crashes).
-- Whites have a light-blue tint; a fine dot pattern shows inside blur; some glyphs and widgets are blank.
+- A fine dot pattern shows inside blur; some glyphs and widgets are blank.
 - **Slow.** The driver still waits for the GPU after every single draw. No frame-rate claim is made.
 - No blit encoder yet (self-test 12, 13).
 - No Wi-Fi, audio, camera, cellular or sensors (as upstream).

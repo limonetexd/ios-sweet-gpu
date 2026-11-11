@@ -31,7 +31,7 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | 120 Hz mode | not-working | `sweetfb_rate=120` no better than 60 (25.4 vs 26.4), NOTES:371 | 0122 |
 | Metal | partially-working | See the Metal rows below. Host: donor driver cross-builds, 135/141 QuartzCore shaders compile for A618 | this commit |
 | Metal: SpringBoard with Metal device, profile 0 | not-working | TEST_LOG 0160mh1: aborts, MPSDevice refused. Fixed by profile 1 | this commit |
-| Metal UI (compositor + SpringBoard on Metal, profile 1) | partially-working | TEST_LOG 0160vA, real device, one boot: UI renders recognisably; respring on app exit, blue tint, blur pattern, low frame rate | this commit |
+| Metal UI (compositor + SpringBoard on Metal, profile 1) | partially-working | TEST_LOG 0160vA, real device, one boot: UI renders recognisably; respring on app exit, blur pattern, low frame rate | this commit |
 | Metal self-test | 15 of 19 pass (0160vA) | TEST_LOG 0160vA and 0160vB, real device, one boot each; 12, 13, 18, 19 fail (18, 19 are test-side) | this commit |
 | Metal per-process allow-list | experimental | works for refusal; backboardd crashes when refused (0160t1) | this commit |
 | Automated image correctness (`sweetshot`) | not-working | PNGs mostly black, ring truncates blobs, NOTES:204 | 0143 |

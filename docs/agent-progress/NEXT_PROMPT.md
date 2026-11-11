@@ -1,5 +1,5 @@
 > State 2026-11-11 (device unless noted):
-> - Metal UI renders recognisably with patches 0001-0007 (0160vA, one boot); faults remain: respring on app exit, blue tint, blur pattern, low frame rate.
+> - Metal UI renders recognisably with patches 0001-0007 (0160vA, one boot); faults remain: respring on app exit, blur pattern, low frame rate.
 > - Root on the phone is `work1` with that driver; do not reflash without need.
 > - Boot args: `sweetmetal=1 metal_profile=1 sweetmetal_procs=* sweetnull=backboardd,SpringBoard,metaltest`.
 > - Self-test (`userland/metaltest`) passes 15 of 19 (0160vA).

@@ -10,7 +10,7 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 
 - `partially-working` (real device, `NOTES.md` only): boot to SpringBoard, UFS/HFSX root, CPU-copy display, touch, CoreAnimation on the A618 via Mesa GL, 512 MiB GPU VA.
 - `partially-working` (real device, two boots, `TEST_LOG` 0160s2, 0160w1): GL home screen (SpringBoard, lock screen, Control Centre, Settings, touch; laggy); second boot about 2 min.
-- `partially-working` (real device, one boot, 0160vA): Metal UI renders recognisably (Settings, home, App Library, Control Centre). Faults: respring on app exit, light-blue tint on whites, blur dotted pattern, missing glyphs, low frame rate. Self-test 15 of 19 (0160vA).
+- `partially-working` (real device, one boot, 0160vA): Metal UI renders recognisably (Settings, home, App Library, Control Centre). Faults: respring on app exit, blur dotted pattern, missing glyphs, low frame rate. Self-test 15 of 19 (0160vA).
 - `experimental`: Wi-Fi (rungs 1–2 passed; rung 3 result unrecorded), battery.
 - `not-working`: sustained 60 fps (best no-idle run 36 swaps/s; swipe runs are bursts with no per-frame data), 120 Hz, automated screenshots, blur-dismiss stability.
 - Host: `check-patch.py` 144/144; `validate-repo.py` fails on known numbering.
@@ -26,7 +26,7 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 Re-planned 2026-11-11 (full list: `METAL_FINDINGS.md` section 10; routing: `SUBAGENTS.md`).
 
 1. Fix the respring on app exit: symbolize the backboardd backtraces in `logs/xnu-0160vA.txt`.
-2. Blue tint of whites (Settings background, widgets).
+2. (withdrawn) Blue tint of whites: camera artefact, not on the screen (user, 2026-11-11).
 3. Dotted blur pattern, missing Control Centre glyphs, blank widgets (XR formats, RG8 plane-1, framebuffer fetch).
 
 Video (decoder, YUV compositing) needs its own audit and is `not-tested`.

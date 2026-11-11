@@ -147,11 +147,11 @@ Patches in `userland/metal/`; device, one boot per run; logs in `logs/`.
 
 Self-test 15 of 19 in both vA and vB. Failing: 12, 13 (blit encoder nil); 18, 19 (test's vertex descriptor lacks attribute 4, point_size float, that `fixed_vert_lph_spc` reads; fix the test, not the driver).
 
-Remaining in 0160vA (user report, photos, log): respring on app exit; light-blue tint on whites; dotted pattern in blur; missing Control Centre glyphs; blank widgets; dashed outlines; low frame rate.
+Remaining in 0160vA (user report, photos, log): respring on app exit; dotted pattern in blur; missing Control Centre glyphs; blank widgets; dashed outlines; low frame rate.
 
 Work list, in order:
 1. Respring on app exit: get the backboardd backtraces (sig 11 once, sig 6 once) from `logs/xnu-0160vA.txt` and symbolize. Then the other crashes (assetsd x7, MapKit sig 11 x2).
-2. Blue tint of whites (Settings background, widgets).
+2. (withdrawn) Blue tint of whites: the user confirmed in person that white is white; the tint was the camera. Lesson: colour judgements from photos need the user's eyes; the dot pattern in blur may also be partly camera moire and needs the same check.
 3. Dotted pattern in blur, missing glyphs, blank widgets, dashed outlines. Candidates: XR formats 550-555 via `CAEnableDeepFramebuffer` (section 4), RG8 plane-1 IOSurface textures, framebuffer-fetch handling (section 7).
 4. Blit encoder (self-test 12, 13).
 5. Self-test 18, 19 descriptor: add attribute 4 (point_size, float).
