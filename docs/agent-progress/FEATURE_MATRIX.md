@@ -32,6 +32,7 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | Metal | not-tested | No device run here. Host only: donor driver cross-builds, 135/141 QuartzCore shaders compile for A618. `TEST_LOG.md` | not in tree |
 | Automated image correctness (`sweetshot`) | not-working | PNGs mostly black, ring truncates blobs, NOTES:204 | 0143 |
 | Visual correctness of UI | partially-working | user's eyes only: "looks good" NOTES:207, "still lags/glitches" NOTES:448. No reference image | 0143 |
+| GL home screen (SpringBoard, lock screen, Control Centre, Settings, touch) | partially-working | TEST_LOG 0160s2, real device, one boot, laggy (no second with 45+ presents) | this commit |
 | Blur-dismiss stability (App Library / Control Center) | not-working | intermittent freeze NOTES:535,802; roadmap B11 still TODO | 0101–0108 |
 | Long soak | not-tested | roadmap B12 TODO; longest run recorded 420–632 s | n/a |
 | Wallpaper / PosterBoard | not-working | NOTES:111-113,997; 0157 AMFI fix and gpu3 root not yet observed to fix it | 0159 |

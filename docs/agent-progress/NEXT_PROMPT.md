@@ -1,4 +1,4 @@
-> **State 2026-11-10, read this first.** The black screen was a half-built root (sweet-root-fixes.py never applied). With the fixes, GL draws the Apple logo and migration progress bar at a steady rate; migration did not finish in 30 min; a 75 min run (0160f4) is in progress. Metal work is paused until the GL home screen is reached (Stage A).
+> **State 2026-11-11: GL home screen reached on the phone (0160s2). Root = gpu3 + sweet-root-fixes default steps minus the migrate sentinel. First boot after a flash needs about 18-30 min of black screen while lsd seeds the LaunchServices database; do not reflash or reboot early. The migrate sentinel must stay absent (migration never reports done and repeats every boot). Next: confirm a quick second boot (0160w1), then Stage B: Metal in app processes on this same root.**
 
 # Phase Stage A: known-good GL baseline
 

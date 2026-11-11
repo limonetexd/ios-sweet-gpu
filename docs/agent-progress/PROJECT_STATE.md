@@ -9,6 +9,7 @@
 Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 
 - `partially-working` (real device, `NOTES.md` only): boot to SpringBoard, UFS/HFSX root, CPU-copy display, touch, CoreAnimation on the A618 via Mesa GL, 512 MiB GPU VA.
+- `partially-working` (real device, one boot, `TEST_LOG` 0160s2): GL home screen (SpringBoard, lock screen, Control Centre, Settings, touch; laggy).
 - `experimental`: Wi-Fi (rungs 1–2 passed; rung 3 result unrecorded), battery.
 - `not-working`: sustained 60 fps (best no-idle run 36 swaps/s; swipe runs are bursts with no per-frame data), 120 Hz, Metal (absent here), wallpaper, automated screenshots, blur-dismiss stability.
 - Host: `check-patch.py` 144/144; `validate-repo.py` fails on known numbering.
@@ -23,7 +24,7 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 
 Re-planned 2026-11-10 (staging: `DECISIONS.md`; routing: `SUBAGENTS.md`).
 
-1. Stage A baseline: let first-boot data migration finish (0160f4, 75 min), then find what keeps the home screen from drawing; consider stopping the lskdd / fairplayd.H2 / bluetoothd restart loops.
+1. Stage A reached once (0160s2). Confirm warm boot, then measure GL frame pacing on the home screen as the baseline Metal must match.
 2. Loop tooling: delta flash (write only changed blocks); kernel-log picture metric (present count and non-black pixel count).
 3. Static REA survey: Metal selectors, formats and features that QuartzCore and WebKit require, against what `RedwoodMetalDevice` implements; host-compiler coverage of the shipped shaders.
 
