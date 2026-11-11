@@ -1,5 +1,57 @@
-# ios-sweet
-## This is a fork with the objective of making the GPU work. Everything or 99% of the updates are vibe coded (AI generated) with Claude Opus 5.5
+# ios-sweet-gpu: iOS 16 on a Redmi Note 10 Pro, with an AI-written Metal GPU driver
+
+**Apple's Metal graphics API running on a Qualcomm Adreno 618.** Real iOS 16.7.16, real SpringBoard, on a Xiaomi phone, drawn by the phone's GPU through an open-source Metal driver.
+
+> **Who wrote this.** The work in this fork was not written by a human. It was written by AI models: **DeepSeek**, **Big Pickle**, and **Claude** (Haiku, Sonnet, Opus and Fable). The repository owner gave the direction, ran every boot on the real phone, filmed the screen and said what looked wrong. The models planned, wrote, reviewed and debugged the code. This is an experiment in how far that can go, kept honest: see "What is proven" below.
+
+This is a fork of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (MIT), which booted iOS 16 to the home screen with **CPU-only drawing**. This fork adds the GPU.
+
+## What this fork adds
+
+| Area | State (2026-11-11, real device) |
+| --- | --- |
+| **Metal UI** | Lock screen, home screen, App Library, Control Centre and Settings are composited by CoreAnimation **through Metal on the Adreno 618**. Partially working: see known faults |
+| **Metal driver** | `RedwoodMetal` plug-in (subclass of Apple's private `_MTLDevice`) + AIR shader front end → NIR → Mesa freedreno/ir3. Built on the Mac from pinned sources by `tools/metal-build.sh`; our changes are the patches in `userland/metal/` |
+| **Driver self-test** | `userland/metaltest`: a headless program on the phone that draws offscreen, reads pixels back and logs PASS/FAIL per feature. **15 of 19 pass** |
+| **OpenGL ES path** | The earlier GL compositor path still boots to the home screen and is the baseline |
+| **Tooling** | One-command flash + RAM-boot + log pull that always returns the phone to fastboot (`tools/metal-flash-test.sh`, `tools/sweet-boot-test.sh`) |
+
+### Bugs found and fixed on the way (each proved on the phone)
+
+- **Black screen for days was not a hang.** After a flash, `lsd` rebuilds the LaunchServices database for ~18 minutes. Every earlier test rebooted too soon.
+- **SpringBoard crash loop under Metal.** MetalPerformanceShaders only accepts devices that claim GPU family Apple2 or newer. Found by static analysis of MPSCore; fixed with one boot-arg (`metal_profile=1`).
+- **Home screen mostly black, icons popping in one by one.** The driver re-ran the render-pass clear before *every draw*, wiping the pass. Fix: `0003-pass-load-actions.patch`.
+- **Every rectangle split along its diagonal in magenta/yellow/blue.** CoreAnimation passes colours between shader stages as 16-bit floats; the ir3 linkage read them wrong. Fix: `0006-varyings-32bit.patch`, confirmed by an A/B boot with the fix on and off.
+- **Draws crashing with SIGSEGV.** The driver did not keep buffers alive until the GPU had used them. Fix: `0005`, `0007`.
+
+### Known faults (not fixed yet)
+
+- Leaving an app causes a respring (the compositor crashes).
+- Whites have a light-blue tint; a fine dot pattern shows inside blur; some glyphs and widgets are blank.
+- **Slow.** The driver still waits for the GPU after every single draw. No frame-rate claim is made.
+- No blit encoder yet (self-test 12, 13).
+- No Wi-Fi, audio, camera, cellular or sensors (as upstream).
+
+### What is proven, and what is not
+
+Nothing here is called "working" from a single boot or a screenshot. Every result is labelled with its fidelity (host, or real device) and recorded with the exact build and log in [`docs/agent-progress/TEST_LOG.md`](docs/agent-progress/TEST_LOG.md). The Metal UI is **partially working on one real phone, over a handful of boots**. The findings, including the static analysis of Metal, MetalPerformanceShaders and QuartzCore that guided the fixes, are in [`docs/agent-progress/METAL_FINDINGS.md`](docs/agent-progress/METAL_FINDINGS.md).
+
+### How the AI work is organised
+
+A lead model plans and reviews; a stronger model writes kernel and driver code from a written spec; cheaper models do inventories, log triage and notes; a separate reviewer reads each diff before it goes to the phone. The rules the models work under are in [`CLAUDE.md`](CLAUDE.md) and [`docs/agent-progress/SUBAGENTS.md`](docs/agent-progress/SUBAGENTS.md).
+
+### Credits
+
+- Base port: [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) and its contributors (MIT).
+- Metal driver base: [oosexgang/hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) at a pinned commit (MIT).
+- GPU back end: [Mesa](https://mesa3d.org) freedreno / ir3 (MIT).
+- No Apple firmware, root images or vendor blobs are in this repository. You need your own lawfully obtained copies.
+
+---
+
+# Upstream README (base project, state of 2026-10-18)
+
+The text below is the base project's own description. Where it says "No GPU", read the section above.
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 
