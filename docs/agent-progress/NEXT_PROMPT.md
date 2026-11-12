@@ -10,6 +10,7 @@
 > - Leads from 0161a, not examined: `mobilenotes.WidgetExtension` killed 0xDEAD10CC three times (suspended with locked system files) - a non-GPU candidate for blank widgets; AegirPoster sig 6; MapKit sig 11 at far 0x8.
 > - Mask lead 2026-11-12 (host, reading only): CoreAnimation clips with `setScissorRect:` and the plug-in drops it (`METAL_FINDINGS.md` 10 item 3, mask lead). `experimental`: which visible faults it causes is untested. Viewport rectangle and stencil ruled out as the first suspects. `IMG_1443.mov` viewed (frames in `photos-2026-11-12/mov-frames/`).
 > - Patch 0010 (scissor rectangle) 2026-11-12: written, host softpipe 5 of 5, reviewed, committed; `experimental`. Not built for iOS, not on the phone. The patched Metal tree is `~/Developer/ios-sweet-work/metal-build/donor` (already has 0010 applied); `~/Developer/ios-sweet-work/metal/donor` is stale, do not use it.
+> - Budget 2026-11-12: weekly Fable allowance is at 100% until Nov 15 19:00 Europe/Madrid. Run this phase with `/model` on Sonnet or Opus; it needs no code change and no `opus-impl` spawn. Device state unchanged since 0161a: phone root is still `work1.raw` + payload 0001-0009, nothing of 0010 flashed, no daemon or boot test running, phone last left in fastboot.
 
 # Phase: patch 0010 on the device (section 10 item 3)
 
