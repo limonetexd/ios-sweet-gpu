@@ -1,0 +1,610 @@
+From: HakiOS
+Subject: [PATCH 0161] sweet-gpu: a GPU fault names what occupies its address
+
+Run 0160d9 stopped with CB1 FSR 00000402 FAR 000000004c43c000 (a read, level 3
+translation fault), and nothing in the log said whose that address was.
+RedwoodGPU.cpp now keeps, by value in fixed static arrays, a record of every
+range its clients have in the GPU's address space (address, bytes mapped,
+owner, handle, kind, IOSurface shape, state, last fence), the last 128 unmaps
+and the last 4 submissions. redwood_gpu_report() hands FAR on, and the report
+says which range's 64 KiB slot holds it (inside the mapped bytes or in the
+slack past them), the nearest ranges below and above, every recent unmap that
+covered it, and the counts. Only when FSR is not 0, once for each address, at most 3 reports a boot, 11 lines each.
+
+Logging only: no new register reads or writes (the report's five SMMU reads
+are the same, into locals), no change to mapping, freeing, fences or waits.
+Always on. Map, unmap and state changes are O(1) through a slot index; the
+report reads at most 10240 records and 128 unmaps, without gGPULock.
+
+Proof in the log: "SWEET GPU: fault address:" after the "SMMU gfsr" line.
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -76,6 +76,8 @@
+ void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
+ void redwood_gpu_report(const char * why);
+ void redwood_gpu_stop(void);
++uint32_t redwood_gpu_done_fence(void);          /* 0161: SweetAdreno.cpp */
++void redwood_gpu_fault_names(uint64_t far);     /* 0161: below, called by redwood_gpu_report() */
+ 
+ void RedwoodGPUStart(void);
+ void RedwoodGPUStop(void);
+@@ -576,7 +578,387 @@
+ #define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
+ #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
+ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
++
++/*
++ * 0161 (fault address): what is in the GPU's address space, for naming the address of a fault
++ * (the SMMU's FAR, which redwood_gpu_report() prints). Run 0160d9 stopped on a read at 0x4c43c000
++ * and nothing here said whose that address was. Every range a client has entered is a record
++ * here from the time it is mapped until it is unmapped, with its state in between (live, left
++ * while the GPU is still at it, kept, stuck); the last GPU_UNMAPS unmaps are kept besides, and
++ * the last GPU_SUBMITTED submissions. Records hold numbers and names only, never a pointer to a
++ * buffer, a surface or a descriptor: the report reads them without gGPULock (the display's
++ * once-a-second line calls it, and so does gpuWait() with the lock held) and must not touch what
++ * may be gone. Everything else changes them with gGPULock held. Entering, changing and removing a
++ * record costs O(1): a record is found through the index of the 64 KiB slot its range starts in.
++ * The report reads every record once (at most GPU_RANGES) and every unmap once (GPU_UNMAPS).
++ */
++#define GPU_RANGE_VA_START      0x40000000ull   /* SweetAdreno.cpp's VA_USER_START to VA_USER_END */
++#define GPU_RANGE_VA_END        0x100000000ull
++#define GPU_RANGE_SLOTS         ((uint32_t)((GPU_RANGE_VA_END - GPU_RANGE_VA_START) >> 16))
++#define GPU_RANGES              10240           /* SweetAdreno.cpp's 320 tables, each level 3 one 32 slots: no more fit */
++#define GPU_UNMAPS              128
++#define GPU_SUBMITTED           4
++#define GPU_RANGE_NAME          17              /* proc_selfname()'s, MAXCOMLEN and the end */
++#define GPU_FAULT_TOLD          3               /* reports a boot */
++
++enum { kRangeFree = 0, kRangeLive, kRangeLeft, kRangeKept, kRangeStuck, kRangeStates };
++enum { kRangeOwn = 1, kRangePool, kRangeSurface, kRangeKinds };
++enum { kUnmapFreeBuffer = 1, kUnmapReap, kUnmapDropKept, kUnmapNewBuffer, kUnmapOther, kUnmapSites };
++static const char * const gRangeStateNames[] = { "free", "live", "left", "kept", "stuck" };
++static const char * const gRangeKindNames[] = { "?", "own buffer", "pool", "IOSurface" };
++static const char * const gUnmapSiteNames[] = { "?", "freeBuffer", "reap", "dropKept", "newBuffer-failure", "other" };
++
++struct gpu_range {
++	uint64_t        address;                /* the GPU's */
++	uint64_t        mapped;                 /* bytes entered into its page tables (4 KiB pages) */
++	uint64_t        allocSize;              /* an IOSurface's */
++	uint32_t        handle, fence;          /* the client's handle, the last submission that named it */
++	uint32_t        surface, width, height, rowBytes, pixelFormat, offset;  /* an IOSurface's; offset: as told to the program */
++	int32_t         pid;                    /* who made it */
++	uint8_t         state, kind, wrapped;
++	char            name[GPU_RANGE_NAME];
++};
++struct gpu_unmap {
++	uint64_t        address, mapped, at;    /* at: mach_absolute_time() */
++	uint32_t        surface, fence, done, last;     /* the range's last fence; the GPU's done and last submitted then */
++	int32_t         pid;
++	uint8_t         kind, site;
++	char            name[GPU_RANGE_NAME];
++};
++struct gpu_submitted {
++	uint64_t        first;                  /* the first command buffer's address */
++	uint32_t        fence, bos, cmds, words;
++	int32_t         pid;
++	char            name[GPU_RANGE_NAME];
++};
++static struct gpu_range gRanges[GPU_RANGES];
++static uint16_t gRangeAt[GPU_RANGE_SLOTS];      /* the record (+ 1) of the range that starts in a slot; 0: none */
++static uint16_t gRangeFree[GPU_RANGES];         /* records given back, to be taken again */
++static uint32_t gRangeFreeCount, gRangeUsed;    /* ... how many; and how many were ever taken */
++static uint32_t gRangeOverflow, gRangeOutside, gRangeReplaced;  /* not recorded: table full, address outside; stale ones overwritten */
++static struct gpu_unmap gUnmaps[GPU_UNMAPS];
++static uint32_t gUnmapNext;
++static struct gpu_submitted gSubmitted[GPU_SUBMITTED];
++static uint32_t gSubmittedNext;
++static uint32_t gFaultTold;
++
++/* With gGPULock held: the record of the range that starts at `address`; NULL: none. */
++static struct gpu_range *
++rangeAt(uint64_t address)
++{
++	if (address < GPU_RANGE_VA_START || address >= GPU_RANGE_VA_END) {
++		return NULL;
++	}
++	uint32_t i = gRangeAt[(address - GPU_RANGE_VA_START) >> 16];
++	if (i == 0 || i > GPU_RANGES || gRanges[i - 1].state == kRangeFree || gRanges[i - 1].address != address) {
++		return NULL;
++	}
++	return &gRanges[i - 1];
++}
++
++/* With gGPULock held: the record is free again, and its slot names nothing. */
++static void
++rangeRemove(struct gpu_range * r)
++{
++	uint32_t i = (uint32_t)(r - gRanges);
++
++	r->state = kRangeFree;
++	gRangeAt[(r->address - GPU_RANGE_VA_START) >> 16] = 0;
++	if (gRangeFreeCount < GPU_RANGES) {
++		gRangeFree[gRangeFreeCount++] = (uint16_t) i;
++	}
++}
++
++/* With gGPULock held, after `mapped` bytes at `address` were entered into the GPU's page tables. */
++static void
++rangeEnter(uint64_t address, uint64_t size, uint32_t handle, uint8_t kind)
++{
++	struct gpu_range * r;
++	uint32_t slot, i;
++
++	if (address < GPU_RANGE_VA_START || address >= GPU_RANGE_VA_END) {
++		gRangeOutside++;
++		return;
++	}
++	slot = (uint32_t)((address - GPU_RANGE_VA_START) >> 16);
++	if (gRangeAt[slot] != 0 && gRangeAt[slot] <= GPU_RANGES) {
++		gRangeReplaced++;               /* (one that was never unmapped here: the record was out of step) */
++		rangeRemove(&gRanges[gRangeAt[slot] - 1]);
++	}
++	if (gRangeFreeCount != 0) {
++		i = gRangeFree[--gRangeFreeCount];
++	} else if (gRangeUsed < GPU_RANGES) {
++		i = gRangeUsed++;
++	} else {
++		gRangeOverflow++;
++		return;
++	}
++	r = &gRanges[i];
++	r->state = kRangeFree;                  /* (so that a report on the way reads it as nothing until it is whole) */
++	r->address = address;
++	r->mapped = (size + 0xfff) & ~0xfffull;
++	r->allocSize = 0;
++	r->handle = handle;
++	r->fence = 0;
++	r->surface = r->width = r->height = r->rowBytes = r->pixelFormat = r->offset = 0;
++	r->kind = kind;
++	r->wrapped = 0;
++	r->pid = proc_selfpid();
++	proc_selfname(r->name, sizeof(r->name));
++	r->state = kRangeLive;
++	gRangeAt[slot] = (uint16_t)(i + 1);
++}
++
++/* With gGPULock held: the buffer at `address` is now in `state` (and still in the page tables). */
++static void
++rangeState(uint64_t address, uint8_t state)
++{
++	struct gpu_range * r = rangeAt(address);
++
++	if (r != NULL) {
++		r->state = state;
++	}
++}
++
++/* With gGPULock held: a kept buffer given again, as handle `handle` of the caller's. */
++static void
++rangeGiven(uint64_t address, uint32_t handle)
++{
++	struct gpu_range * r = rangeAt(address);
++
++	if (r != NULL) {
++		r->handle = handle;
++		r->pid = proc_selfpid();
++		proc_selfname(r->name, sizeof(r->name));
++		r->state = kRangeLive;
++	}
++}
++
++static void
++rangeFence(uint64_t address, uint32_t fence)
++{
++	struct gpu_range * r = rangeAt(address);
++
++	if (r != NULL) {
++		r->fence = fence;
++	}
++}
++
++/* With gGPULock held and the surface held: what it is, by value. */
++static void
++rangeSurface(uint64_t address, SweetSurface * s)
++{
++	struct gpu_range * r = rangeAt(address);
++
++	if (r != NULL) {
++		r->kind = kRangeSurface;
++		r->surface = (uint32_t) s->id;
++		r->width = (uint32_t) s->width;
++		r->height = (uint32_t) s->height;
++		r->rowBytes = (uint32_t) s->bytesPerRow;
++		r->pixelFormat = (uint32_t) s->pixelFormat;
++		r->allocSize = (uint64_t) s->allocSize;
++		r->wrapped = s->wrapped ? 1 : 0;
++		r->offset = (uint32_t)(s->offset + s->wrapDelta);
++	}
++}
++
++/* With gGPULock held, after `size` bytes at `address` were taken out of the GPU's page tables by `site`. */
++static void
++rangeUnmapped(uint64_t address, uint64_t size, uint8_t kind, uint8_t site)
++{
++	struct gpu_unmap * e = &gUnmaps[gUnmapNext % GPU_UNMAPS];
++	struct gpu_range * r = rangeAt(address);
++
++	e->at = 0;
++	e->address = address;
++	if (r != NULL) {
++		e->mapped = r->mapped;
++		e->kind = r->kind;
++		e->surface = r->surface;
++		e->fence = r->fence;
++		e->pid = r->pid;
++		memcpy(e->name, r->name, sizeof(e->name));
++		rangeRemove(r);
++	} else {
++		/* (never recorded: newBuffer()'s own that could not be entered whole, or the table was full) */
++		e->mapped = (size + 0xfff) & ~0xfffull;
++		e->kind = kind;
++		e->surface = 0;
++		e->fence = 0;
++		e->pid = proc_selfpid();
++		proc_selfname(e->name, sizeof(e->name));
++	}
++	e->name[GPU_RANGE_NAME - 1] = 0;
++	e->site = site;
++	e->done = redwood_gpu_done_fence();
++	e->last = redwood_gpu_last();
++	e->at = mach_absolute_time();
++	gUnmapNext++;
++}
+ 
++/* With gGPULock held, for a submission that was taken (fence not 0). */
++static void
++submittedNote(uint32_t fence, uint32_t bos, uint32_t cmds, uint64_t first, uint32_t words)
++{
++	struct gpu_submitted * s = &gSubmitted[gSubmittedNext % GPU_SUBMITTED];
++
++	s->fence = 0;
++	s->bos = bos;
++	s->cmds = cmds;
++	s->first = first;
++	s->words = words;
++	s->pid = proc_selfpid();
++	proc_selfname(s->name, sizeof(s->name));
++	s->fence = fence;
++	gSubmittedNext++;
++}
++
++static const char *
++rangeStateName(uint8_t state)
++{
++	return state < kRangeStates ? gRangeStateNames[state] : "?";
++}
++
++static const char *
++rangeKindName(uint8_t kind)
++{
++	return kind < kRangeKinds ? gRangeKindNames[kind] : "?";
++}
++
++static uint64_t
++rangeSlotBytes(uint64_t mapped)
++{
++	return (mapped + 0xffff) & ~0xffffull;
++}
++
++/*
++ * What occupies the GPU address of a fault, and what did lately: called by redwood_gpu_report()
++ * right after it prints FAR, with or without gGPULock (it is not taken here). Everything is read
++ * by value from the fixed arrays above; what is torn by a change on the way is printed as it is.
++ * At most GPU_FAULT_TOLD times a boot, at most 11 lines each.
++ */
++void
++redwood_gpu_fault_names(uint64_t far)
++{
++	struct gpu_range in, below, above, r;
++	bool found = false, haveBelow = false, haveAbove = false;
++	uint32_t counts[kRangeStates] = {}, used, next, matches = 0, shown = 0;
++	uint64_t bytes[kRangeStates] = {}, now = mach_absolute_time(), ns;
++
++	if (__atomic_fetch_add(&gFaultTold, 1, __ATOMIC_RELAXED) >= GPU_FAULT_TOLD) {
++		return;
++	}
++	bzero(&in, sizeof(in));
++	bzero(&below, sizeof(below));
++	bzero(&above, sizeof(above));
++	used = gRangeUsed;
++	used = used < GPU_RANGES ? used : GPU_RANGES;
++	for (uint32_t i = 0; i < used; i++) {
++		r = gRanges[i];
++		if (r.state == kRangeFree || r.state >= kRangeStates) {
++			continue;
++		}
++		counts[r.state]++;
++		bytes[r.state] += r.mapped;
++		uint64_t end = r.address + rangeSlotBytes(r.mapped);
++		if (far >= r.address && far < end) {
++			if (!found) {
++				in = r;
++				found = true;
++			}
++		} else if (end <= far) {
++			if (!haveBelow || r.address > below.address) {
++				below = r;
++				haveBelow = true;
++			}
++		} else if (!haveAbove || r.address < above.address) {
++			above = r;
++			haveAbove = true;
++		}
++	}
++	in.name[GPU_RANGE_NAME - 1] = below.name[GPU_RANGE_NAME - 1] = above.name[GPU_RANGE_NAME - 1] = 0;
++
++	if (!found) {
++		IOLog("SWEET GPU: fault address: FAR %#llx is in no live range\n", far);
++	} else {
++		uint64_t from = far - in.address;
++		if (from < in.mapped) {
++			IOLog("SWEET GPU: fault address: FAR %#llx is in the range at %#llx (%llu bytes mapped, slot of %llu): "
++			    "%#llx from its start, inside the mapped bytes, %#llx before their end\n", far, in.address, in.mapped,
++			    rangeSlotBytes(in.mapped), from, in.mapped - from);
++		} else {
++			IOLog("SWEET GPU: fault address: FAR %#llx is in the range at %#llx (%llu bytes mapped, slot of %llu): "
++			    "%#llx from its start, in the slack past the mapped bytes, %#llx past their end\n", far, in.address,
++			    in.mapped, rangeSlotBytes(in.mapped), from, from - in.mapped);
++		}
++		IOLog("SWEET GPU: fault address: it is %s, %s, handle %u of pid %d (%s), last fence %u\n", rangeKindName(in.kind),
++		    rangeStateName(in.state), in.handle, in.pid, in.name, in.fence);
++		if (in.kind == kRangeSurface) {
++			IOLog("SWEET GPU: fault address: surface %u %ux%u, %u bytes a row, format %#x, allocSize %llu, %s, offset %u\n",
++			    in.surface, in.width, in.height, in.rowBytes, in.pixelFormat, in.allocSize,
++			    in.wrapped ? "wrapped" : "not wrapped", in.offset);
++		}
++	}
++	if (haveBelow) {
++		IOLog("SWEET GPU: fault address: below: %#llx, %llu bytes, %s, %s, pid %d (%s), surface %u %ux%u; FAR %#llx past its mapped end\n",
++		    below.address, below.mapped, rangeKindName(below.kind), rangeStateName(below.state), below.pid, below.name,
++		    below.surface, below.width, below.height, far - (below.address + below.mapped));
++	} else {
++		IOLog("SWEET GPU: fault address: below: none\n");
++	}
++	if (haveAbove) {
++		IOLog("SWEET GPU: fault address: above: %#llx, %llu bytes, %s, %s, pid %d (%s), surface %u %ux%u; FAR %#llx before its start\n",
++		    above.address, above.mapped, rangeKindName(above.kind), rangeStateName(above.state), above.pid, above.name,
++		    above.surface, above.width, above.height, above.address - far);
++	} else {
++		IOLog("SWEET GPU: fault address: above: none\n");
++	}
++
++	next = gUnmapNext;
++	for (uint32_t k = 0; k < GPU_UNMAPS && k < next; k++) {
++		struct gpu_unmap e = gUnmaps[(next - 1 - k) % GPU_UNMAPS];
++
++		if (far < e.address || far >= e.address + rangeSlotBytes(e.mapped)) {
++			continue;
++		}
++		matches++;
++		if (shown >= 3) {
++			continue;
++		}
++		shown++;
++		e.name[GPU_RANGE_NAME - 1] = 0;
++		absolutetime_to_nanoseconds(now >= e.at ? now - e.at : 0, &ns);
++		IOLog("SWEET GPU: fault address: unmapped %llu ms ago by %s: %#llx, %llu bytes, %s of pid %d (%s), surface %u, "
++		    "its last fence %u, done %u, submitted %u\n", ns / NSEC_PER_MSEC,
++		    e.site < kUnmapSites ? gUnmapSiteNames[e.site] : "?", e.address, e.mapped, rangeKindName(e.kind), e.pid, e.name,
++		    e.surface, e.fence, e.done, e.last);
++	}
++	IOLog("SWEET GPU: fault address: %u live (%llu KB), %u left (%llu KB), %u kept (%llu KB), %u stuck (%llu KB); "
++	    "%u of the last %u unmaps contain FAR (%u shown); not recorded: %u (table full), %u (outside), %u replaced\n",
++	    counts[kRangeLive], bytes[kRangeLive] >> 10, counts[kRangeLeft], bytes[kRangeLeft] >> 10,
++	    counts[kRangeKept], bytes[kRangeKept] >> 10, counts[kRangeStuck], bytes[kRangeStuck] >> 10,
++	    matches, next < GPU_UNMAPS ? next : GPU_UNMAPS, shown, gRangeOverflow, gRangeOutside, gRangeReplaced);
++
++	next = gSubmittedNext;
++	for (uint32_t k = 0; k < GPU_SUBMITTED; k += 2) {
++		struct gpu_submitted a = gSubmitted[(next - 1 - k) % GPU_SUBMITTED], b = gSubmitted[(next - 2 - k) % GPU_SUBMITTED];
++
++		if (k >= next) {
++			break;
++		}
++		a.name[GPU_RANGE_NAME - 1] = b.name[GPU_RANGE_NAME - 1] = 0;
++		if (k + 1 >= next) {
++			IOLog("SWEET GPU: fault address: submitted %u by pid %d (%s): %u buffers, %u commands, the first at %#llx, %u words\n",
++			    a.fence, a.pid, a.name, a.bos, a.cmds, a.first, a.words);
++		} else {
++			IOLog("SWEET GPU: fault address: submitted %u by pid %d (%s): %u buffers, %u commands, the first at %#llx, %u words; "
++			    "%u by pid %d (%s): %u buffers, %u commands, the first at %#llx, %u words\n",
++			    a.fence, a.pid, a.name, a.bos, a.cmds, a.first, a.words, b.fence, b.pid, b.name, b.bos, b.cmds, b.first, b.words);
++		}
++	}
++}
++
+ class RedwoodGPUUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(RedwoodGPUUserClient);
+@@ -595,7 +977,7 @@
+ 	uint64_t                fKeptBytes;
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+-	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
++	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle, uint8_t kind);
+ 	void freeBuffer(struct gpu_buffer * b);
+ 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
+ 	void dropKept(struct gpu_kept * k);
+@@ -661,10 +1043,13 @@
+ 		left->fence = b->fence;
+ 		left->flags = b->flags;
+ 		left->pool = b->pool;
++		rangeState(b->address, kRangeLeft);
+ 	} else {
+ 		if (busy) {
+ 			static uint32_t said;
+ 
++			rangeState(b->address, kRangeStuck);    /* (stays in the page tables for good) */
++
+ 			if (b->surface == NULL) {
+ 				b->memory->retain();
+ 			} else {
+@@ -675,9 +1060,14 @@
+ 			}
+ 		} else if (b->surface == NULL && !b->pool && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
+ 			b->memory = NULL;               /* (now the kept one's) */
++			rangeState(b->address, kRangeKept);
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(b->address, b->size);
+ 			redwood_gpu_address_free(b->address, b->size);
++			rangeUnmapped(b->address, b->size, b->surface != NULL ? kRangeSurface : b->pool ? kRangePool : kRangeOwn,
++			    kUnmapFreeBuffer);
++		} else {
++			rangeState(b->address, kRangeStuck);    /* (the GPU is given back: nothing is unmapped any more) */
+ 		}
+ 		if (b->memory != NULL) {
+ 			if (b->pool && !busy) {
+@@ -710,9 +1100,14 @@
+ 		if (left->surface == NULL && !left->pool && redwood_gpu_ready() &&
+ 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
+ 			left->memory = NULL;
++			rangeState(left->address, kRangeKept);
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(left->address, left->size);
+ 			redwood_gpu_address_free(left->address, left->size);
++			rangeUnmapped(left->address, left->size, left->surface != NULL ? kRangeSurface : left->pool ? kRangePool : kRangeOwn,
++			    kUnmapReap);
++		} else {
++			rangeState(left->address, kRangeStuck);
+ 		}
+ 		if (left->memory != NULL) {
+ 			if (left->pool) {
+@@ -784,7 +1179,7 @@
+  * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
+  */
+ struct gpu_buffer *
+-RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
++RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle, uint8_t kind)
+ {
+ 	struct gpu_buffer * b = NULL;
+ 	bool mapped = true;
+@@ -821,6 +1216,7 @@
+ 			}
+ 			redwood_gpu_unmap(b->address, size);
+ 			redwood_gpu_address_free(b->address, size);
++			rangeUnmapped(b->address, size, kind, kUnmapNewBuffer);
+ 			b->address = 0;
+ 		}
+ 		if (attempt > 0 || fKeptBytes == 0) {
+@@ -850,6 +1246,7 @@
+ 	b->surface = NULL;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
++	rangeEnter(b->address, size, *handle, kind);
+ 	return b;
+ }
+ 
+@@ -863,6 +1260,9 @@
+ 	if (redwood_gpu_ready()) {
+ 		redwood_gpu_unmap(k->address, k->size);
+ 		redwood_gpu_address_free(k->address, k->size);
++		rangeUnmapped(k->address, k->size, kRangeOwn, kUnmapDropKept);
++	} else {
++		rangeState(k->address, kRangeStuck);
+ 	}
+ 	k->memory->release();
+ 	k->memory = NULL;
+@@ -948,6 +1348,7 @@
+ 			fBufferCount++;
+ 			fBufferBytes += size;
+ 			request->handle = h + 1;
++			rangeGiven(b->address, h + 1);
+ 			found->memory = NULL;
+ 			fKeptBytes -= size;
+ 			gGPUStat.given_again++;
+@@ -985,7 +1386,7 @@
+ 			}
+ 			inflightStage(4);
+ 			gpuLock();
+-			b = newBuffer(md, 0, size, request->flags, &request->handle);
++			b = newBuffer(md, 0, size, request->flags, &request->handle, kRangePool);
+ 			if (b != NULL) {
+ 				b->memory = md;
+ 				b->kernel = pool_kva;
+@@ -1022,7 +1423,7 @@
+ 
+ 	inflightStage(7);
+ 	gpuLock();
+-	b = newBuffer(memory, 0, size, request->flags, &request->handle);
++	b = newBuffer(memory, 0, size, request->flags, &request->handle, kRangeOwn);
+ 	if (b != NULL) {
+ 		b->memory = memory;
+ 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
+@@ -1114,10 +1515,11 @@
+ 	if (b != NULL) {
+ 		memory->release();
+ 		s->release();
+-	} else if ((b = newBuffer(s->memory, 0, size, 0, &request->handle)) != NULL) {
++	} else if ((b = newBuffer(s->memory, 0, size, 0, &request->handle, kRangeSurface)) != NULL) {
+ 		b->memory = memory;
+ 		b->kernel = (uint8_t *) s->kernelAddress() - s->wrapDelta;
+ 		b->surface = s;
++		rangeSurface(b->address, s);
+ 		gGPUStat.surfaces++;
+ 	}
+ 	gGPUStat.taking += mach_absolute_time() - began;
+@@ -1286,6 +1688,9 @@
+ 		words[count++] = cmds[i].size / 4;
+ 	}
+ 	request->fence = redwood_gpu_submit(addresses, words, count);
++	if (request->fence != 0) {
++		submittedNote(request->fence, request->nr_bos, request->nr_cmds, count != 0 ? addresses[0] : 0, count != 0 ? words[0] : 0);
++	}
+ 	if (gpu_log && request->fence != 0) {
+ 		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
+ 		uint32_t big = 0, all_words = 0;
+@@ -1316,6 +1721,7 @@
+ 
+ 		if (b != NULL) {
+ 			b->fence = request->fence;
++			rangeFence(b->address, request->fence);
+ 			if (b->surface != NULL) {
+ 				b->surface->drawn = request->fence;
+ 			}
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -56,6 +56,8 @@
+ void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
+ void redwood_gpu_report(const char *why);
+ void redwood_gpu_stop(void);
++uint32_t redwood_gpu_done_fence(void);          /* 0161 */
++void redwood_gpu_fault_names(uint64_t far);     /* 0161: RedwoodGPU.cpp */
+ void redwood_tl(const char *format, ...) __printflike(1, 2);
+ uint32_t gpu_log;
+ }
+@@ -649,10 +651,30 @@
+ 	IOLog("SWEET GPU: %s: fence %u done %u rptr %u wptr %u RBBM_STATUS %08x CP_HW_FAULT %08x IB1 %llx rem %u\n", why,
+ 	    seqno, *fence_word(), gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x210),
+ 	    gpu_rd(0x821), ib1, gpu_rd(0x92a));
+-	IOLog("SWEET GPU: %s: SMMU gfsr %08x CB1 FSR %08x FAR %08x%08x FSYNR0 %08x\n", why, rd(SMMU_OFF + 0x48),
+-	    rd(SMMU_CB1 + 0x58), rd(SMMU_CB1 + 0x64), rd(SMMU_CB1 + 0x60), rd(SMMU_CB1 + 0x68));
++	/* 0161: the same five registers as before, read once each, into locals so that FAR can be handed on */
++	uint32_t gfsr = rd(SMMU_OFF + 0x48), fsr = rd(SMMU_CB1 + 0x58), far_hi = rd(SMMU_CB1 + 0x64), far_lo = rd(SMMU_CB1 + 0x60);
++	uint32_t fsynr0 = rd(SMMU_CB1 + 0x68);
++	IOLog("SWEET GPU: %s: SMMU gfsr %08x CB1 FSR %08x FAR %08x%08x FSYNR0 %08x\n", why, gfsr, fsr, far_hi, far_lo, fsynr0);
++	/*
++	 * What the programs had at that address: only when there is a fault (a GPU that is merely slow
++	 * is reported here too, with FSR 0 and an address that means nothing), and once for each
++	 * address (a GPU that has stopped is reported every second, with the same one).
++	 */
++	static uint64_t named_far = ~0ull;
++	uint64_t far = ((uint64_t)far_hi << 32) | far_lo;
++	if (fsr != 0 && far != named_far) {
++		named_far = far;
++		redwood_gpu_fault_names(far);
++	}
+ }
+ 
++/* 0161: the last submission the GPU has said is done, from the fence page (memory, not a register), for RedwoodGPU's record of unmaps */
++uint32_t
++redwood_gpu_done_fence(void)
++{
++	return shared != NULL ? *fence_word() : 0;
++}
++
+ void
+ redwood_gpu_stop(void)
+ {
