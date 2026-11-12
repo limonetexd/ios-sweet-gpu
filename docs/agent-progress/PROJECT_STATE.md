@@ -25,7 +25,7 @@ Nothing is `verified-working`. Full table: `FEATURE_MATRIX.md`.
 
 Re-planned 2026-11-11 (full list: `METAL_FINDINGS.md` section 10; routing: `SUBAGENTS.md`).
 
-1. Fix the respring on app exit: symbolize the backboardd backtraces in `logs/xnu-0160vA.txt`.
+1. GPU fault then compositor crash (0160d9, `METAL_FINDINGS.md` 10 item 1b). Respring on app exit is `partially-working` with patches 0008+0009 (one boot, attribution unknown).
 2. (withdrawn) Blue tint of whites: camera artefact, not on the screen (user, 2026-11-11).
 3. Dotted blur pattern, missing Control Centre glyphs, blank widgets (XR formats, RG8 plane-1, framebuffer fetch).
 

@@ -1,0 +1,499 @@
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -95,6 +95,7 @@
+ #import <objc/runtime.h>
+ #include <IOKit/IOKitLib.h>
+ #include <dlfcn.h>
++#include <pthread.h>
+ 
+ #include "redwood_drawable.h"
+ #include <stdarg.h>
+@@ -1300,8 +1301,70 @@
+ 		refuse = at != NULL && at[strlen(RW_DEPTHREFUSE_KEY)] == '1';
+ 	});
+ 	return refuse;
++}
++
++/*
++ * The library has one Gallium pipe_context per device, and a pipe_context is single-threaded
++ * by contract; the library itself has no lock. So every call into it is made under this one
++ * process-wide recursive mutex, and -commit holds it across a command buffer's whole replay,
++ * because the context keeps the framebuffer, the bound pipeline and the current batch between
++ * calls. Without it backboardd died with two commits inside rwa_render_draw at once (log
++ * xnu-0160vA line 4447) and with ctx->batch NULL mid-draw (xnu-0160d8 lines 2991 and
++ * 4482-4515), one boot each. Boot-arg sweetmetal_nolock=1 keeps the old unlocked calls.
++ * Decided once per process and said once.
++ */
++#define RW_NOLOCK_KEY "sweetmetal_nolock="
++
++static pthread_mutex_t rw_lib_mutex;
++
++static bool
++rw_lib_serialized(void)
++{
++	static dispatch_once_t once;
++	static bool serialized;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++		pthread_mutexattr_t attr;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_NOLOCK_KEY)) != NULL;
++			     at += strlen(RW_NOLOCK_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		serialized = !(at != NULL && at[strlen(RW_NOLOCK_KEY)] == '1');
++		pthread_mutexattr_init(&attr);
++		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
++		pthread_mutex_init(&rw_lib_mutex, &attr);
++		pthread_mutexattr_destroy(&attr);
++		rw_print("library calls: %s\n", serialized ?
++			 "serialized by one recursive lock (sweetmetal_nolock=1 turns it off)" :
++			 "NOT serialized (forced by boot-arg sweetmetal_nolock=1)");
++	});
++	return serialized;
+ }
+ 
++static inline void
++rw_lib_lock(void)
++{
++	if (rw_lib_serialized()) {
++		pthread_mutex_lock(&rw_lib_mutex);
++	}
++}
++
++static inline void
++rw_lib_unlock(void)
++{
++	if (rw_lib_serialized()) {
++		pthread_mutex_unlock(&rw_lib_mutex);
++	}
++}
++
+ /* The one line per process: what the library actually did, from the first pipeline it
+  * made, since only the library knows whether its compiler has 16-bit ALU. */
+ static void
+@@ -1371,9 +1434,11 @@
+ 	if (mesa_available()) {
+ 		char why[256] = { 0 };
+ 
++		rw_lib_lock();
+ 		_mesa = mesa.device_open(why, sizeof(why));
+ 		rw_print("the compiler library %s\n",
+ 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
++		rw_lib_unlock();
+ 	}
+ 
+ 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
+@@ -1406,7 +1471,9 @@
+ - (void)dealloc
+ {
+ 	if (_mesa != NULL) {
++		rw_lib_lock();
+ 		mesa.device_close(_mesa);
++		rw_lib_unlock();
+ 	}
+ 	if (_gpu != IO_OBJECT_NULL) {
+ 		IOServiceClose(_gpu);
+@@ -1688,12 +1755,14 @@
+ 
+ 	char why[512] = { 0 };
+ 	struct rwa_render_info info = { 0 };
++	rw_lib_lock();
+ 	struct rwa_render *render = mesa.render_create(_mesa,
+ 	    vertex_air != nil ? [vertex_air bytes] : NULL,
+ 	    vertex_air != nil ? [vertex_air length] : 0,
+ 	    vertex != nil ? [[vertex name] UTF8String] : NULL,
+ 	    [fragment_air bytes], [fragment_air length], [[fragment name] UTF8String],
+ 	    &shape, &info, why, sizeof(why));
++	rw_lib_unlock();
+ 
+ 	if (render == NULL) {
+ 		/* PRINTED as well as returned, and RW_AGAIN because the same specification
+@@ -1918,7 +1987,9 @@
+ 		.sample_count = (unsigned)[descriptor sampleCount],
+ 		.usage = (unsigned)[descriptor usage],
+ 	};
++	rw_lib_lock();
+ 	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
++	rw_lib_unlock();
+ 
+ 	if (texture == NULL) {
+ 		rw_print("%s\n", why);
+@@ -1954,7 +2025,9 @@
+ 		.lod_min = [descriptor lodMinClamp],
+ 		.lod_max = [descriptor lodMaxClamp],
+ 	};
++	rw_lib_lock();
+ 	struct rwa_sampler *sampler = mesa.sampler_create(_mesa, &state, why, sizeof(why));
++	rw_lib_unlock();
+ 
+ 	if (sampler == NULL) {
+ 		rw_print("%s\n", why);
+@@ -2026,8 +2099,10 @@
+ 		};
+ 	}
+ 
++	rw_lib_lock();
+ 	struct rwa_depth_stencil *made = mesa.depth_stencil_create(_mesa, &state, why,
+ 								   sizeof(why));
++	rw_lib_unlock();
+ 
+ 	if (made == NULL) {
+ 		rw_print("%s\n", why);
+@@ -2178,11 +2253,15 @@
+ 	char why[512] = { 0 };
+ 	struct rwa_argbuf_layout sets[8];
+ 	unsigned count = 0;
++	int rc;
+ 
+-	if (mesa.module_argbufs(_mesa, [air bytes], [air length],
+-				[[function name] UTF8String], sets,
+-				(unsigned)(sizeof(sets) / sizeof(sets[0])), &count, why,
+-				sizeof(why)) != 0) {
++	rw_lib_lock();
++	rc = mesa.module_argbufs(_mesa, [air bytes], [air length],
++				 [[function name] UTF8String], sets,
++				 (unsigned)(sizeof(sets) / sizeof(sets[0])), &count, why,
++				 sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		/* the frontend's own sentence, passed through: it names what it refused */
+ 		rw_print("%s\n", why);
+ 		return nil;
+@@ -2333,9 +2412,11 @@
+ 
+ 	char why[512] = { 0 };
+ 	struct rwa_compute_info info = { 0 };
++	rw_lib_lock();
+ 	struct rwa_compute *compute = mesa.compute_create(_mesa, [air bytes], [air length],
+ 							  [[function name] UTF8String], &info,
+ 							  why, sizeof(why));
++	rw_lib_unlock();
+ 	if (compute == NULL) {
+ 		/* The front end's own sentence, passed through rather than replaced: it says
+ 		 * which construct it refused, and an application can act on that. */
+@@ -2527,8 +2608,11 @@
+ 	shape.mip_levels = (unsigned)[d mipmapLevelCount];
+ 	shape.sample_count = (unsigned)[d sampleCount];
+ 	shape.usage = (unsigned)[d usage];
++	/* the import goes into the library too (rwa_texture_from_surface), so it is locked */
++	rw_lib_lock();
+ 	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
+ 					  &took, why, sizeof(why));
++	rw_lib_unlock();
+ 	if (texture == NULL) {
+ 		RW_AGAIN("no drawable: %s\n", why);
+ 		return nil;
+@@ -2765,7 +2849,9 @@
+ 	if (mesa_available() && [device mesaDevice] != NULL) {
+ 		char why[256] = { 0 };
+ 
++		rw_lib_lock();
+ 		_mesa = mesa.buffer_create([device mesaDevice], length, why, sizeof(why));
++		rw_lib_unlock();
+ 		if (_mesa == NULL) {
+ 			rw_print("Mesa would not allocate %lu bytes: %s\n",
+ 			         (unsigned long)length, why);
+@@ -2774,7 +2860,9 @@
+ 		}
+ 		_owner = device;
+ 		_length = length;
++		rw_lib_lock();
+ 		_contents = mesa.buffer_map(_mesa);
++		rw_lib_unlock();
+ 		return self;
+ 	}
+ 	if (gpu == IO_OBJECT_NULL || length == 0) {
+@@ -2826,7 +2914,9 @@
+ - (void)dealloc
+ {
+ 	if (_mesa != NULL) {
++		rw_lib_lock();
+ 		mesa.buffer_destroy(_mesa);
++		rw_lib_unlock();
+ 		[super dealloc];
+ 		return;
+ 	}
+@@ -2973,7 +3063,9 @@
+ {
+ 	self = [super init];
+ 	if (self == nil) {
++		rw_lib_lock();
+ 		mesa.texture_destroy(texture);
++		rw_lib_unlock();
+ 		return nil;
+ 	}
+ 	_owner = device;
+@@ -2985,7 +3077,9 @@
+ - (void)dealloc
+ {
+ 	if (_texture != NULL) {
++		rw_lib_lock();
+ 		mesa.texture_destroy(_texture);
++		rw_lib_unlock();
+ 	}
+ 	[super dealloc];
+ }
+@@ -3050,9 +3144,14 @@
+ 	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
+ 			     (unsigned)region.size.depth };
+ 
++	int rc;
++
+ 	(void)image;
+-	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+-			       stride, why, sizeof(why)) != 0) {
++	rw_lib_lock();
++	rc = mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
++				stride, why, sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("writing texels: %s\n", why);
+ 	}
+ }
+@@ -3079,9 +3178,14 @@
+ 	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
+ 			     (unsigned)region.size.depth };
+ 
++	int rc;
++
+ 	(void)image;
+-	if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+-			      stride, why, sizeof(why)) != 0) {
++	rw_lib_lock();
++	rc = mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
++			       stride, why, sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("reading texels: %s\n", why);
+ 	}
+ }
+@@ -3110,8 +3214,12 @@
+ 		         "older than this driver and cannot say what a depth buffer holds\n");
+ 		return NO;
+ 	}
+-	if (mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
+-			    sizeof(why)) != 0) {
++	int rc;
++
++	rw_lib_lock();
++	rc = mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why, sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("reading the depth of a texture: %s\n", why);
+ 		return NO;
+ 	}
+@@ -3250,7 +3358,9 @@
+ 	 * nil to one of these */
+ 	self = [super initWithDevice:device samplerDescriptor:descriptor];
+ 	if (self == nil) {
++		rw_lib_lock();
+ 		mesa.sampler_destroy(sampler);
++		rw_lib_unlock();
+ 		return nil;
+ 	}
+ 	_sampler = sampler;
+@@ -3260,7 +3370,9 @@
+ - (void)dealloc
+ {
+ 	if (_sampler != NULL) {
++		rw_lib_lock();
+ 		mesa.sampler_destroy(_sampler);
++		rw_lib_unlock();
+ 	}
+ 	[super dealloc];
+ }
+@@ -3281,7 +3393,9 @@
+ 	 * there is reported by Apple's own validation. */
+ 	self = [super initWithDevice:device depthStencilDescriptor:descriptor];
+ 	if (self == nil) {
++		rw_lib_lock();
+ 		mesa.depth_stencil_destroy(state);
++		rw_lib_unlock();
+ 		return nil;
+ 	}
+ 	_state = state;
+@@ -3325,7 +3439,9 @@
+ - (void)dealloc
+ {
+ 	if (_state != NULL) {
++		rw_lib_lock();
+ 		mesa.depth_stencil_destroy(_state);
++		rw_lib_unlock();
+ 	}
+ 	[super dealloc];
+ }
+@@ -3352,7 +3468,9 @@
+ 	 * by it. */
+ 	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
+ 	if (self == nil) {
++		rw_lib_lock();
+ 		mesa.compute_destroy(compute);
++		rw_lib_unlock();
+ 		return nil;
+ 	}
+ 	_owner = device;
+@@ -3370,7 +3488,9 @@
+ - (void)dealloc
+ {
+ 	if (_compute != NULL) {
++		rw_lib_lock();
+ 		mesa.compute_destroy(_compute);
++		rw_lib_unlock();
+ 	}
+ 	[super dealloc];
+ }
+@@ -3401,7 +3521,9 @@
+ 	 * descriptor, for the reason the compute one learned at its own line 1504 */
+ 	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
+ 	if (self == nil) {
++		rw_lib_lock();
+ 		mesa.render_destroy(render);
++		rw_lib_unlock();
+ 		return nil;
+ 	}
+ 	_owner = device;
+@@ -3429,7 +3551,9 @@
+ - (void)dealloc
+ {
+ 	if (_render != NULL) {
++		rw_lib_lock();
+ 		mesa.render_destroy(_render);
++		rw_lib_unlock();
+ 	}
+ 	[super dealloc];
+ }
+@@ -4039,6 +4163,12 @@
+ 	char why[512] = { 0 };
+ 
+ 	_status = RW_CB_COMMITTED;
++	/* The whole replay under the library's lock: the context keeps the framebuffer, the
++	 * bound pipeline and the current batch between calls, so another command buffer's draws
++	 * must not land between this one's (xnu-0160vA line 4447: two commits inside
++	 * rwa_render_draw at once). Released at `done:`, the only way out, before anything
++	 * below can call a handler or give a slot back. */
++	rw_lib_lock();
+ 	for (RedwoodMetalWork *work in _work) {
+ 		if (work->clearOnly) {
+ 			[self runClear:work why:why size:sizeof(why)];
+@@ -4104,11 +4234,12 @@
+ 	}
+ 	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
+ done:
++	rw_lib_unlock();
+ 	/* What the work named is let go here, on the thread that committed: every item has
+ 	 * run and been waited for (or was abandoned by a failure), so nothing below needs
+ 	 * it. Left to -dealloc, the last release could come from the completion queue's
+ 	 * thread and destroy a buffer or texture while this thread is inside a draw -- the
+-	 * library has no lock -- and a command buffer somebody keeps would pin a whole
++	 * library has no lock of its own -- and a command buffer somebody keeps would pin a whole
+ 	 * frame's attachments. */
+ 	[_work removeAllObjects];
+ 	/* The queue's slot goes back here and on every way out of this method, a failed draw
+@@ -4272,7 +4403,12 @@
+ 		return NO;
+ 	}
+ 
+-	if (mesa.render_draw([work->render render], &draw, why, size) != 0) {
++	int rc;
++
++	rw_lib_lock();   /* already held by -commit; recursive */
++	rc = mesa.render_draw([work->render render], &draw, why, size);
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("the draw failed: %s\n", why);
+ 		[self failWith:why];
+ 		return NO;
+@@ -4301,11 +4437,16 @@
+ 			return;
+ 		}
+ 	}
+-	if (mesa.render_clear([[_queue device] mesaDevice], color, work->colorCount,
+-			      &work->clearColors[0][0], work->clearColorMask,
+-			      [work->depth mesaTexture],
+-			      work->clearsDepth ? &work->clearDepth : NULL,
+-			      work->clearsStencil ? &work->clearStencil : NULL, why, size) != 0) {
++	int rc;
++
++	rw_lib_lock();   /* already held by -commit; recursive */
++	rc = mesa.render_clear([[_queue device] mesaDevice], color, work->colorCount,
++			       &work->clearColors[0][0], work->clearColorMask,
++			       [work->depth mesaTexture],
++			       work->clearsDepth ? &work->clearDepth : NULL,
++			       work->clearsStencil ? &work->clearStencil : NULL, why, size);
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		/* the library's sentence is the reason: said when it differs from the last
+ 		 * one said, so a repeating failure is one line and a new one is not lost */
+ 		static char said[256];
+@@ -4334,7 +4475,14 @@
+ 	if (_status == RW_CB_ERROR) {
+ 		return;
+ 	}
+-	if (mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
++	int rc;
++
++	/* locked per call: this is reached from -redwoodDeliverHandlers after -commit has let
++	 * go, and from an application's own -waitUntilCompleted on any thread */
++	rw_lib_lock();
++	rc = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("THE GPU DID NOT FINISH: %s\n", why);
+ 		_error = [[NSError errorWithDomain:@"RedwoodMetal" code:3
+ 					  userInfo:@{ NSLocalizedDescriptionKey:
+@@ -6440,8 +6588,13 @@
+ 		         class_getName(object_getClass(buffer)));
+ 		return;
+ 	}
+-	if (mesa.argbuf_encode_buffer([_destination mesaBuffer], _offset, (unsigned)index,
+-				      [buffer mesaBuffer], offset, why, sizeof(why)) != 0) {
++	int rc;
++
++	rw_lib_lock();
++	rc = mesa.argbuf_encode_buffer([_destination mesaBuffer], _offset, (unsigned)index,
++				       [buffer mesaBuffer], offset, why, sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("%s\n", why);
+ 	}
+ }
+@@ -6469,8 +6622,13 @@
+ 		         class_getName(object_getClass(texture)));
+ 		return;
+ 	}
+-	if (mesa.argbuf_encode_texture([_destination mesaBuffer], _offset, (unsigned)index,
+-				       [texture mesaTexture], why, sizeof(why)) != 0) {
++	int rc;
++
++	rw_lib_lock();
++	rc = mesa.argbuf_encode_texture([_destination mesaBuffer], _offset, (unsigned)index,
++					[texture mesaTexture], why, sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("%s\n", why);
+ 	}
+ }
+@@ -6495,8 +6653,13 @@
+ 		         class_getName(object_getClass(sampler)));
+ 		return;
+ 	}
+-	if (mesa.argbuf_encode_sampler([_destination mesaBuffer], _offset, (unsigned)index,
+-				       [sampler mesaSampler], why, sizeof(why)) != 0) {
++	int rc;
++
++	rw_lib_lock();
++	rc = mesa.argbuf_encode_sampler([_destination mesaBuffer], _offset, (unsigned)index,
++					[sampler mesaSampler], why, sizeof(why));
++	rw_lib_unlock();
++	if (rc != 0) {
+ 		rw_print("%s\n", why);
+ 	}
+ }

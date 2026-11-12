@@ -138,3 +138,37 @@ NOTES.md:661, :983, :1142-1144 (upstream): first-boot migration takes 15-60 min 
 Self-test failures in vA and vB: 12 and 13 (`blitCommandEncoder` returns nil); 18 and 19 (new CoreAnimation-quad tests: pipeline nil, `fixed_vert_lph_spc` reads vertex attribute 4 (point_size, float) and the test's vertex descriptor configures no format there). The test is at fault for 18 and 19, not the driver.
 
 Status: Metal UI `partially-working` (real device, one boot, 0160vA). Self-test 15 of 19 (0160vA, 0160vB). Not a frame-rate result: no per-frame data and no sustained run.
+
+## Patch 0008, depth store without a depth attachment, 2026-11-12 (host only)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-12 | 0008 on 0001-0007, host softpipe, Mesa debugoptimized | `air_metal_test --draw-ms AppleMetalGLRenderer.bundle/default.metallib texturedFragment2DDepthMultisample`, once as is (test asks for the old refusal) and once with `RWA_TEST_DEPTH_DISCARD=1` (library default) | Refusal sentence in the first run; in the second a pipeline with no depth attachment that stores nothing to depth | As expected: first run refuses then retries with a depth attachment; second run prints `the fragment shader stores nothing to [[depth]], depth attachment none`. Neither run draws: softpipe cannot make the 4-sample texture (existing limit), so only pipeline creation is covered | patch `userland/metal/0008-depth-store-discarded.patch`; outputs not kept |
+| 2026-11-12 | same, iOS arm64 build | `bash tools/metal-build.sh` for `ios`, `driver`, `test`, `payload` | Clean build, payload library equals build library | Clean; `libredwoodair.dylib` UUID 82334361-92B5-3478-8E94-E1A7FBABC262 in both, sha256 965b43ac…; `discard_depth_stores` and `sweetmetal_depthrefuse` present | `~/Developer/ios-sweet-work/metal-build/pay` |
+
+Status: 0008 `not-tested` on the device. Review (`reviewer`, source reading): accept with fixes; applied: deref-chain guard in `discard_depth_stores`, shader-out mode check in `fragment_writes_depth`, host switch `RWA_TEST_DEPTH_DISCARD`. Open from review: library and plug-in have no runtime struct-size check, so they must always be deployed and rolled back together; whether ir3 on the A618 accepts a fragment shader left with no stored output is unknown until a device run.
+
+## Patch 0008 on the device, 2026-11-12 (real device, RAM boot, one boot)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-12 | 0160d8 = patches 0001-0008, `shim-boot-0160vA.img` (same boot-args as 0160vA, `sweetgpu_reboot=300`), root `work1.raw` + new payload, `userdata` flashed (rollback `work1-pre0008.raw`) | `tools/metal-flash-test.sh work1.raw shim-boot-0160vA.img 0160d8 420`; user opened and exited apps | No `CRASH backboardd`; self-test no worse than 15 of 19 | backboardd crashed twice, both sig 11 inside `libredwoodair.dylib` (lines 3010, 4516). No sig 6 and no `refused ... [[depth]]` line, but no `store is discarded` line either: the 0008 path was not reached in this boot, so 0008 is neither confirmed nor refuted. Self-test 15 passed, 4 failed. User: respring on app exit, blank widgets, heavy lag, Control Centre and App Library blur faults unchanged (photos IMG_1430-1434) | `logs/xnu-0160d8.txt` |
+
+Crash 1 (line 2991): fault address 0x1a8 in `fd6_draw_vbos` <- `fd_draw_vbo+472` <- `rwa_render_draw+3588` <- `runDraw` <- `commit`. Crash 2 (lines 4482-4515): two fault lines (0x1c, 0x8c) and two interleaved backtraces, one in `fd_bo_add_fence` <- `fd_submit_sp_flush` <- `fd_gmem_render_tiles` <- `fd_batch_flush` <- `fd_context_flush` <- `finish_or_say_why` <- `rwa_render_draw`, the other in `fd_pipe_fence_finish` <- `finish_or_say_why` <- `rwa_render_draw`; both under `-[RedwoodMetalCommandBuffer commit]`. Reading: two threads were inside the one `pipe_context` at the same time. Status: 0008 `not-tested` on device (path not reached); respring `not-working`.
+
+## Patch 0009, library calls serialized, 2026-11-12 (host only)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-12 | 0009 on 0001-0008, iOS arm64 build | `bash tools/metal-build.sh` for `ios`, `driver`, `test`, `payload` | Clean build | Clean; `sweetmetal_nolock` present in the payload plug-in | `userland/metal/0009-library-calls-serialized.patch`, `~/Developer/ios-sweet-work/metal-build/pay` |
+
+Status: 0009 `not-tested` (no host or mock test of the lock exists; device run not done: the second `userdata` flash was not carried out). Review (`reviewer`, source reading): ACCEPT, no blockers. Known limits from review: `finish` waits for the GPU while holding the lock (measure pacing against `sweetmetal_nolock=1`); a non-UTF-8 `why` string would throw under the lock; `finish` is device-wide, so a fault can be blamed on the wrong command buffer.
+
+## Patch 0009 on the device, 2026-11-12 (real device, RAM boot, one boot)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-12 | 0160d9 = patches 0001-0009, `shim-boot-0160vA.img`, root `work1.raw` + new payload, `userdata` flashed by the user | `tools/metal-flash-test.sh work1.raw shim-boot-0160vA.img 0160d9 420` (run by the user); user opened and exited apps | No `CRASH backboardd`; self-test no worse than 15 of 19 | Lock active (line 986 `library calls: serialized by one recursive lock`). User: apps can be exited without a respring. One backboardd lived from boot to line 5791 (0160vA and 0160d8 each lost two). It then died of a different cause: SMMU fault `CB1 FSR 00000402 FAR 000000004c43c000` and `SweetAdreno: submission 36366 not done` (about line 5190), 102 `the draw failed: the GPU did not finish the draw within two seconds` lines, then sig 11 at 0x18 in `fd_bo_heap_alloc+208` <- `fd_bo_new_ring` <- `fd_batch_create` <- `fd_context_batch` <- `fd_draw_vbo` <- `rwa_render_draw`. No `store is discarded` line: 0008's path again not reached. Self-test 15 passed, 4 failed. Blank widgets, missing Control Centre glyphs, dashed lines on rounded shapes, lag unchanged (photos IMG_1435-1438) | `logs/xnu-0160d9.txt` |
+
+Status: respring on app exit `partially-working` (real device, one boot; no A/B with `sweetmetal_nolock=1`, no cold/warm/stress set). Attribution: unknown. 0160d9 carried 0008 and 0009 together and no boot ran one without the other; the 0008 path never printed in 0160d9 (no `store is discarded` line, no refusal line), so the result belongs to the pair 0008+0009, not to either patch alone. New fault: GPU reads or writes an unmapped address, never recovers, and the driver then crashes on a failed buffer allocation: `not-working`. 0008 `not-tested` on device.
+

@@ -1,0 +1,370 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -5196,12 +5196,117 @@
+                continue;
+             nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+             if (d && d->deref_type == nir_deref_type_var &&
++                d->var->data.mode == nir_var_shader_out &&
+                 d->var->data.location == FRAG_RESULT_DEPTH)
+                return true;
+          }
+       }
+    }
+    return false;
++}
++
++static bool
++is_depth_output(const nir_variable *var)
++{
++   return var && var->data.mode == nir_var_shader_out &&
++          var->data.location == FRAG_RESULT_DEPTH;
++}
++
++/*
++ * Removes the fragment shader's [[depth]] output: every store_deref whose destination is
++ * that variable, then the derefs left unused, then the variable itself, so that nothing
++ * after this -- nir_lower_io in finalize_for_gallium, then the driver's own compiler --
++ * sees a depth output at all. Returns the number of stores removed.
++ *
++ * The destination is found through nir_deref_instr_get_variable, which follows an array
++ * or struct chain back to its variable, and not only the bare var deref
++ * fragment_writes_depth looks at. Neither chain can in fact occur: translate_output in
++ * air_to_nir.c refuses an aggregate output by name, and the frontend reaches an output
++ * only through nir_store_var, which is a var deref and nothing else. A cast cannot reach
++ * one either, for the same reason, and nir_deref_instr_get_variable returns NULL for one.
++ *
++ * Returns -1, having changed NOTHING, if the output is used by anything but a store's
++ * destination. The frontend emits no such use, so this is the statement that the reasoning
++ * above no longer holds rather than a case expected to happen, and the caller refuses.
++ *
++ * The output's driver_location is given back: the outputs after it move down by one and
++ * num_outputs shrinks, which is the numbering translate_output would have made had the
++ * module declared no depth. A hole would be a base no store names, and a backend that
++ * sizes its output table from the highest base would have an entry nothing filled in.
++ * nir_shader_gather_info does not run on this path (air_to_nir.c says so where it sets
++ * inputs_read), so outputs_written is only cleared in case something has gathered it, and
++ * the depth layout the frontend set from air.depth_qualifier goes back to NONE.
++ */
++static int
++discard_depth_stores(nir_shader *fs)
++{
++   nir_foreach_function_impl(impl, fs) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            /* Any deref built ON the output's var deref -- a cast above all, which
++             * nir_deref_instr_get_variable answers NULL for and so hides from the
++             * source walk below -- would keep the var deref alive after the variable
++             * is unlinked. The frontend builds none; one found is refused. */
++            if (instr->type == nir_instr_type_deref) {
++               nir_deref_instr *d = nir_instr_as_deref(instr);
++               for (nir_deref_instr *p = nir_deref_instr_parent(d); p;
++                    p = nir_deref_instr_parent(p)) {
++                  if (p->deref_type == nir_deref_type_var && is_depth_output(p->var))
++                     return -1;
++               }
++               continue;
++            }
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++            unsigned n = nir_intrinsic_infos[in->intrinsic].num_srcs;
++            for (unsigned s = 0; s < n; s++) {
++               nir_deref_instr *d = nir_src_as_deref(in->src[s]);
++               if (d && is_depth_output(nir_deref_instr_get_variable(d)) &&
++                   !(in->intrinsic == nir_intrinsic_store_deref && s == 0))
++                  return -1;
++            }
++         }
++      }
++   }
++
++   int removed = 0;
++   nir_foreach_function_impl(impl, fs) {
++      bool progress = false;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++            if (in->intrinsic != nir_intrinsic_store_deref)
++               continue;
++            nir_deref_instr *d = nir_src_as_deref(in->src[0]);
++            if (!d || !is_depth_output(nir_deref_instr_get_variable(d)))
++               continue;
++            nir_instr_remove(instr);
++            removed++;
++            progress = true;
++         }
++      }
++      /* instructions removed from inside blocks, and no block added or taken away */
++      nir_metadata_preserve(impl, progress ? nir_metadata_control_flow : nir_metadata_all);
++   }
++   nir_remove_dead_derefs(fs);
++
++   nir_foreach_variable_with_modes_safe(var, fs, nir_var_shader_out) {
++      if (!is_depth_output(var))
++         continue;
++      unsigned gone = var->data.driver_location;
++      exec_node_remove(&var->node);
++      nir_foreach_variable_with_modes(o, fs, nir_var_shader_out)
++         if (o->data.driver_location > gone)
++            o->data.driver_location--;
++      if (fs->num_outputs)
++         fs->num_outputs--;
++   }
++   fs->info.outputs_written &= ~BITFIELD64_BIT(FRAG_RESULT_DEPTH);
++   fs->info.fs.depth_layout = FRAG_DEPTH_LAYOUT_NONE;
++   return removed;
+ }
+ 
+ static bool
+@@ -5329,20 +5434,26 @@
+  * nothing above it moved) and rwa_render_info from 108 to 116 (8 bytes at offset 108).
+  * keep_16bit_varyings took rwa_render_shape from 1052 to 1056 (4 bytes at offset 1052),
+  * and varyings_mode rwa_render_info from 116 to 120 (4 bytes at offset 116).
++ * refuse_depth_store_without_attachment took rwa_render_shape from 1056 to 1060 (4 bytes
++ * at offset 1056), and depth_store_discarded rwa_render_info from 120 to 124 (4 bytes at
++ * offset 120).
+  */
+ static_assert(sizeof(struct rwa_color_blend) == 32 &&
+-                 sizeof(struct rwa_render_shape) == 1056 &&
++                 sizeof(struct rwa_render_shape) == 1060 &&
+                  offsetof(struct rwa_render_shape, vertex_attribute) == 48 &&
+                  offsetof(struct rwa_render_shape, vertex_layout) == 420 &&
+                  offsetof(struct rwa_render_shape, color_blend) == 792 &&
+                  offsetof(struct rwa_render_shape, color_blend_count) == 1048 &&
+-                 offsetof(struct rwa_render_shape, keep_16bit_varyings) == 1052,
++                 offsetof(struct rwa_render_shape, keep_16bit_varyings) == 1052 &&
++                 offsetof(struct rwa_render_shape, refuse_depth_store_without_attachment) ==
++                    1056,
+               "struct rwa_render_shape is not the shape redwoodmetal.m asserts: a field "
+               "was added in the middle, or only one of the two copies was rebuilt");
+-static_assert(sizeof(struct rwa_render_info) == 120 &&
++static_assert(sizeof(struct rwa_render_info) == 124 &&
+                  offsetof(struct rwa_render_info, vertex_argbuf_mask) == 100 &&
+                  offsetof(struct rwa_render_info, blend_enabled_mask) == 108 &&
+-                 offsetof(struct rwa_render_info, varyings_mode) == 116,
++                 offsetof(struct rwa_render_info, varyings_mode) == 116 &&
++                 offsetof(struct rwa_render_info, depth_store_discarded) == 120,
+               "struct rwa_render_info is not the shape redwoodmetal.m asserts, and this "
+               "one the LIBRARY writes into: a driver with a shorter one is overrun");
+ 
+@@ -6061,21 +6172,40 @@
+                    &out.fragment_textures, &out.fragment_samplers);
+    out.fragment_writes_depth = fragment_writes_depth(fs) ? 1 : 0;
+ 
+-   /* A shader that stores to [[depth]] with nowhere to store it is refused here, by name.
++   /* A shader that stores to [[depth]] with nowhere to store it has the store REMOVED
++    * here, and the old refusal is kept behind shape->refuse_depth_store_without_attachment
++    * (boot-arg sweetmetal_depthrefuse=1).
+     *
+-    * This is not tidiness. texturedFragment2DDepth is one of Apple's own, it stores a
+-    * depth and no colour, and the draw sweep built it a pipeline with three colour
+-    * attachments and no depth one: the dispatch never came back and took the whole boot
+-    * with it (logs/082415-run.log, where the sweep's own "about to draw" line is the last
+-    * thing in it). Metal's rule is the same one -- a pipeline whose fragment function
+-    * writes depth needs a depthAttachmentPixelFormat -- so refusing is both what the API
+-    * says and what keeps a GPU answering.
++    * The store is taken out of the shader, not tolerated, and that is the history. The
++    * refusal came first: texturedFragment2DDepth is one of Apple's own, it stores a depth
++    * and no colour, and the draw sweep built it a pipeline with three colour attachments
++    * and no depth one, the store intact: the dispatch never came back and took the whole
++    * boot with it (logs/082415-run.log, where the sweep's own "about to draw" line is the
++    * last thing in it).
++    *
++    * The refusal is no longer the default because of what the phone's window server does
++    * with it: CoreAnimation asks for a pipeline with fixed_frag_lph_cpf, which stores to
++    * [[depth]], and no depthAttachmentPixelFormat; refused, it aborts in
++    * CA::OGL::MetalContext::create_pipeline_state and backboardd dies of signal 6, which is
++    * a respring (device log xnu-0160vA, lines 5747-5773, one boot). Metal itself drops
++    * such a write, and discard_depth_stores makes the compiled stage do the same: what
++    * reaches the driver has no depth output, so fragment_writes_depth is 0 and the GPU is
++    * never handed the shape that hung it. Anything the removal cannot vouch for -- a use of
++    * the output other than a store, or fragment_writes_depth still true afterwards -- is
++    * refused as before.
+     */
+    if (out.fragment_writes_depth && !shape->depth_format) {
+-      say(why, why_size, "%s stores to [[depth]] and this pipeline has no depth attachment, "
+-                         "so there is nowhere for that store to go",
+-          render->finfo.entry_point ? render->finfo.entry_point : "the fragment function");
+-      goto fail;
++      int dropped = shape->refuse_depth_store_without_attachment ? -1
++                                                                 : discard_depth_stores(fs);
++      if (dropped <= 0 || fragment_writes_depth(fs)) {
++         say(why, why_size, "%s stores to [[depth]] and this pipeline has no depth "
++                            "attachment, so there is nowhere for that store to go",
++             render->finfo.entry_point ? render->finfo.entry_point
++                                       : "the fragment function");
++         goto fail;
++      }
++      out.fragment_writes_depth = 0;
++      out.depth_store_discarded = 1;
+    }
+ 
+    /* The vertex stage: translated when a module was supplied, generated otherwise. The
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -861,6 +861,15 @@
+ 	 * boot-arg sweetmetal_f16vary=1.
+ 	 */
+ 	unsigned keep_16bit_varyings;
++
++	/*
++	 * APPENDED, 4 bytes at the END, by the same rule. What becomes of a fragment
++	 * function that stores to [[depth]] when depth_format is 0: 0, the default and what
++	 * a zeroed shape says, removes the store from the shader and makes the pipeline
++	 * (rwa_render_info.depth_store_discarded); non-zero refuses the pipeline by name, as
++	 * every build did before. The driver sets it from the boot-arg sweetmetal_depthrefuse=1.
++	 */
++	unsigned refuse_depth_store_without_attachment;
+ };
+ 
+ /*
+@@ -967,6 +976,14 @@
+ 	 * shape.keep_16bit_varyings asked (boot-arg sweetmetal_f16vary=1).
+ 	 */
+ 	unsigned varyings_mode;
++
++	/*
++	 * APPENDED, by the same warning: 1 when the fragment function stored to [[depth]],
++	 * the shape had no depth attachment and did not ask for the refusal, and so the
++	 * stores were removed from the shader. fragment_writes_depth is then 0, because the
++	 * compiled stage no longer writes depth.
++	 */
++	unsigned depth_store_discarded;
+ };
+ enum { RWA_VARYINGS_32BIT = 1, RWA_VARYINGS_KEPT_NO_16BIT = 2, RWA_VARYINGS_KEPT_FORCED = 3 };
+ 
+--- a/tools/mesa/air/air_metal_test.c
++++ b/tools/mesa/air/air_metal_test.c
+@@ -2112,10 +2112,17 @@
+     * A depth attachment only if the shader stores to [[depth]], which is asked by
+     * trying without one: texturedFragment2DDepthMultisample writes depth and nothing to
+     * colour, and this library refuses such a pipeline by name when there is nowhere for
+-    * the store to go (docs/metal.md 10.30). Refusing first and retrying is how the
+-    * question gets asked without a table in this program saying which shaders they are.
++    * the store to go (docs/metal.md 10.30) -- when the shape asks it to, which this one
++    * does, since the default is now to remove the store. Refusing first and retrying is
++    * how the question gets asked without a table in this program saying which shaders
++    * they are.
+     */
+-   struct rwa_render_shape shape = { .color_count = 4, .sample_count = 1 };
++   struct rwa_render_shape shape = { .color_count = 4, .sample_count = 1,
++                                     .refuse_depth_store_without_attachment = 1 };
++   /* RWA_TEST_DEPTH_DISCARD=1 measures the library's default instead: the store is
++    * removed and the pipeline is made with no depth attachment at all. */
++   if (getenv("RWA_TEST_DEPTH_DISCARD"))
++      shape.refuse_depth_store_without_attachment = 0;
+    for (unsigned i = 0; i < 4; i++)
+       shape.color_format[i] = format;
+    struct rwa_render_info info = { 0 };
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -224,6 +224,10 @@
+ 	/* APPENDED, 4 bytes at the END: non-zero keeps 16-bit varyings 16-bit
+ 	 * (boot-arg sweetmetal_f16vary=1); 0 makes every varying 32-bit */
+ 	unsigned keep_16bit_varyings;
++	/* APPENDED, 4 bytes at the END: non-zero refuses a fragment function that stores to
++	 * [[depth]] with no depth attachment (boot-arg sweetmetal_depthrefuse=1); 0 has the
++	 * library remove the store */
++	unsigned refuse_depth_store_without_attachment;
+ };
+ struct rwa_render_info {
+ 	unsigned vertex_buffers, fragment_buffers, fragment_textures, fragment_samplers;
+@@ -253,6 +257,9 @@
+ 	unsigned color_write_masks;
+ 	/* APPENDED: what became of 16-bit varyings, RWA_VARYINGS_* below */
+ 	unsigned varyings_mode;
++	/* APPENDED: 1 when the library removed a [[depth]] store that had no depth
++	 * attachment to go to; fragment_writes_depth is then 0 */
++	unsigned depth_store_discarded;
+ };
+ enum { RWA_VARYINGS_32BIT = 1, RWA_VARYINGS_KEPT_NO_16BIT = 2, RWA_VARYINGS_KEPT_FORCED = 3 };
+ struct rwa_vertex_stream {
+@@ -422,18 +429,20 @@
+  * the failure that is invisible.
+  */
+ _Static_assert(sizeof(struct rwa_color_blend) == 32 &&
+-		   sizeof(struct rwa_render_shape) == 1056 &&
++		   sizeof(struct rwa_render_shape) == 1060 &&
+ 		   offsetof(struct rwa_render_shape, vertex_attribute) == 48 &&
+ 		   offsetof(struct rwa_render_shape, vertex_layout) == 420 &&
+ 		   offsetof(struct rwa_render_shape, color_blend) == 792 &&
+ 		   offsetof(struct rwa_render_shape, color_blend_count) == 1048 &&
+-		   offsetof(struct rwa_render_shape, keep_16bit_varyings) == 1052,
++		   offsetof(struct rwa_render_shape, keep_16bit_varyings) == 1052 &&
++		   offsetof(struct rwa_render_shape, refuse_depth_store_without_attachment) == 1056,
+ 	       "struct rwa_render_shape here is not the shape air_metal.c asserts: a field "
+ 	       "was added in the middle, or only one of the two copies was rebuilt");
+-_Static_assert(sizeof(struct rwa_render_info) == 120 &&
++_Static_assert(sizeof(struct rwa_render_info) == 124 &&
+ 		   offsetof(struct rwa_render_info, vertex_argbuf_mask) == 100 &&
+ 		   offsetof(struct rwa_render_info, blend_enabled_mask) == 108 &&
+-		   offsetof(struct rwa_render_info, varyings_mode) == 116,
++		   offsetof(struct rwa_render_info, varyings_mode) == 116 &&
++		   offsetof(struct rwa_render_info, depth_store_discarded) == 120,
+ 	       "struct rwa_render_info here is not the shape air_metal.c asserts, and this "
+ 	       "one the LIBRARY writes into: too short is a buffer overrun");
+ 
+@@ -1259,7 +1268,40 @@
+ 	});
+ 	return keep;
+ }
++
++/*
++ * Whether a fragment function that stores to [[depth]] in a pipeline with no depth
++ * attachment is refused: boot-arg sweetmetal_depthrefuse=1 keeps the old refusal, anything
++ * else (absent included) has the library remove the store, which is what Metal does with
++ * such a write. CoreAnimation aborts in create_pipeline_state when it is refused, and
++ * backboardd with it. Decided once per process.
++ */
++#define RW_DEPTHREFUSE_KEY "sweetmetal_depthrefuse="
+ 
++static bool
++rw_refuse_depth_store(void)
++{
++	static dispatch_once_t once;
++	static bool refuse;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_DEPTHREFUSE_KEY)) != NULL;
++			     at += strlen(RW_DEPTHREFUSE_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		refuse = at != NULL && at[strlen(RW_DEPTHREFUSE_KEY)] == '1';
++	});
++	return refuse;
++}
++
+ /* The one line per process: what the library actually did, from the first pipeline it
+  * made, since only the library knows whether its compiler has 16-bit ALU. */
+ static void
+@@ -1545,6 +1587,7 @@
+ 	}
+ 	shape.color_blend_count = 8;
+ 	shape.keep_16bit_varyings = rw_keep_16bit_varyings() ? 1 : 0;
++	shape.refuse_depth_store_without_attachment = rw_refuse_depth_store() ? 1 : 0;
+ 	/*
+ 	 * And the measurement this was built to make: what the window server actually asks
+ 	 * for, one line per attachment it has, printed BEFORE the library can refuse any of
+@@ -1672,6 +1715,12 @@
+ 		rw_blend_result(info.blend_enabled_mask, info.color_write_masks);
+ 	}
+ 	rw_varyings_said(info.varyings_mode);
++	if (info.depth_store_discarded) {
++		RW_AGAIN("this pipeline's fragment function %s stores to [[depth]] and the "
++			 "pipeline has no depth attachment; the store is discarded (boot-arg "
++			 "sweetmetal_depthrefuse=1 refuses instead)\n",
++			 [[fragment name] UTF8String]);
++	}
+ 	return [[RedwoodMetalRenderPipeline alloc] initWithRedwoodDevice:self
+ 								 render:render
+ 								   info:&info
