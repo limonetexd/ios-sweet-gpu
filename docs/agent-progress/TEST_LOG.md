@@ -172,3 +172,12 @@ Status: 0009 `not-tested` (no host or mock test of the lock exists; device run n
 
 Status: respring on app exit `partially-working` (real device, one boot; no A/B with `sweetmetal_nolock=1`, no cold/warm/stress set). Attribution: unknown. 0160d9 carried 0008 and 0009 together and no boot ran one without the other; the 0008 path never printed in 0160d9 (no `store is discarded` line, no refusal line), so the result belongs to the pair 0008+0009, not to either patch alone. New fault: GPU reads or writes an unmapped address, never recovers, and the driver then crashes on a failed buffer allocation: `not-working`. 0008 `not-tested` on device.
 
+
+## Patch 0161 kernel build, 2026-11-12 (CI build + host image checks; nothing run on the device)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-12 | kernel 0161 = `xnu/patches/` 0001-0161 at 5f6ec1f | `gh workflow run xnu.yml --ref gpu -f keep_going=false` (run 43300161670) | Compiles and links | Success. Kernel SHA256 `12b12f60...b3a0b` matches `SHA256SUMS`; 13 `SWEET GPU: fault address` strings; `__DATA` vmsize 5668864 -> 6602752, total vmsize 22167552 -> 23117824 (+0.93 MiB) | `~/Developer/ios-sweet-work/kernel-0161/` |
+| 2026-11-12 | `shim-boot-0161a.img` | `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH bash tools/sweet-gpu-image.sh ~/Developer/ios-sweet-work/kernel-0161 0161a "sweetgpu_reboot=300 sweetmetal=1 metal_profile=1 sweetmetal_procs=* sweetnull=backboardd,SpringBoard,metaltest"` | Same boot-args as 0160vA, new kernel inside | `RAMDISK MATCH`; boot-args equal to 0160vA except `sweetepoch`; SHA256 `e2f28ce9...ca211` | `shim/out/shim-boot-0161a.img` |
+
+Status: 0161 `not-tested` (compiled and packed only). Trap found: without `ios-sweet-work/bin` on `PATH` the shim build fails (`aarch64-linux-gnu-gcc: command not found`), the script hides the error and copies the previous `shim-boot.img`; the first 0161a image was byte-identical to 0160vB. Trust only an image whose build printed `RAMDISK MATCH`. Shim load window: `shim/loader.c` places the ADT at `kernel_end`, no fixed size cap found by reading; not proven by a boot.

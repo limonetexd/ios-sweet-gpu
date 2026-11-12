@@ -5,8 +5,9 @@
 > - Phone root = `work1.raw` + payload 0001-0009. Rollback image `~/Developer/ios-sweet-work/root/work1-pre0008.raw` (before 0008).
 > - Patches 0008 and 0009 are committed on branch `gpu` (cf0a53b). Tag `known-good-0160vA` = 2147ca8.
 > - Self-test 15 of 19. Test boot image `shim/out/shim-boot-0160vA.img` (`sweetgpu_reboot=300`). The auto-mode permission check refuses `tools/metal-flash-test.sh`; the user runs it with `!`.
-> - Patch 0161 (fault names its buffer, logging only): in `cxnu` d524c4a and `xnu/patches/`, reviewed ACCEPT, never compiled, `not-tested`. The log read is done (section 10 item 1b); do not repeat it. Blocked on a kernel build: none has run on this Mac (see item 1b, "Build blocker"). Next single unit: build a kernel with 0161, check its size against the shim load window, RAM boot it (`fastboot boot`, no flash), reproduce the fault, read the `SWEET GPU: fault address:` lines.
-> - 2026-11-12 late: the host saw USB `05c6:f000` and an empty `fastboot devices`; the phone was not in fastboot.
+> - Patch 0161 (fault names its buffer, logging only): committed 5f6ec1f in `xnu/patches/`, reviewed ACCEPT, CI kernel built (`~/Developer/ios-sweet-work/kernel-0161`), image `shim/out/shim-boot-0161a.img` (SHA256 e2f28ce9..., same boot-args as 0160vA). `not-tested` on the device. The log read of 0160d9 is done; do not repeat it.
+> - Next single unit: `bash tools/sweet-boot-test.sh shim/out/shim-boot-0161a.img 0161a 420` (RAM boot, no flash, reversible), user opens and exits apps; then `log-triage` on `logs/xnu-0161a.txt` for `SWEET GPU: fault address:` lines. No fault in one boot proves nothing; repeat.
+> - Kernel builds go through GitHub CI (user, 2026-11-12). Image builds need `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH` and must print `RAMDISK MATCH` (`TEST_LOG.md`).
 
 # Phase: Metal UI, GPU fault after app use (item 1b)
 
