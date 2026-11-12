@@ -965,6 +965,78 @@ t19(void)
 	return caQuad(@"fixed_vert_lpf_spc", @"fixed_frag_lph_cph");
 }
 
+/*
+ * -setScissorRect: then a full-target quad: inside the rectangle the draw colour, everywhere
+ * else the pass's clear colour, every pixel checked. The rectangle is off-centre in both axes
+ * so that a y measured from the bottom (rows 48..59 here) or swapped axes cannot pass, and
+ * the clear must still cover the whole target although the scissor is set before the draw
+ * (Metal does not scissor a load action). Then two cases that take their own code in
+ * freedreno and that the host test only covers on softpipe: a zero-width rectangle (nothing
+ * drawn) and, last, a new encoder with no rectangle after the scissored ones (everything
+ * drawn: the rectangle must not stick). With sweetmetal_noscissor=1 this test FAILS by
+ * design, the quad then covers everything: that boot is the negative control.
+ */
+static int
+scissorPass(id<MTLRenderPipelineState> p, const MTLScissorRect *sr, int x0, int y0, int x1, int y1,
+	    const char *what)
+{
+	id<MTLTexture> t = newTarget();
+	id<MTLCommandBuffer> cb = t ? [g_q commandBuffer] : nil;
+	id<MTLRenderCommandEncoder> e = cb ? beginPass(cb, t, MTLClearColorMake(0, 0, 1, 1), nil) : nil;
+	if (!e) {
+		fail("render encoder nil");
+		return -1;
+	}
+	const float col[4] = { 1.0f, 0.5f, 0.25f, 1.0f };
+	[e setRenderPipelineState:p];
+	if (sr) {
+		[e setScissorRect:*sr];
+	}
+	if (!draw(e, kQuad, 4, MTLPrimitiveTypeTriangleStrip, col, 0.0f)) {
+		return -1;
+	}
+	[e endEncoding];
+	if (!finish(cb, what)) {
+		return -1;
+	}
+	static uint8_t px[W * H * 4];
+	readTex(t, px, W, H);
+	int inside = 0;
+	for (int y = 0; y < H; y++) {
+		for (int x = 0; x < W; x++) {
+			BOOL in = x >= x0 && x < x1 && y >= y0 && y < y1;
+			if (!(in ? probe(px, W, x, y, 1, .5f, .25f, 1) : probe(px, W, x, y, 0, 0, 1, 1))) {
+				note("%s: wrong at (%d,%d)", what, x, y);
+				return -1;
+			}
+			inside += in;
+		}
+	}
+	return inside;
+}
+
+static int
+t20(void)
+{
+	if (!g_q) {
+		return skip("no queue");
+	}
+	id<MTLRenderPipelineState> p = makePipe(@"fs_color", MTLPixelFormatInvalid, NO);
+	if (!p) {
+		return g_pr;
+	}
+	/* a bottom-left origin would put this rectangle at rows 48..59: every pixel is checked */
+	const MTLScissorRect sr = { 8, 4, 16, 12 };
+	const MTLScissorRect empty = { 8, 4, 0, 12 };
+	int in = scissorPass(p, &sr, 8, 4, 24, 16, "scissored quad");
+	if (in < 0 || scissorPass(p, &empty, 0, 0, 0, 0, "zero-width scissor") < 0 ||
+	    scissorPass(p, NULL, 0, 0, W, H, "no scissor after one") < 0) {
+		return R_FAIL;
+	}
+	note("%d px inside {8,4,16,12}, %d clear; zero width draws nothing; none draws all", in, W * H - in);
+	return R_PASS;
+}
+
 typedef struct { const char *name; int (*fn)(void); unsigned timeout; } Test;
 
 int
@@ -985,7 +1057,7 @@ main(int argc, char **argv)
 		{ "alpha blend", t10, 10 }, { "depth test", t11, 10 }, { "blit texture copy", t12, 10 },
 		{ "blit mipmaps+tex2buf", t13, 10 }, { "compute", t14, 10 }, { "iosurface texture", t15, 10 },
 		{ "100 passes", t16, 30 }, { "completion handler+GPU times", t17, 10 },
-		{ "CA quad lph", t18, 30 }, { "CA quad lpf", t19, 30 },
+		{ "CA quad lph", t18, 30 }, { "CA quad lpf", t19, 30 }, { "scissor rect", t20, 10 },
 	};
 	int counts[3] = { 0, 0, 0 };
 	int tmo_in_row = 0;

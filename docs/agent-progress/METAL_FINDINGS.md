@@ -185,6 +185,7 @@ Work list, in order:
    - No stencil in the mask path seen so far: QuartzCore has no `setStencilReferenceValue:` selector; `setDepthStencilState:` is sent once, from `update_encoder_state`. Masks and corners go through `MaskNode::apply`, `MaskCorners`, `fill_corner_rect` (corner textures and blending), not read yet.
    - Formats in the 0161a blend lines (`log-triage`, not re-counted by the lead): 80 (49 lines), 115, 43 and 10 (R8, one pipeline). Format 30 refused as a drawable 7 times, 550 4 times, 554 twice.
    - Fix is a bounded patch (no R1-R3 case): carry the scissor in `rwa_draw`, keep it in the encoder, set Gallium scissor state in the library. Spec in `NEXT_PROMPT.md`.
+   - Patch 0010 written 2026-11-12 (`userland/metal/0010-scissor-rect.patch`, `experimental`): host softpipe test 5 of 5, reviewed, not built for iOS, not on the phone (`TEST_LOG.md`). The rectangle goes to Gallium unflipped (the library's negative viewport y-scale already makes row 0 the top; shown by the host test). Old path: `sweetmetal_noscissor=1`. Self-test item 20 added. The patched tree is `~/Developer/ios-sweet-work/metal-build/donor`; `~/Developer/ios-sweet-work/metal/donor` is stale (donor + 0001 only), so the line numbers above (4403, 4760, 1205) are that tree's.
 4. Blit encoder (self-test 12, 13).
 5. Self-test 18, 19 descriptor: add attribute 4 (point_size, float).
 6. Frame rate: each draw waits for the GPU (finish per draw). Measure first, then batch.

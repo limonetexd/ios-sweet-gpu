@@ -27,7 +27,7 @@ Re-planned 2026-11-11 (full list: `METAL_FINDINGS.md` section 10; routing: `SUBA
 
 1. GPU fault then compositor crash (0160d9, `METAL_FINDINGS.md` 10 item 1b). Respring on app exit is `partially-working` with patches 0008+0009 (one boot, attribution unknown).
 2. (withdrawn) Blue tint of whites: camera artefact, not on the screen (user, 2026-11-11).
-3. Visual faults: scissor rectangle is dropped by the plug-in (found 2026-11-12 by reading, `experimental`; `METAL_FINDINGS.md` 10 item 3); then dotted blur, glyphs, widgets.
+3. Visual faults: scissor rectangle is dropped by the plug-in. Patch 0010 written, host softpipe test passes, reviewed (`experimental`, 2026-11-12); next is build, flash, A/B boot (`NEXT_PROMPT.md`). Then dotted blur, glyphs, widgets.
 
 Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 

@@ -1,0 +1,445 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -5126,7 +5126,11 @@
+     */
+    void *vs_cso, *fs_cso;
+    void *blend, *dsa, *rast, *velem;
+-   struct pipe_resource *vbuf;        /* the full-screen quad, for the generated stage */
++   /* the same rasterizer state with the scissor test on, for a draw that carries a
++    * rectangle: made beside `rast` rather than keyed, because the bit is the only thing
++    * a draw can change about it */
++   void *rast_scissor;
++   struct pipe_resource *vbuf;       /* the full-screen quad, for the generated stage */
+ 
+    /* What the vertex descriptor was turned into, empty for a stage that fetches no
+     * attributes -- which is the generated quad and every vertex module this library
+@@ -6393,8 +6397,7 @@
+     * util_framebuffer_get_num_samples) and emits with emit_msaa. So this bit is the
+     * honest state for a multisample pass and not the thing that turns multisampling on.
+     */
+-   render->rast = device->pipe->create_rasterizer_state(device->pipe,
+-      &(struct pipe_rasterizer_state){
++   struct pipe_rasterizer_state rs = {
+          /* Metal's provoking vertex is the first one of a primitive; Gallium's default
+           * is the last. A [[flat]] value differs per vertex in CoreAnimation's quads, so
+           * with the last vertex each of a quad's two triangles took a different value
+@@ -6402,8 +6405,16 @@
+          .flatshade_first = 1,
+          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+-         .multisample = samples > 1 });
+-   if (!render->blend || !render->dsa || !render->rast) {
++         .multisample = samples > 1 };
++   render->rast = device->pipe->create_rasterizer_state(device->pipe, &rs);
++   /* And the same state with the scissor test on, which is the only bit a draw's
++    * rwa_draw.scissor changes. Two objects made here rather than one patched per draw:
++    * a draw with no rectangle binds `rast`, which is byte for byte the state every draw
++    * before scissoring was proven with.
++    */
++   rs.scissor = 1;
++   render->rast_scissor = device->pipe->create_rasterizer_state(device->pipe, &rs);
++   if (!render->blend || !render->dsa || !render->rast || !render->rast_scissor) {
+       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
+       goto fail;
+    }
+@@ -6533,6 +6544,10 @@
+       pipe->bind_rasterizer_state(pipe, NULL);
+       pipe->delete_rasterizer_state(pipe, render->rast);
+    }
++   if (render->rast_scissor) {
++      pipe->bind_rasterizer_state(pipe, NULL);
++      pipe->delete_rasterizer_state(pipe, render->rast_scissor);
++   }
+    if (render->velem) {
+       /* Unbound before deleted, and the vertex buffer unbound with it: the context holds
+        * a reference of its own to whatever is bound there (set_vertex_buffers took it),
+@@ -7170,7 +7185,37 @@
+    pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
+       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
+                      (uint8_t)(draw->stencil_reference[1] & 0xff) } });
+-   pipe->bind_rasterizer_state(pipe, render->rast);
++   /*
++    * The scissor rectangle, when the encoder has one (rwa_draw.scissor). Gallium's
++    * scissor is in framebuffer pixels from memory row 0, and the viewport above already
++    * puts Metal's top-left origin there, so x and y go across unflipped; the maxima are
++    * exclusive, as MTLScissorRect's x + width is. It is clamped to the pass rather than
++    * refused, and the sums are taken wide so that a width near UINT_MAX cannot wrap back
++    * inside the attachment.
++    *
++    * A rectangle with no area left is set as an EMPTY scissor (min == max) and the draw
++    * still goes to the driver, which is Gallium's own spelling of "rasterise nothing":
++    * softpipe's cliprect is then empty and freedreno turns min == max into TL > BR
++    * itself (fd_set_scissor_states). The vertex stage still runs, as it does in Metal.
++    *
++    * No rectangle binds `rast`, the state with the test off, and leaves the scissor
++    * values alone: with the bit off neither driver reads them. The load actions further
++    * down are pipe->clear and clear_render_target, and neither is scissored by the
++    * rasterizer state (pctx->clear "is only for full-surface clears", freedreno_draw.c;
++    * softpipe's clears the whole surface), which is Metal's rule for a load action.
++    */
++   if (draw->scissor) {
++      uint64_t x0 = MIN2((uint64_t)draw->scissor[0], (uint64_t)w);
++      uint64_t y0 = MIN2((uint64_t)draw->scissor[1], (uint64_t)h);
++      uint64_t x1 = MIN2((uint64_t)draw->scissor[0] + draw->scissor[2], (uint64_t)w);
++      uint64_t y1 = MIN2((uint64_t)draw->scissor[1] + draw->scissor[3], (uint64_t)h);
++      pipe->set_scissor_states(pipe, 0, 1, &(struct pipe_scissor_state){
++         .minx = (uint16_t)x0, .miny = (uint16_t)y0,
++         .maxx = (uint16_t)x1, .maxy = (uint16_t)y1 });
++      pipe->bind_rasterizer_state(pipe, render->rast_scissor);
++   } else {
++      pipe->bind_rasterizer_state(pipe, render->rast);
++   }
+    pipe->bind_vs_state(pipe, render->vs_cso);
+    pipe->bind_fs_state(pipe, render->fs_cso);
+ 
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -1337,6 +1337,29 @@
+ 	unsigned vertex_buffer_table_count;
+ 	const struct rwa_buffer_bind *fragment_buffer_table;
+ 	unsigned fragment_buffer_table_count;
++
++	/*
++	 * THE SCISSOR RECTANGLE: -setScissorRect:, which is encoder state in Metal exactly as
++	 * the stencil reference is, and so in the draw.
++	 *
++	 * NULL is no rectangle, the whole attachment, which is what every draw before this
++	 * field did. A pointer is four values { x, y, width, height } in pixels, as
++	 * MTLScissorRect has them, with Metal's origin: the TOP LEFT, memory row 0. That is
++	 * also Gallium's framebuffer origin, because the viewport rwa_render_draw sets already
++	 * puts clip y = +1 in row 0 (its negative y scale), so the rectangle goes
++	 * to set_scissor_states without a flip -- and air_metal_test's scissor case is what
++	 * says so, with a rectangle off-centre in both axes.
++	 *
++	 * Metal requires the rectangle to lie inside the attachment; this library CLAMPS one
++	 * that does not rather than refusing it, and a rectangle with no area left after that
++	 * draws nothing, as Metal's does. The pass's load actions are NOT scissored -- a clear
++	 * in Metal is the whole attachment whatever rectangle the encoder has set.
++	 *
++	 * APPENDED, for the reason every field since the indexed forms is: nothing above
++	 * moves for a driver built against the shape before it. The two copies still have to
++	 * be rebuilt together; there is no size field for either to check the other's by.
++	 */
++	const unsigned *scissor;   /* NULL, or { x, y, width, height } in pixels, origin top-left, Metal's MTLScissorRect */
+ };
+ 
+ int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+--- a/tools/mesa/air/air_metal_test.c
++++ b/tools/mesa/air/air_metal_test.c
+@@ -6490,6 +6490,165 @@
+    rwa_texture_destroy(b);
+    rwa_device_close(device);
+    printf("air_metal_test: clear: %u case%s failed\n", failed, failed == 1 ? "" : "s");
++   return failed ? 1 : 0;
++}
++
++/*
++ * rwa_draw.scissor: a full-attachment quad through a rectangle, every texel read back.
++ *
++ * The attachment is 64x48, not square, and the rectangle {8, 4, 16, 12} is off-centre in both
++ * axes and not square either, so a y measured from the bottom (rows 32..43), swapped axes, or
++ * an inclusive edge are each a different set of texels and not a lucky pass.
++ *
++ * The Y DIRECTION is not taken on trust from the readback. The fragment function writes its
++ * own [[position]] out, which is Metal's window coordinate -- top left is (0.5, 0.5) by
++ * Metal's definition -- so a texel drawn at readback row r holding y = r + 0.5 says that row r
++ * IS Metal's row r, and the rectangle's rows are then checked in that same coordinate. It
++ * needs
++ *
++ *    fragment float4 f(float4 p [[position]], constant float4 &c [[buffer(0)]])
++ *    { return float4(p.x, p.y, c.z, c.w); }
++ *
++ * and the readback is rwa_texture_read with origin 0 and a packed stride, i.e. -getBytes:'s
++ * order: texel (x, y) at index y * 64 + x, row 0 first.
++ *
++ * Every case clears with the pass (MTLLoadActionClear) over an attachment pre-filled with a
++ * stale value, so a clear that was scissored leaves stale texels outside the rectangle and
++ * fails by name. The cases: the rectangle; no rectangle right after it (nothing leaks); two
++ * rectangles with no area (zero width, and x at the right edge) which draw nothing and still
++ * clear; and one past the attachment in both directions, which is clamped.
++ *
++ *   air_metal_test --draw-scissor FILE.metallib FUNCTION
++ */
++#define SC_W 64
++#define SC_H 48
++
++static bool
++scissor_case(struct rwa_render *render, struct rwa_texture *t, struct rwa_buffer *cbuf,
++             const unsigned *rect, const unsigned want[4], const char *name)
++{
++   char why[WHY] = "";
++   const float stale[4] = { 7, 7, 7, 7 }, clear[4] = { -1, -1, -1, -1 };
++   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { SC_W, SC_H, 1 };
++   static float px[SC_W * SC_H * 4];
++   for (unsigned i = 0; i < SC_W * SC_H; i++)
++      memcpy(&px[4 * i], stale, sizeof(stale));
++   bool ok = rwa_texture_write(t, 0, 0, origin, extent, px, 0, why, sizeof(why)) == 0;
++   struct rwa_texture *c[1] = { t };
++   const struct rwa_draw draw = {
++      .color = c, .color_count = 1, .clear_color = clear,
++      .fragment = { .buffers = &cbuf, .buffer_count = 1 },
++      .primitive = 4 /* MTLPrimitiveTypeTriangleStrip */,
++      .vertex_start = 0, .vertex_count = 4,
++      .scissor = rect,
++   };
++   ok = ok && rwa_render_draw(render, &draw, why, sizeof(why)) == 0;
++   ok = ok && rwa_texture_read(t, 0, 0, origin, extent, px, 0, why, sizeof(why)) == 0;
++   if (!ok) {
++      printf("air_metal_test: scissor: %s: %s\n", name, why);
++      return false;
++   }
++   /* want is { x0, y0, x1, y1 }, exclusive at the far edges, in readback rows */
++   unsigned bad = 0, drawn = 0;
++   unsigned bx0 = SC_W, by0 = SC_H, bx1 = 0, by1 = 0;
++   for (unsigned y = 0; y < SC_H; y++) {
++      for (unsigned x = 0; x < SC_W; x++) {
++         const float *p = &px[4 * (y * SC_W + x)];
++         bool in = x >= want[0] && x < want[2] && y >= want[1] && y < want[3];
++         const float inside[4] = { x + 0.5f, y + 0.5f, 0.25f, 1.0f };
++         const float *w = in ? inside : clear;
++         if (p[3] == 1.0f) {
++            drawn++;
++            bx0 = x < bx0 ? x : bx0, by0 = y < by0 ? y : by0;
++            bx1 = x + 1 > bx1 ? x + 1 : bx1, by1 = y + 1 > by1 ? y + 1 : by1;
++         }
++         if (memcmp(p, w, sizeof(inside)) != 0 && bad++ < 4)
++            printf("air_metal_test: scissor: %s: texel (%u,%u) is %g %g %g %g, wanted "
++                   "%g %g %g %g\n", name, x, y, p[0], p[1], p[2], p[3], w[0], w[1], w[2],
++                   w[3]);
++      }
++   }
++   if (drawn)
++      printf("air_metal_test: scissor: %s: %u texels drawn, x %u..%u y %u..%u (readback "
++             "row = [[position]].y - 0.5 in every one)\n", name, drawn, bx0, bx1 - 1, by0,
++             by1 - 1);
++   else
++      printf("air_metal_test: scissor: %s: no texel drawn\n", name);
++   if (bad)
++      printf("air_metal_test: scissor: %s: %u texels wrong\n", name, bad);
++   printf("air_metal_test: scissor: %-40s %s\n", name, bad ? "FAIL" : "PASS");
++   return bad == 0;
++}
++
++static int
++run_scissor(const char *path, const char *func)
++{
++   setenv("RWA_SOFTWARE", "1", 0);
++   char why[WHY] = "";
++   struct rwa_device *device = rwa_device_open(why, sizeof(why));
++   if (!device) {
++      printf("air_metal_test: rwa_device_open: %s\n", why);
++      return 1;
++   }
++   printf("air_metal_test: device is \"%s\"\n", rwa_device_name(device));
++
++   struct metallib lib = { 0 };
++   char name[256];
++   const uint8_t *bitcode = NULL;
++   size_t bitcode_size = 0;
++   if (!load_metallib(path, &lib) ||
++       !find_function(&lib, func, name, sizeof(name), &bitcode, &bitcode_size))
++      return 1;
++   struct rwa_render_shape shape = { .color_count = 1, .sample_count = 1,
++                                     .color_format = { MTL_RGBA32_FLOAT } };
++   struct rwa_render_info info = { 0 };
++   struct rwa_render *render = rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size,
++                                                 func, &shape, &info, why, sizeof(why));
++   if (!render) {
++      printf("air_metal_test: scissor: rwa_render_create: %s\n", why);
++      return 1;
++   }
++   const struct rwa_texture_shape ts = {
++      .pixel_format = MTL_RGBA32_FLOAT, .type = MTL_TEXTURE_TYPE_2D, .width = SC_W,
++      .height = SC_H, .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
++      .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
++   };
++   struct rwa_texture *t = rwa_texture_create(device, &ts, why, sizeof(why));
++   struct rwa_buffer *cbuf = rwa_buffer_create(device, 16, why, sizeof(why));
++   if (!t || !cbuf) {
++      printf("air_metal_test: scissor: %s\n", why);
++      return 1;
++   }
++   const float col[4] = { 0, 0, 0.25f, 1.0f };
++   memcpy(rwa_buffer_map(cbuf), col, sizeof(col));
++
++   unsigned failed = 0;
++   {
++      const unsigned r[4] = { 8, 4, 16, 12 }, w[4] = { 8, 4, 24, 16 };
++      failed += !scissor_case(render, t, cbuf, r, w, "{8,4,16,12} of 64x48");
++   }
++   {
++      const unsigned w[4] = { 0, 0, SC_W, SC_H };
++      failed += !scissor_case(render, t, cbuf, NULL, w, "no rectangle, after one");
++   }
++   {
++      const unsigned r[4] = { 8, 4, 0, 12 }, w[4] = { 0, 0, 0, 0 };
++      failed += !scissor_case(render, t, cbuf, r, w, "zero width");
++   }
++   {
++      const unsigned r[4] = { SC_W, 4, 5, 5 }, w[4] = { 0, 0, 0, 0 };
++      failed += !scissor_case(render, t, cbuf, r, w, "x at the right edge (clamped empty)");
++   }
++   {
++      const unsigned r[4] = { 40, 30, 1000, 0xffffffffu }, w[4] = { 40, 30, SC_W, SC_H };
++      failed += !scissor_case(render, t, cbuf, r, w, "past the attachment (clamped)");
++   }
++
++   rwa_buffer_destroy(cbuf);
++   rwa_texture_destroy(t);
++   rwa_render_destroy(render);
++   rwa_device_close(device);
++   printf("air_metal_test: scissor: %u case%s failed\n", failed, failed == 1 ? "" : "s");
+    return failed ? 1 : 0;
+ }
+ 
+@@ -6548,6 +6707,13 @@
+ 
+    if (argc >= 2 && !strcmp(argv[1], "--clear"))
+       return run_clear(argc > 3 ? argv[2] : NULL, argc > 3 ? argv[3] : NULL);
++   if (argc >= 2 && !strcmp(argv[1], "--draw-scissor")) {
++      if (argc < 4) {
++         fprintf(stderr, "usage: %s --draw-scissor FILE.metallib FUNCTION\n", argv[0]);
++         return 2;
++      }
++      return run_scissor(argv[2], argv[3]);
++   }
+    if (argc >= 2 && !strcmp(argv[1], "--draw")) {
+       if (argc < 4) {
+          fprintf(stderr, "usage: air_metal_test --draw FILE.metallib FUNCTION "
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -321,6 +321,9 @@
+ 	unsigned vertex_buffer_table_count;
+ 	const struct rwa_buffer_bind *fragment_buffer_table;
+ 	unsigned fragment_buffer_table_count;
++	/* -setScissorRect:, NULL for none: { x, y, width, height }, origin top-left. APPENDED
++	 * like everything since the indexed forms, so no field above moves. */
++	const unsigned *scissor;
+ };
+ 
+ /*
+@@ -1065,6 +1068,11 @@
+ 	unsigned stencilReference[2];
+ 	float depthRange[2];
+ 	BOOL hasDepthRange;
++	/* the scissor rectangle bound when the draw was encoded, COPIED here and not pointed
++	 * at in the encoder: the draw runs at -commit, after the encoder may have changed
++	 * it or gone. hasScissor NO is no rectangle, and so is sweetmetal_noscissor=1. */
++	unsigned scissor[4];
++	BOOL hasScissor;
+ 	unsigned primitive, vertexStart, vertexCount;
+ 	/* the index buffer of an indexed draw and the three numbers that come with it in
+ 	 * the same Metal call; indexBuffer nil is -drawPrimitives:, and then vertexCount
+@@ -1304,6 +1312,41 @@
+ }
+ 
+ /*
++ * Whether -setScissorRect: reaches the library: boot-arg sweetmetal_noscissor=1 drops every
++ * rectangle and passes NULL, which is what every draw did before rwa_draw.scissor existed;
++ * anything else (absent included) passes the encoder's rectangle. Decided once per process
++ * and said once.
++ */
++#define RW_NOSCISSOR_KEY "sweetmetal_noscissor="
++
++static bool
++rw_scissor_enabled(void)
++{
++	static dispatch_once_t once;
++	static bool enabled;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_NOSCISSOR_KEY)) != NULL;
++			     at += strlen(RW_NOSCISSOR_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		enabled = !(at != NULL && at[strlen(RW_NOSCISSOR_KEY)] == '1');
++		rw_print("scissor rectangles: %s\n", enabled ?
++			 "passed to the library (sweetmetal_noscissor=1 drops them)" :
++			 "DROPPED (forced by boot-arg sweetmetal_noscissor=1)");
++	});
++	return enabled;
++}
++
++/*
+  * The library has one Gallium pipe_context per device, and a pipe_context is single-threaded
+  * by contract; the library itself has no lock. So every call into it is made under this one
+  * process-wide recursive mutex, and -commit holds it across a command buffer's whole replay,
+@@ -4394,6 +4437,9 @@
+ 		.vertex_buffer_table_count = work->vertexBufferCount,
+ 		.fragment_buffer_table = fragment_table,
+ 		.fragment_buffer_table_count = work->count,
++		/* the work item's own copy, which lives as long as `work` does -- past this
++		 * call, which waits for the GPU */
++		.scissor = work->hasScissor ? work->scissor : NULL,
+ 	};
+ 
+ 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
+@@ -4635,6 +4681,8 @@
+ 	unsigned _stencilReference[2];
+ 	float _depthRange[2];
+ 	BOOL _hasDepthRange;
++	unsigned _scissor[4];          /* -setScissorRect:, { x, y, width, height } */
++	BOOL _hasScissor;              /* NO until one is set: the whole attachment */
+ 	id _vertexBuffers[RW_MAX_BUFFERS];
+ 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
+ 	id _fragmentBuffers[RW_MAX_BUFFERS];
+@@ -4866,7 +4914,19 @@
+ 	_depthRange[1] = (float)viewport.zfar;
+ 	_hasDepthRange = YES;
+ }
+-- (void)setScissorRect:(MTLScissorRect)rect           { (void)rect; }
++/* The scissor rectangle, encoder state that every later draw of this encoder carries until
++ * it is set again. Kept in Metal's own top-left pixels; the library clamps it to the pass.
++ * NSUInteger is 64 bits and the contract 32, so a value past UINT32_MAX is saturated: what it
++ * meant was "to the edge", and the clamp then takes it there. sweetmetal_noscissor=1 is
++ * decided at the draw (-recordDraw:), so this stays a plain store. */
++- (void)setScissorRect:(MTLScissorRect)rect
++{
++	_scissor[0] = rect.x > UINT32_MAX ? UINT32_MAX : (unsigned)rect.x;
++	_scissor[1] = rect.y > UINT32_MAX ? UINT32_MAX : (unsigned)rect.y;
++	_scissor[2] = rect.width > UINT32_MAX ? UINT32_MAX : (unsigned)rect.width;
++	_scissor[3] = rect.height > UINT32_MAX ? UINT32_MAX : (unsigned)rect.height;
++	_hasScissor = YES;
++}
+ - (void)setCullMode:(NSUInteger)mode                  { (void)mode; }
+ - (void)setFrontFacingWinding:(NSUInteger)winding     { (void)winding; }
+ - (void)setTriangleFillMode:(NSUInteger)mode          { (void)mode; }
+@@ -4965,6 +5025,10 @@
+ 	work->depthRange[0] = _depthRange[0];
+ 	work->depthRange[1] = _depthRange[1];
+ 	work->hasDepthRange = _hasDepthRange;
++	work->hasScissor = _hasScissor && rw_scissor_enabled();
++	for (unsigned i = 0; i < 4; i++) {
++		work->scissor[i] = _scissor[i];
++	}
+ 	work->primitive = (unsigned)primitive;
+ 	work->vertexStart = (unsigned)start;
+ 	work->vertexCount = (unsigned)count;
+@@ -5234,9 +5298,18 @@
+ 		[self setViewport:viewports[0]];
+ 	}
+ }
++/* One rectangle is all the contract carries (one viewport, one scissor), so the first is
++ * taken, as -setViewports:count: takes the first viewport; none leaves the current one. */
+ - (void)setScissorRects:(const MTLScissorRect *)rects count:(NSUInteger)count
+ {
+-	(void)rects; (void)count;
++	if (count > 1 && !_complained) {
++		rw_print("%lu scissor rectangles are not implemented; the first one is "
++		         "taken\n", (unsigned long)count);
++		_complained = YES;
++	}
++	if (count >= 1 && rects != NULL) {
++		[self setScissorRect:rects[0]];
++	}
+ }
+ /* MTLDepthClipModeClip is what the library's rasterizer state does (depth_clip_near and
+  * _far are both on); MTLDepthClipModeClamp, which keeps a primitive outside the depth range
