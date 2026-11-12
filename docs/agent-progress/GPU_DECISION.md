@@ -77,3 +77,18 @@ Phase 1b (2026-11-08): GPU execution still cannot be ranked. The 0139 figure is 
 1. **Done 2026-11-08:** donor `eagl.c` read at `e477291`; profile fields settled above. Nothing copied.
 2. **Measurement-only patch, not written, needs approval:** `sweetfb_ftrace=1` (default off). A kernel thread reads the fence word about every 200 us while work is outstanding (reads only: no new packets or register writes), giving each submission's real completion, plus a per-swap ring of timestamps (swap arrival, last fence, fence done, tick index, copy start/end). Ring busy is the sum of `done − max(submit, previous done)`. Separate commit.
 3. **Device, reversible (RAM boot), needs approval:** two identical 420 s runs of that kernel, `SWEETFB_HZ=60`, `sweetgpu_reboot=420 sweetgpu_swipe=60` confirmed in the payload, covering a swipe workload and a no-idle scene at 0 VA errors. Proposed: skip no-code runs first, because today's instrumentation cannot measure GPU execution.
+
+## Metal frame time, 2026-11-12 (host; existing device logs 0161sA, 0161sB, 0161a, one boot each; source reading)
+
+Verdict: **fix in place**, scheduling multiplied by cache maintenance. None of R1-R3 is shown.
+
+| Boot | Active s | Swaps | Late | Swaps/s (max) | GPU subs | Subs/swap | Bufs named/sub | Cache clean per sub | Cache CPU total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0161sA | 81 | 360 | 358 | 4.4 (10) | 35201 | 98 | 15.9 | 12.3 MB, 0.93 ms | 32.7 s of 183 s |
+| 0161sB | 40 | 136 | 134 | 3.4 (8) | 13475 | 99 | 15.6 | 11.5 MB, 0.90 ms | 12.1 s of 118 s |
+| 0161a | 162 | 550 | 548 | 3.4 (10) | 63110 | 115 | 15.8 | 11.2 MB, 0.90 ms | 56.8 s of 271 s |
+
+- Where it goes: every Metal draw and clear is its own kernel submission. `rwa_render_draw` (`air_metal.c` 7364) and the clear (6846) call `finish_or_say_why`, which is `pipe->flush` plus `fence_finish` (3088). The plug-in replays a command buffer's draws inside `-commit` (`redwoodmetal.m` 4204-4295), so a frame is about 100 flushes, each followed by a wait.
+- Each submission costs the kernel about 0.9 ms of cache cleaning, because an IOSurface (ordinary cached memory) is cleaned again when more than `GPU_PUSH_AGAIN_MS` = 4 ms has passed since its last clean (`RedwoodGPU.cpp` 190). 11-12 MB per submission is about one 1125x2436 BGRA drawable (11.0 MB). About 100 x 0.9 ms = about 90 ms of CPU per frame before any GPU time. Waiting means polling every 200 us (`GPU_ASK_AGAIN_US`).
+- Caveat: the submission counts cover the whole system (backboardd, SpringBoard, apps), so subs/swap is an upper bound for one frame. The GPU's own execution time per frame is not measured.
+- Not architectural: the interface already accepts many draws per flush (Gallium batches). The per-draw wait was put there on purpose, for error reporting (docs/air.md section 5), not because anything requires it.
