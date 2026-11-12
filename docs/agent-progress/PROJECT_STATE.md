@@ -27,7 +27,8 @@ Re-planned 2026-11-11 (full list: `METAL_FINDINGS.md` section 10; routing: `SUBA
 
 1. GPU fault then compositor crash (0160d9, `METAL_FINDINGS.md` 10 item 1b). Respring on app exit is `partially-working` with patches 0008+0009 (one boot, attribution unknown).
 2. (withdrawn) Blue tint of whites: camera artefact, not on the screen (user, 2026-11-11).
-3. Visual faults: scissor rectangle is dropped by the plug-in. Patch 0010 written, host softpipe test passes, reviewed (`experimental`, 2026-11-12); next is build, flash, A/B boot (`NEXT_PROMPT.md`). Then dotted blur, glyphs, widgets.
+3. Visual faults: patch 0010 (scissor rectangle) is on the phone, `partially-working` (0161sA/0161sB, one boot each, 2026-11-12): green fault and app-close fault gone with it, back without it; self-test 16 of 20. Left: status-bar battery icon, dotted blur, Control Centre glyphs, widgets.
+4. User order 2026-11-12: frame rate and performance first in importance (`NEXT_PROMPT.md`), then widgets and Control Centre; brightness and Wi-Fi later.
 
 Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 

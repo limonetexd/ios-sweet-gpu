@@ -33,6 +33,7 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | Metal: SpringBoard with Metal device, profile 0 | not-working | TEST_LOG 0160mh1: aborts, MPSDevice refused. Fixed by profile 1 | this commit |
 | Metal UI (compositor + SpringBoard on Metal, profile 1) | partially-working | TEST_LOG 0160vA, real device, one boot: UI renders recognisably; respring on app exit, blur pattern, low frame rate | this commit |
 | Metal self-test | 15 of 19 pass (0160vA) | TEST_LOG 0160vA and 0160vB, real device, one boot each; 12, 13, 18, 19 fail (18, 19 are test-side) | this commit |
+| Metal scissor rectangle (patch 0010) | partially-working | TEST_LOG 0161sA/0161sB, real device, one A/B pair: self-test item 20 PASS with it, FAIL without; green fault and app-close fault gone with it (user by eye) | this commit |
 | Metal per-process allow-list | experimental | works for refusal; backboardd crashes when refused (0160t1) | this commit |
 | Automated image correctness (`sweetshot`) | not-working | PNGs mostly black, ring truncates blobs, NOTES:204 | 0143 |
 | Visual correctness of UI | partially-working | user's eyes only: "looks good" NOTES:207, "still lags/glitches" NOTES:448. No reference image | 0143 |
