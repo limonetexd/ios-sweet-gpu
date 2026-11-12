@@ -215,3 +215,13 @@ Status: scissor rectangle (0010) `partially-working` (real device, one A/B pair,
 | Date | Build | Procedure | Expected | Actual | Artifacts |
 | --- | --- | --- | --- | --- | --- |
 | 2026-11-12 | logs of 0161sA, 0161sB, 0161a | `python3 -I tools/sweet-fps-summary.py logs/xnu-TAG.txt`; per-second `SWEET FPS:` and `RedwoodGPU:` lines summed by a scratch parser (not in the repository) | Where the frame time goes | subs/swap 98 / 99 / 115; swaps/s while active 4.4 / 3.4 / 3.4 (max 10); late 358/360, 134/136, 548/550; cache clean 0.93 / 0.90 / 0.90 ms and 11-12 MB per submission (32.7 / 12.1 / 56.8 s total); GPU wait 0.72-0.81 ms mean; submit-to-done 5.0-5.5 ms mean. One boot each; this is not a frame-rate claim | `GPU_DECISION.md` "Metal frame time" |
+
+## Patch 0011, one wait per command buffer, 2026-11-12 (host and build only; nothing run on the device)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-12 | 0011 on 0001-0010 in `metal-build/donor`, host softpipe | copy `air_metal{.c,.h,_test.c}` to `host/mesa-25.0.7/src/compiler/air/`, `ninja ... air_metal_test`; `air_metal_test --draw-deferred dw.metallib` (`dw.metal`: `fs_pos`, `fs_color`, `fs_copy` = `t.read(p.xy) + (0,0,.5,0)`; scratch, not in git) | Clear + 64 scissored column draws + one draw reading that target, per draw and deferred, same bytes | per draw PASS, deferred PASS, same bytes PASS, NULL device refused; 0 checks failed. Regression: `--draw-scissor` 0 failed, `--clear` 0 failed. Softpipe runs work at flush, so this proves order and result without the waits, not GPU overlap. No negative control | scratchpad |
+| 2026-11-12 | same, iOS | `bash tools/metal-build.sh ios`, `driver`, `test`, `payload` (order matters: `driver` empties `obj/`) | builds, no errors | `RedwoodMetal` 62645657..., `libredwoodair.dylib` 1ba7090c... (exports `rwa_set_deferred_wait`), `metaltest` 142d6a49... (item 21). `metaltest.m` syntax check clean | `metal-build/pay` |
+| 2026-11-12 | kernel 0161 | `sweet-gpu-image.sh ... 0161wA "<0161sA args>"`, 0161wB the same plus `sweetmetal_drawwait=1` | `RAMDISK MATCH` | both MATCH; wA b4203b3a..., wB e6ab6e09...; `sweetgpu_reboot=300` in both, `sweetmetal_drawwait=1` only in wB | `shim/out/` |
+
+Status: 0011 `experimental`. Reviewed by the lead only (the user asked for no agents this time); one change from the review: the boot-arg is read only once a device exists. Snapshot before the flash: `root/work1-pre0011.raw` (APFS clone of `work1.raw` = 0001-0010). Not done: the device A/B.

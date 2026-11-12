@@ -1,0 +1,356 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -116,6 +116,14 @@
+     * construction: a buffer joins only when something is encoded into it.
+     */
+    struct rwa_buffer *encoded;
++
++   /* Whether a draw or a clear returns without waiting for the GPU (rwa_set_deferred_wait).
++    * Off, each waits for itself, as before 0011. On, the caller owes one rwa_finish before
++    * it reads, rewrites or gives back anything those draws named; the plug-in pays it once
++    * at the end of every -commit, which put about 100 waits and 100 cache cleans of the
++    * drawable into each frame when it was per draw (GPU_DECISION.md "Metal frame time").
++    */
++   bool deferred_wait;
+ };
+ 
+ /*
+@@ -3941,6 +3949,15 @@
+    return finish_or_say_why(device, false, "work", why, why_size);
+ }
+ 
++int
++rwa_set_deferred_wait(struct rwa_device *device, int on)
++{
++   if (!device)
++      return -1;
++   device->deferred_wait = on != 0;
++   return 0;
++}
++
+ /*
+  * ---------------------------------------------------------------------------------------
+  * Drawing.
+@@ -6842,8 +6859,10 @@
+       return -1;
+    clear_pass(pipe, surf, color_count, clear_colors, clear_color_mask, depth, clear_depth,
+               clear_stencil, w, h);
+-   /* Waited for as a draw is: a clear that never landed must not read as a result. */
+-   int rc = finish_or_say_why(device, true, "clear", why, why_size);
++   /* Waited for as a draw is: a clear that never landed must not read as a result.
++    * Deferred like a draw's when the caller asked (rwa_set_deferred_wait). */
++   int rc = device->deferred_wait ? 0
++                                  : finish_or_say_why(device, true, "clear", why, why_size);
+    release_pass_framebuffer(pipe, surf, color_count, zsurf);
+    return rc;
+ }
+@@ -7361,7 +7380,7 @@
+     * come back (docs/air.md section 5). A link error between the stages, which ir3 only
+     * finds now, surfaces as this not finishing.
+     */
+-   rc = finish_or_say_why(device, true, "draw", why, why_size);
++   rc = device->deferred_wait ? 0 : finish_or_say_why(device, true, "draw", why, why_size);
+ 
+ unbind:
+    unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -577,6 +577,14 @@
+ 
+ /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
+ int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
++
++/* Whether rwa_render_draw and rwa_render_clear wait for the GPU themselves (off, the
++ * default) or return once the work is queued (on). With it on, a failure on the GPU is
++ * reported by the next rwa_finish rather than by the draw, and the caller must call
++ * rwa_finish before the CPU reads, rewrites or destroys anything those draws named.
++ * Dispatches always wait. 0, or -1 for no device. New in 0011: absent in older libraries.
++ */
++int rwa_set_deferred_wait(struct rwa_device *device, int on);
+ 
+ /*
+  * ---------------------------------------------------------------------------------------
+--- a/tools/mesa/air/air_metal_test.c
++++ b/tools/mesa/air/air_metal_test.c
+@@ -6649,6 +6649,153 @@
+    rwa_render_destroy(render);
+    rwa_device_close(device);
+    printf("air_metal_test: scissor: %u case%s failed\n", failed, failed == 1 ? "" : "s");
++   return failed ? 1 : 0;
++}
++
++/*
++ * ONE WAIT PER COMMAND BUFFER (0011). The same sequence twice, once with every draw and clear
++ * waiting for itself and once with rwa_set_deferred_wait on and a single rwa_finish at the
++ * end, as the plug-in's -commit does: a clear of A, 64 draws each scissored to one column of
++ * A's top 40 rows, then a draw into B that reads A ([[texture(0)]], read()). Both runs must
++ * give the expected picture and the same bytes. On softpipe a flush runs at once, so this
++ * proves order and result with the waits taken out, not that the GPU overlapped anything.
++ *
++ *   air_metal_test --draw-deferred FILE.metallib   (with fs_pos and fs_copy in it)
++ */
++#define DW_W 64
++#define DW_H 48
++#define DW_ROWS 40
++
++static struct rwa_render *
++dw_render(struct rwa_device *device, struct metallib *lib, const char *func)
++{
++   char why[WHY] = "", name[256];
++   const uint8_t *bitcode = NULL;
++   size_t bitcode_size = 0;
++   if (!find_function(lib, func, name, sizeof(name), &bitcode, &bitcode_size))
++      return NULL;
++   struct rwa_render_shape shape = { .color_count = 1, .sample_count = 1,
++                                     .color_format = { MTL_RGBA32_FLOAT } };
++   struct rwa_render_info info = { 0 };
++   struct rwa_render *r = rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size,
++                                            func, &shape, &info, why, sizeof(why));
++   if (!r)
++      printf("air_metal_test: deferred: rwa_render_create %s: %s\n", func, why);
++   return r;
++}
++
++static bool
++dw_run(struct rwa_device *device, struct rwa_render *pos, struct rwa_render *copy,
++       struct rwa_texture *a, struct rwa_texture *b, struct rwa_buffer *cbuf, int deferred,
++       float *outa, float *outb)
++{
++   char why[WHY] = "";
++   const float stale[4] = { 7, 7, 7, 7 }, clear[4] = { -1, -1, -1, -1 };
++   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { DW_W, DW_H, 1 };
++   const char *mode = deferred ? "deferred" : "per draw";
++   for (unsigned i = 0; i < DW_W * DW_H; i++)
++      memcpy(&outa[4 * i], stale, sizeof(stale));
++   bool ok = rwa_set_deferred_wait(device, deferred) == 0 &&
++             rwa_texture_write(a, 0, 0, origin, extent, outa, 0, why, sizeof(why)) == 0 &&
++             rwa_texture_write(b, 0, 0, origin, extent, outa, 0, why, sizeof(why)) == 0;
++   struct rwa_texture *ca[1] = { a }, *cb[1] = { b };
++   ok = ok && rwa_render_clear(device, ca, 1, clear, 1u, NULL, NULL, NULL, why,
++                               sizeof(why)) == 0;
++   for (unsigned x = 0; ok && x < DW_W; x++) {
++      const unsigned rect[4] = { x, 0, 1, DW_ROWS };
++      const struct rwa_draw draw = {
++         .color = ca, .color_count = 1,
++         .fragment = { .buffers = &cbuf, .buffer_count = 1 },
++         .primitive = 4 /* MTLPrimitiveTypeTriangleStrip */,
++         .vertex_start = 0, .vertex_count = 4, .scissor = rect,
++      };
++      ok = rwa_render_draw(pos, &draw, why, sizeof(why)) == 0;
++   }
++   const struct rwa_draw rd = {
++      .color = cb, .color_count = 1,
++      .fragment = { .textures = ca, .texture_count = 1 },
++      .primitive = 4, .vertex_start = 0, .vertex_count = 4,
++   };
++   ok = ok && rwa_render_draw(copy, &rd, why, sizeof(why)) == 0;
++   ok = ok && rwa_finish(device, why, sizeof(why)) == 0;
++   ok = ok && rwa_set_deferred_wait(device, 0) == 0;
++   ok = ok && rwa_texture_read(a, 0, 0, origin, extent, outa, 0, why, sizeof(why)) == 0 &&
++        rwa_texture_read(b, 0, 0, origin, extent, outb, 0, why, sizeof(why)) == 0;
++   if (!ok) {
++      printf("air_metal_test: deferred: %s: %s\n", mode, why);
++      return false;
++   }
++   unsigned bad = 0;
++   for (unsigned y = 0; y < DW_H; y++) {
++      for (unsigned x = 0; x < DW_W; x++) {
++         const float drawn[4] = { x + 0.5f, y + 0.5f, 0.25f, 1.0f };
++         const float *wa = y < DW_ROWS ? drawn : clear;
++         const float wb[4] = { wa[0], wa[1], wa[2] + 0.5f, wa[3] };
++         const float *pa = &outa[4 * (y * DW_W + x)], *pb = &outb[4 * (y * DW_W + x)];
++         if (memcmp(pa, wa, sizeof(drawn)) != 0 && bad++ < 4)
++            printf("air_metal_test: deferred: %s: A (%u,%u) is %g %g %g %g, wanted %g %g "
++                   "%g %g\n", mode, x, y, pa[0], pa[1], pa[2], pa[3], wa[0], wa[1], wa[2],
++                   wa[3]);
++         if (memcmp(pb, wb, sizeof(wb)) != 0 && bad++ < 4)
++            printf("air_metal_test: deferred: %s: B (%u,%u) is %g %g %g %g, wanted %g %g "
++                   "%g %g\n", mode, x, y, pb[0], pb[1], pb[2], pb[3], wb[0], wb[1], wb[2],
++                   wb[3]);
++      }
++   }
++   printf("air_metal_test: deferred: %-9s clear + 64 column draws + 1 draw reading them, "
++          "%u texels wrong: %s\n", mode, bad, bad ? "FAIL" : "PASS");
++   return bad == 0;
++}
++
++static int
++run_deferred(const char *path)
++{
++   setenv("RWA_SOFTWARE", "1", 0);
++   char why[WHY] = "";
++   struct rwa_device *device = rwa_device_open(why, sizeof(why));
++   if (!device) {
++      printf("air_metal_test: rwa_device_open: %s\n", why);
++      return 1;
++   }
++   printf("air_metal_test: device is \"%s\"\n", rwa_device_name(device));
++   struct metallib lib = { 0 };
++   if (!load_metallib(path, &lib))
++      return 1;
++   struct rwa_render *pos = dw_render(device, &lib, "fs_pos");
++   struct rwa_render *copy = dw_render(device, &lib, "fs_copy");
++   const struct rwa_texture_shape ts = {
++      .pixel_format = MTL_RGBA32_FLOAT, .type = MTL_TEXTURE_TYPE_2D, .width = DW_W,
++      .height = DW_H, .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
++      .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
++   };
++   struct rwa_texture *a = rwa_texture_create(device, &ts, why, sizeof(why));
++   struct rwa_texture *b = a ? rwa_texture_create(device, &ts, why, sizeof(why)) : NULL;
++   struct rwa_buffer *cbuf = rwa_buffer_create(device, 16, why, sizeof(why));
++   if (!pos || !copy || !a || !b || !cbuf) {
++      printf("air_metal_test: deferred: %s\n", why);
++      return 1;
++   }
++   const float col[4] = { 0, 0, 0.25f, 1.0f };
++   memcpy(rwa_buffer_map(cbuf), col, sizeof(col));
++
++   static float a0[DW_W * DW_H * 4], b0[DW_W * DW_H * 4];
++   static float a1[DW_W * DW_H * 4], b1[DW_W * DW_H * 4];
++   unsigned failed = 0;
++   failed += !dw_run(device, pos, copy, a, b, cbuf, 0, a0, b0);
++   failed += !dw_run(device, pos, copy, a, b, cbuf, 1, a1, b1);
++   bool same = memcmp(a0, a1, sizeof(a0)) == 0 && memcmp(b0, b1, sizeof(b0)) == 0;
++   printf("air_metal_test: deferred: per draw and deferred give the same bytes: %s\n",
++          same ? "PASS" : "FAIL");
++   failed += !same;
++   failed += rwa_set_deferred_wait(NULL, 1) == -1 ? 0 : 1;   /* no device is refused */
++
++   rwa_buffer_destroy(cbuf);
++   rwa_texture_destroy(b);
++   rwa_texture_destroy(a);
++   rwa_render_destroy(copy);
++   rwa_render_destroy(pos);
++   rwa_device_close(device);
++   printf("air_metal_test: deferred: %u check%s failed\n", failed, failed == 1 ? "" : "s");
+    return failed ? 1 : 0;
+ }
+ 
+@@ -6707,6 +6854,13 @@
+ 
+    if (argc >= 2 && !strcmp(argv[1], "--clear"))
+       return run_clear(argc > 3 ? argv[2] : NULL, argc > 3 ? argv[3] : NULL);
++   if (argc >= 2 && !strcmp(argv[1], "--draw-deferred")) {
++      if (argc != 3) {
++         fprintf(stderr, "usage: %s --draw-deferred FILE.metallib\n", argv[0]);
++         return 2;
++      }
++      return run_deferred(argv[2]);
++   }
+    if (argc >= 2 && !strcmp(argv[1], "--draw-scissor")) {
+       if (argc < 4) {
+          fprintf(stderr, "usage: %s --draw-scissor FILE.metallib FUNCTION\n", argv[0]);
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -546,6 +546,7 @@
+ 							  char *, size_t);
+ 	void (*depth_stencil_destroy)(struct rwa_depth_stencil *);
+ 	int (*finish)(struct rwa_device *, char *, size_t);
++	int (*set_deferred_wait)(struct rwa_device *, int);   /* 0011; absent in older ones */
+ } mesa;
+ 
+ /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
+@@ -608,6 +609,9 @@
+ 	*(void **)&mesa.depth_stencil_create = dlsym(mesa.handle, "rwa_depth_stencil_create");
+ 	*(void **)&mesa.depth_stencil_destroy = dlsym(mesa.handle, "rwa_depth_stencil_destroy");
+ 	*(void **)&mesa.finish = dlsym(mesa.handle, "rwa_finish");
++	/* One wait per command buffer (0011): absent in an older library, and then every draw
++	 * and clear waits for itself as before. */
++	*(void **)&mesa.set_deferred_wait = dlsym(mesa.handle, "rwa_set_deferred_wait");
+ 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
+ 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
+ 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
+@@ -1347,6 +1351,45 @@
+ }
+ 
+ /*
++ * Whether -commit waits once for all of its draws and clears (0011) or the library waits after
++ * each one: boot-arg sweetmetal_drawwait=1 keeps the wait per draw, anything else (absent
++ * included) waits once per command buffer. Per draw, a frame was about 100 submissions and
++ * 100 cache cleans of the drawable (GPU_DECISION.md "Metal frame time", 0161sA/sB/a).
++ * Decided once per process and said once; a library without rwa_set_deferred_wait is the
++ * per-draw path whatever the boot-arg says.
++ */
++#define RW_DRAWWAIT_KEY "sweetmetal_drawwait="
++
++static bool
++rw_wait_per_commit(void)
++{
++	static dispatch_once_t once;
++	static bool enabled;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_DRAWWAIT_KEY)) != NULL;
++			     at += strlen(RW_DRAWWAIT_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		bool forced = at != NULL && at[strlen(RW_DRAWWAIT_KEY)] == '1';
++		enabled = !forced && mesa.set_deferred_wait != NULL && mesa.finish != NULL;
++		rw_print("GPU waits: %s\n", enabled ?
++			 "one per command buffer (sweetmetal_drawwait=1 waits per draw)" :
++			 forced ? "per draw (forced by boot-arg sweetmetal_drawwait=1)" :
++				  "per draw (this library has no rwa_set_deferred_wait)");
++	});
++	return enabled;
++}
++
++/*
+  * The library has one Gallium pipe_context per device, and a pipe_context is single-threaded
+  * by contract; the library itself has no lock. So every call into it is made under this one
+  * process-wide recursive mutex, and -commit holds it across a command buffer's whole replay,
+@@ -4212,12 +4255,24 @@
+ 	 * rwa_render_draw at once). Released at `done:`, the only way out, before anything
+ 	 * below can call a handler or give a slot back. */
+ 	rw_lib_lock();
++	/* 0011: the draws and clears below queue without waiting, and the one wait is paid
++	 * below `done:` while the lock is still held, before anything they named is let go
++	 * (0007's order). Set per commit because the device is shared and the setting is the
++	 * library's; nothing else runs on it while the lock is held. */
++	struct rwa_device *device = [[_queue device] mesaDevice];
++	bool once = device != NULL && rw_wait_per_commit();
++	bool queued = false;
++	if (once) {
++		mesa.set_deferred_wait(device, 1);
++	}
+ 	for (RedwoodMetalWork *work in _work) {
+ 		if (work->clearOnly) {
++			queued = true;
+ 			[self runClear:work why:why size:sizeof(why)];
+ 			continue;
+ 		}
+ 		if (work->render != nil) {
++			queued = true;
+ 			if (![self runDraw:work why:why size:sizeof(why)]) {
+ 				goto done;
+ 			}
+@@ -4277,6 +4332,22 @@
+ 	}
+ 	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
+ done:
++	if (once) {
++		/* Paid on every way out, a failed draw included: the draws before it are queued
++		 * and name what _work holds. A GPU failure here fails the command buffer, with
++		 * the library's sentence, as a failed draw did when each waited for itself. */
++		mesa.set_deferred_wait(device, 0);
++		if (queued) {
++			char late[512] = { 0 };
++
++			if (mesa.finish(device, late, sizeof(late)) != 0 &&
++			    _status != RW_CB_ERROR) {
++				rw_print("THE GPU DID NOT FINISH this command buffer's draws: %s\n",
++					 late);
++				[self failWith:late];
++			}
++		}
++	}
+ 	rw_lib_unlock();
+ 	/* What the work named is let go here, on the thread that committed: every item has
+ 	 * run and been waited for (or was abandoned by a failure), so nothing below needs

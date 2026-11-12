@@ -1037,6 +1037,61 @@ t20(void)
 	return R_PASS;
 }
 
+/*
+ * 21: one command buffer, one pass, W draws, each scissored to its own column and coloured by
+ * its own buffer, which only the recorded work holds once draw() returns. Under 0011 the
+ * plug-in waits once at the end of -commit, so every buffer must outlive every queued draw
+ * (0005/0007 retain rules) and each draw must read its own colour. The time is commit to
+ * completed; compare it with a sweetmetal_drawwait=1 boot (one wait per draw), which must
+ * pass too.
+ */
+static int
+t21(void)
+{
+	if (!g_q) {
+		return skip("no queue");
+	}
+	id<MTLRenderPipelineState> p = makePipe(@"fs_color", MTLPixelFormatInvalid, NO);
+	if (!p) {
+		return g_pr;
+	}
+	id<MTLTexture> t = newTarget();
+	id<MTLCommandBuffer> cb = t ? [g_q commandBuffer] : nil;
+	id<MTLRenderCommandEncoder> e = cb ? beginPass(cb, t, MTLClearColorMake(0, 0, 1, 1), nil) : nil;
+	if (!e) {
+		return fail("render encoder nil");
+	}
+	const float even[4] = { 1.0f, 0.5f, 0.25f, 1.0f }, odd[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+	[e setRenderPipelineState:p];
+	for (int x = 0; x < W; x++) {
+		const MTLScissorRect sr = { (NSUInteger)x, 0, 1, H / 2 };
+		[e setScissorRect:sr];
+		if (!draw(e, kQuad, 4, MTLPrimitiveTypeTriangleStrip, (x & 1) ? odd : even, 0.0f)) {
+			return R_FAIL;
+		}
+	}
+	[e endEncoding];
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	if (!finish(cb, "64 draws")) {
+		return R_FAIL;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+	static uint8_t px[W * H * 4];
+	readTex(t, px, W, H);
+	for (int y = 0; y < H; y++) {
+		for (int x = 0; x < W; x++) {
+			const float *c = y < H / 2 ? ((x & 1) ? odd : even) : NULL;
+			if (!(c ? probe(px, W, x, y, c[0], c[1], c[2], c[3]) : probe(px, W, x, y, 0, 0, 1, 1))) {
+				return fail("wrong at (%d,%d) after %d draws in one command buffer", x, y, W);
+			}
+		}
+	}
+	note("%d draws in one command buffer, own colour each, commit to completed %.2f ms", W, ms);
+	return R_PASS;
+}
+
 typedef struct { const char *name; int (*fn)(void); unsigned timeout; } Test;
 
 int
@@ -1058,6 +1113,7 @@ main(int argc, char **argv)
 		{ "blit mipmaps+tex2buf", t13, 10 }, { "compute", t14, 10 }, { "iosurface texture", t15, 10 },
 		{ "100 passes", t16, 30 }, { "completion handler+GPU times", t17, 10 },
 		{ "CA quad lph", t18, 30 }, { "CA quad lpf", t19, 30 }, { "scissor rect", t20, 10 },
+		{ "64 draws, one commit", t21, 10 },
 	};
 	int counts[3] = { 0, 0, 0 };
 	int tmo_in_row = 0;

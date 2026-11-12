@@ -1,20 +1,20 @@
 > State 2026-11-12 (device unless noted):
-> - Phone root = `work1.raw` + payload 0001-0010. Rollback images in `~/Developer/ios-sweet-work/root/`: `work1-pre0010.raw` (0001-0009), `work1-pre0008.raw`. Phone left in fastboot; no daemon or boot test running.
-> - 0010 scissor: `partially-working` (0161sA/sB, one boot each). Self-test 16 of 20. Kernel 0161 stays in every image; after any boot, `rg 'SMMU gfsr|fault address' logs/xnu-TAG.txt` first.
-> - Frame time measured (host, 3 existing logs, `GPU_DECISION.md` "Metal frame time"): about 100 submissions per swap, 3-4 swaps/s, each submission about 0.9 ms of kernel cache cleaning (one drawable, about 11 MB). Cause: `finish_or_say_why` after every draw and clear in `air_metal.c` (7364, 6846). Verdict: fix in place, no R1-R3.
-> - Builds: `bash tools/metal-build.sh ios|driver|test|payload` (tree `~/Developer/ios-sweet-work/metal-build/donor`, holds 0001-0010). Images need `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH` and `RAMDISK MATCH`. The user runs `tools/metal-flash-test.sh` with `!`; the agent runs `tools/sweet-boot-test.sh`.
+> - Phone root = `work1.raw` + payload 0001-0010; left in fastboot; no daemon or boot test running. Snapshots in `~/Developer/ios-sweet-work/root/`: `work1-pre0011.raw` (= 0001-0010, APFS clone), `work1-pre0010.raw`, `work1-pre0008.raw`.
+> - Patch 0011 (one GPU wait per command buffer, `userland/metal/0011-one-wait-per-commit.patch`): `experimental`. Host softpipe PASS, built for iOS; payload ready in `~/Developer/ios-sweet-work/metal-build/pay` (`RedwoodMetal` 62645657..., `libredwoodair.dylib` 1ba7090c..., `metaltest` 142d6a49... with item 21). Old path: `sweetmetal_drawwait=1`.
+> - Images built, `RAMDISK MATCH`: `shim/out/shim-boot-0161wA.img` (b4203b3a..., 0011 on) and `shim-boot-0161wB.img` (e6ab6e09..., `sweetmetal_drawwait=1`), kernel 0161, `sweetgpu_reboot=300`.
+> - Baseline, one boot each (`GPU_DECISION.md` "Metal frame time"): about 100 submissions per swap, 3-4 swaps/s, 0.9 ms of cache cleaning per submission.
 > - Budget: Fable weekly allowance used up until Nov 15 19:00 Europe/Madrid; check the meter first.
 
-# Phase: patch 0011, one wait per command buffer (host first)
+# Phase: 0011 on the device, A/B (one boot each)
 
-Read `CLAUDE.md`, `GPU_DECISION.md` "Metal frame time", `METAL_FINDINGS.md` section 10 item 6. Plan in ten lines, wait for go-ahead. Writer: `opus-impl` (library + plug-in = one subsystem, one writer); review: `reviewer`.
+Read `CLAUDE.md`, then the last section of `TEST_LOG.md`. Plan in ten lines, wait for go-ahead.
 
-Spec 0011 (`userland/metal/0011-one-wait-per-commit.patch`):
-1. Library (`tools/mesa/air/air_metal.c`, `air_metal.h`): add `int rwa_set_deferred_wait(struct rwa_device *, bool)`. When it is on, `rwa_render_draw` and the clear path skip `finish_or_say_why` (no flush, no wait). Dispatch still waits. Default off, so existing callers (`picture_host.c`, `air_metal_test.c`) are unchanged.
-2. Plug-in (`userland/src/redwoodmetal.m`): `dlsym` the call (absent means the old path). In `-commit`, inside the 0009 lock and before `done:`, call `mesa.finish` once if any draw or clear ran. A failure there sets `_status = RW_CB_ERROR` and `_error` with its `why`. A dispatch in the same command buffer stays as it is, since it flushes and waits for everything queued before it. `_work` is still released after `done:` (0007 order kept).
-3. Boot-arg `sweetmetal_drawwait=1` keeps the per-draw wait; one log line per process saying which mode is on (as 0009 and 0010 do).
-4. Host test (softpipe, `air_metal_test.c`): with deferred waits, 64 draws to one target plus a draw that samples a texture rendered earlier in the same batch, then one `rwa_finish`. The pixels must equal the per-draw-wait run.
-5. Self-test item 21 (`metaltest`): one command buffer, 64 quads, check pixels; print the commit time in both modes.
-6. Device A/B after host pass and review (snapshot-first: `userdata` flash, snapshot `work1-pre0011.raw`): 0161wA (new) and 0161wB (`sweetmetal_drawwait=1`), same 420 s use. Compare subs/swap, swaps/s, cache CPU s, late swaps, SMMU lines. One boot each is not a frame rate.
+1. Rung snapshot-first (`userdata` flash; snapshot exists). The user runs: `! tools/metal-flash-test.sh ~/Developer/ios-sweet-work/root/work1.raw shim/out/shim-boot-0161wA.img 0161wA 420`, then uses the phone the same way as in 0161sA (home swipes, open and close Settings, Control Centre).
+2. The agent runs `bash tools/sweet-boot-test.sh shim/out/shim-boot-0161wB.img 0161wB 420` (RAM boot, same root); the user uses the phone the same way.
+3. After each boot, first `rg 'SMMU gfsr|fault address|THE GPU DID NOT FINISH' logs/xnu-TAG.txt`, then `rg 'GPU waits:' logs/xnu-TAG.txt` (wA: "one per command buffer", wB: "forced by boot-arg").
+4. Compare with `tools/sweet-fps-summary.py` and the per-second parser (the parser is not in git; add it to `tools/` as a host tool if it is used again): subs/swap, swaps/s while active, late swaps, cache CPU s, GPU wait mean. Self-test: wA 17 of 21 expected (21 PASS, 12/13/18/19 FAIL as before); wB 21 must also PASS. Item 21's commit-to-completed time in A against B.
+5. Pass means: no new fault class, subs/swap down by about 10x or more in wA, and swaps/s up. One boot each is not a frame rate; any rate is reported as one boot.
+6. If wA is worse or faults: roll back is `sweetmetal_drawwait=1` (wB image) with no reflash; the root snapshot is only needed to drop 0011's files.
+7. Record in `TEST_LOG.md`, `METAL_FINDINGS.md` 10 item 6, `FEATURE_MATRIX.md`; write the next prompt. The next candidate after this: the kernel's surface clean every 4 ms (`GPU_PUSH_AGAIN_MS`), measured first.
 
-Risk to watch: more draws per batch moves freedreno from sysmem to GMEM tiling (a full-screen load and store once per flush); item 1b (SMMU fault) could show up differently. Not in this phase: kernel `GPU_PUSH_AGAIN_MS` policy (the second candidate, after 0011 is measured), widgets, Control Centre, masks, battery icon.
+Not in this phase: widgets, Control Centre glyphs, masks, battery icon, brightness, Wi-Fi.
