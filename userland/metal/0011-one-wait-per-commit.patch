@@ -31,7 +31,28 @@
  /*
   * ---------------------------------------------------------------------------------------
   * Drawing.
-@@ -6842,8 +6859,10 @@
+@@ -6675,11 +6692,16 @@
+                          unsigned color_count, struct pipe_surface *zsurf)
+ {
+    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
++   /* Dropped by reference, not destroyed: a batch that has not been flushed yet holds its
++    * own reference to these surfaces (util_copy_framebuffer_state in fd_batch), and with
++    * rwa_set_deferred_wait on that batch is flushed later, in rwa_finish. surface_destroy
++    * here freed them under it (0161wA: backboardd sig 11 in emit_blit <- fd6_emit_tile_init
++    * <- rwa_finish, every boot of backboardd). Waiting per draw, the count is 1 and this
++    * is the same as before.
++    */
+    for (unsigned i = 0; i < color_count; i++)
+-      if (surf[i])
+-         pipe->surface_destroy(pipe, surf[i]);
+-   if (zsurf)
+-      pipe->surface_destroy(pipe, zsurf);
++      pipe_surface_reference(&surf[i], NULL);
++   pipe_surface_reference(&zsurf, NULL);
+ }
+ 
+ /*
+@@ -6842,8 +6864,10 @@
        return -1;
     clear_pass(pipe, surf, color_count, clear_colors, clear_color_mask, depth, clear_depth,
                clear_stencil, w, h);
@@ -44,7 +65,7 @@
     release_pass_framebuffer(pipe, surf, color_count, zsurf);
     return rc;
  }
-@@ -7361,7 +7380,7 @@
+@@ -7361,7 +7385,7 @@
      * come back (docs/air.md section 5). A link error between the stages, which ir3 only
      * finds now, surfaces as this not finishing.
      */

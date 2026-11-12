@@ -225,3 +225,11 @@ Status: scissor rectangle (0010) `partially-working` (real device, one A/B pair,
 | 2026-11-12 | kernel 0161 | `sweet-gpu-image.sh ... 0161wA "<0161sA args>"`, 0161wB the same plus `sweetmetal_drawwait=1` | `RAMDISK MATCH` | both MATCH; wA b4203b3a..., wB e6ab6e09...; `sweetgpu_reboot=300` in both, `sweetmetal_drawwait=1` only in wB | `shim/out/` |
 
 Status: 0011 `experimental`. Reviewed by the lead only (the user asked for no agents this time); one change from the review: the boot-arg is read only once a device exists. Snapshot before the flash: `root/work1-pre0011.raw` (APFS clone of `work1.raw` = 0001-0010). Not done: the device A/B.
+
+## Patch 0011 on the device, first boot 0161wA, 2026-11-13 (real device; FAILED)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | `shim-boot-0161wA.img` (b4203b3a...), root `work1.raw` + payload 0001-0011 (library 1ba7090c...), `userdata` flashed by the user (snapshot `work1-pre0011.raw`) | `tools/metal-flash-test.sh ... 0161wA 420` (user) | `GPU waits: one per command buffer`; no new fault | Mode line present. backboardd crashed 27 times, sig 11 every time, so no UI (boot-loop; the user saw the console only). Symbolized (`atos`, ios build): `emit_blit<6>+136` <- `fd6_emit_tile_init<6>+536` <- `fd_gmem_render_tiles+904` <- `fd_batch_flush` <- `fd_context_flush` <- `rwa_finish+56` <- `-[RedwoodMetalCommandBuffer commit]`. metaltest: 05 crash, 08/09 timeout, done 6 passed 3 failed. No `SMMU gfsr` checked yet in detail. Phone returned to fastboot by `sweetgpu_reboot` | `logs/xnu-0161wA.txt`, user photo `IMG_1460.jpeg` |
+
+Cause (source reading, consistent with the trace): `release_pass_framebuffer` (`air_metal.c`) freed each draw's `pipe_surface` with `surface_destroy`, ignoring the reference the unflushed freedreno batch holds (`util_copy_framebuffer_state`). Waiting per draw hid it: the batch was already flushed. The tile pass at the deferred flush then read freed surfaces. Fix in 0011: release with `pipe_surface_reference(&s, NULL)`. Host tests pass again (deferred, scissor, clear), but softpipe cannot show this defect: no host test covers it. Rebuilt: library 3560a9da..., plug-in 62645657... and `metaltest` 142d6a49... unchanged. The 0161wB image (`sweetmetal_drawwait=1`) is safe with either library (per-draw wait).
