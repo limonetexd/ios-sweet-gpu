@@ -32,6 +32,7 @@ Fidelity is the real device unless stated. Commit = the kernel/image the observa
 | Metal | partially-working | See the Metal rows below. Host: donor driver cross-builds, 135/141 QuartzCore shaders compile for A618 | this commit |
 | Metal: SpringBoard with Metal device, profile 0 | not-working | TEST_LOG 0160mh1: aborts, MPSDevice refused. Fixed by profile 1 | this commit |
 | Metal UI (compositor + SpringBoard on Metal, profile 1) | partially-working | TEST_LOG 0160vA, real device, one boot: UI renders recognisably; respring on app exit, blur pattern, low frame rate | this commit |
+| Metal: one GPU wait per command buffer (0011) | partially-working | TEST_LOG 0161wA2, real device, one boot: 7.3 subs/swap (was 98), cache cost 1.9 s/76 s; frame rate not better by eye; submit-to-done now about 80 ms | 6e45b37 |
 | Metal self-test | 15 of 19 pass (0160vA) | TEST_LOG 0160vA and 0160vB, real device, one boot each; 12, 13, 18, 19 fail (18, 19 are test-side) | this commit |
 | Metal scissor rectangle (patch 0010) | partially-working | TEST_LOG 0161sA/0161sB, real device, one A/B pair: self-test item 20 PASS with it, FAIL without; green fault and app-close fault gone with it (user by eye) | this commit |
 | Metal per-process allow-list | experimental | works for refusal; backboardd crashes when refused (0160t1) | this commit |
