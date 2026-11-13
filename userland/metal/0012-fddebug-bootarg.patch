@@ -1,0 +1,74 @@
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -1387,6 +1387,63 @@
+ 				  "per draw (this library has no rwa_set_deferred_wait)");
+ 	});
+ 	return enabled;
++}
++
++/*
++ * 0012: boot-arg sweetmetal_fddebug=<word[,word]> becomes FD_MESA_DEBUG in this process, so one
++ * boot can run freedreno's existing alternatives (sysmem, gmem, nobin: freedreno_screen.c)
++ * against the default without another library. Mesa reads the variable once, in
++ * fd_screen_create, so this runs before the first rwa_device_open and never again. The value
++ * is taken only if it is 1 to 63 characters of [a-z,], and then replaces any FD_MESA_DEBUG
++ * already in the environment; absent (or boot-args too long to read), nothing is set or said.
++ */
++#define RW_FDDEBUG_KEY "sweetmetal_fddebug="
++#define RW_FDDEBUG_MAX 63
++
++static void
++rw_fddebug_from_bootarg(void)
++{
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++		char value[RW_FDDEBUG_MAX + 1];
++		size_t n = 0;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
++			return;
++		}
++		for (at = args; (at = strstr(at, RW_FDDEBUG_KEY)) != NULL;
++		     at += strlen(RW_FDDEBUG_KEY)) {
++			if (at == args || at[-1] == ' ') {
++				break;
++			}
++		}
++		if (at == NULL) {
++			return;
++		}
++		at += strlen(RW_FDDEBUG_KEY);
++		while ((at[n] >= 'a' && at[n] <= 'z') || at[n] == ',') {
++			if (n == RW_FDDEBUG_MAX) {
++				break;
++			}
++			value[n] = at[n];
++			n++;
++		}
++		if (n == 0 || (at[n] != '\0' && at[n] != ' ')) {
++			rw_print("FD_MESA_DEBUG: not set (boot-arg sweetmetal_fddebug is not 1-%d of [a-z,])\n",
++			         RW_FDDEBUG_MAX);
++			return;
++		}
++		value[n] = '\0';
++		if (setenv("FD_MESA_DEBUG", value, 1) != 0) {
++			rw_print("FD_MESA_DEBUG: not set (setenv failed)\n");
++			return;
++		}
++		rw_print("FD_MESA_DEBUG: %s (boot-arg sweetmetal_fddebug)\n", value);
++	});
+ }
+ 
+ /*
+@@ -1521,6 +1578,7 @@
+ 		char why[256] = { 0 };
+ 
+ 		rw_lib_lock();
++		rw_fddebug_from_bootarg();   /* 0012: before the library reads FD_MESA_DEBUG */
+ 		_mesa = mesa.device_open(why, sizeof(why));
+ 		rw_print("the compiler library %s\n",
+ 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
