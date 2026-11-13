@@ -363,3 +363,20 @@ Notes:
 
 - The sampler stops the replaying thread about once a millisecond (suspend, read registers and frame pointers, resume). Stopped time is in the wall figure and not in the CPU figure, so cpu/wall of a prof boot is not comparable with a passlog-only boot, and frame times of a prof boot are a few percent high.
 - A sample is one millisecond of wall time of the replaying thread inside a command buffer, on a processor or blocked. `ours` skips the link register unless the pc is in one of our images.
+
+## Patch 0014 on the device, 0165fA, 2026-11-13 (real device, one boot, synthetic swipes)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | `shim-boot-0165fA.img` (09073ea3...), payload 0001-0014 (plug-in c466594f..., library a9e8c642...), flashed by the lead on the user's pre-authorisation, snapshot `work1-pre0014.raw` | `tools/metal-flash-test.sh ... 0165fA 420`; `tools/sweet-prof-symbols.py logs/xnu-0165fA.txt` | Top functions of the replay thread | 64946 samples (72 % running), 1617 command buffers sampled, 0 errors, 0 dropped, no `THREAD_RESUME FAILED`. `api`: `rwa_render_draw` 67.7 %, `rwa_finish` 31.1 %. `ours`: `bind_stage` 56.6 %, `drmCommandWrite` 28.3 %, `drmCommandWriteRead` 8.4 %. `leaf`: `_platform_memmove` 56.5 %, `mach_msg2_trap` 36.8 %; all Mesa draw encoding together under 7 %. **Faults in this boot only:** 14 `SMMU gfsr`, 9 `fault address`, 9 `THE GPU DID NOT FINISH`, 8 `table arena full` (first at log line 4244, late); whether the sampler's stops provoked them is not established. Self-test 17 of 21 | `logs/xnu-0165fA.txt` |
+
+## Patch 0015 (uniform upload size; boot-arg `sweetmetal_ubowhole=1` = old behaviour), 2026-11-13
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | 0015 on 0001-0014 (`opus-impl`; `reviewer`: ACCEPT-WITH-FIXES, the wanted host cases added, two low items accepted as they are: possible 64-byte over-fetch if ir3 widens a load, a wrap that needs a 32-bit `size_t`), host softpipe x86_64 | `air_metal_test --draw-ubo ubo.metallib`, `--draw-scissor`, `--clear` (run by `opus-impl`) | Same texel in both modes; fewer bytes | `fs_ptr` (`c[0]` at byte 20 of 2048): 64 against 2028 bytes, same texel, PASS. `fs_any` (unbounded index): rest of buffer, PASS. `fs_none`: 64 bytes, PASS. **`fs_and` (`c[(x+5)&7]`): FAIL as a saving, correct as a picture**: the bound is not found (`iand -> u2u64 -> u2u32 -> ishl`) and the rest of the buffer is uploaded. Scissor and clear pass | `userland/metal/0015-ubo-upload-size.patch`; `ubo.metal` in the scratchpad, not in git |
+| 2026-11-13 | same | `tools/metal-build.sh ios`, `driver`, `test`, `payload` | - | library a9e8c642... -> **accfbc7a...**, plug-in c466594f... -> **e7ba170e...**, `metaltest` unchanged; `_rwa_set_ubo_whole` exported | `metal-build/pay/` |
+| 2026-11-13 | `shim-boot-0166uA.img` (52839803...), payload 0001-0015 flashed by the lead (user present), snapshot `work1-pre0015.raw`; passlog on, profiler off | `tools/metal-flash-test.sh ... 0166uA 420` | Faster | `uniform uploads: what the shader reads`. backboardd busy blocks: 198 s, **3699 command buffers (18.7/s)**, 96.8 draws/cb. 197 active s, **3710 swaps**, max 29/s. About 30000 uploads and 31 MB per 5 s block, of which about 110 uploads are `unbounded` and carry nearly all the bytes. No fault lines. Self-test 17 of 21. Picture not judged | `logs/xnu-0166uA.txt` |
+| 2026-11-13 | `shim-boot-0166uB.img` (d080635e...), same payload + `sweetmetal_ubowhole=1` | `tools/sweet-boot-test.sh ... 0166uB 420` (RAM only) | As before the patch | `uniform uploads: rest of the buffer (forced ...)`. 197 s, **2183 command buffers (11.1/s)**, 97.7 draws/cb. 198 active s, **2218 swaps**, max 18/s. No fault lines | `logs/xnu-0166uB.txt` |
+
+Reading: same payload, same workload, one boot each: 11.1 -> 18.7 command buffers per busy second (+68 %), 2218 -> 3710 swaps. 0015: `partially-working`. Left: the unbounded uploads; `sweetfb_hz=30` now caps the best second (29).

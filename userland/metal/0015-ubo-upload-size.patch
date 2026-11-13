@@ -1,0 +1,530 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -136,7 +136,91 @@
+     * and its six counters at the start of the interval */
+    void (*passlog_hook)(struct pipe_context *, uint64_t[6]);
+    uint64_t passlog_last[6];
++
++   /* 0015 (rwa_set_ubo_whole): an unaligned constant buffer uploads the pre-0015 amount
++    * when set; and, with passlog on, what that path was asked for in the interval */
++   bool ubo_whole;
++   uint64_t ubo_user_binds, ubo_user_bytes, ubo_user_unknown;
+ };
++
++/*
++ * 0015: THE MOST A SHADER CAN READ OF EACH CONSTANT BUFFER, by Gallium slot, so that an
++ * unaligned binding (bind_stage) hands the driver that many bytes rather than the rest of
++ * a megabyte of uniforms on every draw. air.buffer_size is absent for a `constant T *`
++ * argument (Core Animation's mvp_matrix and texmat, 40 functions) and for every
++ * argument-buffer member, and those were the whole-rest uploads.
++ *
++ * Every read of a `constant` pointer this frontend emits is a load_ubo with an immediate
++ * block index (air_to_nir.c, air_load_ptr), so the bound of slot n is the largest
++ * offset + size over the loads of block n -- the offset's own value when constant
++ * after folding, else nir_unsigned_upper_bound's. A load with no usable bound, or a
++ * block index that is not a constant, makes the slot (or every slot) UNKNOWN, and an
++ * unknown slot uploads what it did before. The size counts at least 32 bits a component
++ * (ir3 sizes a range that way), and bind_stage rounds the bound up to 64: ir3 pushes a
++ * constant-offset UBO range in units of const_upload_unit * 16 = 64 bytes on a4xx and
++ * later (ir3_nir_analyze_ubo_ranges.c), and freedreno uploads at an alignment of 64, so
++ * the pushed range stays inside the upload. Never larger than what is left of the buffer,
++ * which is what was uploaded before.
++ *
++ * Done on a throwaway clone at pipeline creation; the NIR the driver compiles is untouched.
++ */
++#define RWA_UBO_UNKNOWN UINT32_MAX
++
++static void
++ubo_read_bounds(const nir_shader *nir, uint32_t bound[PIPE_MAX_CONSTANT_BUFFERS])
++{
++   for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++)
++      bound[i] = 0;
++   nir_shader *s = nir_shader_clone(NULL, nir);
++   struct hash_table *ht = _mesa_pointer_hash_table_create(NULL);
++   bool all_unknown = s == NULL || ht == NULL;
++
++   if (!all_unknown) {
++      bool progress;
++      unsigned rounds = 0;
++      do {
++         progress = false;
++         NIR_PASS(progress, s, nir_copy_prop);
++         NIR_PASS(progress, s, nir_opt_constant_folding);
++         NIR_PASS(progress, s, nir_opt_dce);
++      } while (progress && ++rounds < 8);
++   }
++   if (!all_unknown) {
++      nir_foreach_function_impl(impl, s) {
++         nir_foreach_block(block, impl) {
++            nir_foreach_instr(instr, block) {
++               if (instr->type != nir_instr_type_intrinsic)
++                  continue;
++               nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++               if (in->intrinsic != nir_intrinsic_load_ubo)
++                  continue;
++               if (!nir_src_is_const(in->src[0])) {
++                  all_unknown = true;
++                  continue;
++               }
++               uint64_t slot = nir_src_as_uint(in->src[0]);
++               if (slot >= PIPE_MAX_CONSTANT_BUFFERS || bound[slot] == RWA_UBO_UNKNOWN)
++                  continue;   /* past the slots: bind_stage refuses that binding */
++               uint64_t off = nir_src_is_const(in->src[1])
++                                 ? nir_src_as_uint(in->src[1])
++                                 : nir_unsigned_upper_bound(s, ht,
++                                                            nir_get_scalar(in->src[1].ssa, 0),
++                                                            NULL);
++               uint64_t end = off + (uint64_t)in->def.num_components *
++                                    MAX2(in->def.bit_size, 32) / 8;
++               bound[slot] = end >= RWA_UBO_UNKNOWN ? RWA_UBO_UNKNOWN
++                                                    : MAX2(bound[slot], (uint32_t)end);
++            }
++         }
++      }
++   }
++   if (all_unknown)
++      for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++)
++         bound[i] = RWA_UBO_UNKNOWN;
++   if (ht)
++      _mesa_hash_table_destroy(ht, NULL);
++   ralloc_free(s);
++}
+ 
+ #ifdef GALLIUM_FREEDRENO
+ /* freedreno_screen.c; set from FD_MESA_DEBUG in fd_screen_create. Declared here rather
+@@ -301,6 +385,9 @@
+     * once, with everything else that comes from the instructions.
+     */
+    bool compare_sampler[RWA_MAX_TEXTURES];
++
++   /* 0015: the most the kernel reads of each constant buffer (ubo_read_bounds) */
++   uint32_t ubo_read[PIPE_MAX_CONSTANT_BUFFERS];
+ 
+    /* One compiled state, not a cache. The threadgroup size is a dispatch argument in
+     * Metal and a shader constant to both Gallium drivers here, so the state belongs to
+@@ -2953,6 +3040,7 @@
+    }
+ 
+    slot_shapes(compute->nir, compute->slots, compute->compare_sampler);
++   ubo_read_bounds(compute->nir, compute->ubo_read);   /* 0015 */
+ 
+    compute->caps.static_shared_bytes = compute->info.threadgroup_bytes;
+    compute->caps.max_threads_per_group = device->max_threads_per_group;
+@@ -3581,7 +3669,7 @@
+ static int
+ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
+            const struct air_shader_info *info, void **own_sampler,
+-           const bool *compare_sampler,
++           const bool *compare_sampler, const uint32_t *ubo_read,
+            const struct rwa_bindings *bindings, const struct rwa_buffer_bind *table,
+            unsigned table_count, const char *name, struct rwa_bound *bound, char *why,
+            size_t why_size)
+@@ -3691,7 +3779,8 @@
+           * simply the mapping plus the offset.
+           *
+           * What is uploaded is `air.buffer_size` where Apple's metadata carries one,
+-          * which is all the shader is able to read; the rest of the buffer otherwise.
++          * which is all the shader is able to read; else, since 0015, the most its loads
++          * reach (ubo_read_bounds); the rest of the buffer when neither is known.
+           * A 48-byte uniform block 1164 bytes into a megabyte of uniforms costs 48
+           * bytes a draw, which is what the window server of this port asks for.
+           */
+@@ -3703,10 +3792,22 @@
+             cb.buffer = b->res;
+          } else {
+             size_t want = r->size && r->size <= left ? r->size : left;
++            uint32_t reads = ubo_read[r->index];   /* r->index < PIPE_MAX_CONSTANT_BUFFERS */
++            bool unknown = !r->size && reads == RWA_UBO_UNKNOWN;
+ 
++            /* 0015: what the shader's loads can reach, when the metadata gave no size
++             * (ubo_read_bounds); a bound of 0 is a shader that reads none of it and
++             * still gets 64 bytes, so the driver is never handed an empty upload */
++            if (!r->size && !unknown && !device->ubo_whole)
++               want = MIN2(left, ALIGN_POT((size_t)MAX2(reads, 1u), 64));
+             cb.user_buffer = (const char *)b->map + boffset;
+             cb.buffer_offset = 0;
+             cb.buffer_size = (unsigned)want;
++            if (device->passlog) {
++               device->ubo_user_binds++;
++               device->ubo_user_bytes += want;
++               device->ubo_user_unknown += unknown;
++            }
+          }
+          pipe->set_constant_buffer(pipe, stage, r->index, false, &cb);
+          break;
+@@ -3943,7 +4044,7 @@
+     */
+    struct rwa_bound bound = { 0 };
+    if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->own_sampler,
+-                  compute->compare_sampler,
++                  compute->compare_sampler, compute->ubo_read,
+                   bindings, table, table_count, name, &bound, why, why_size) != 0)
+       return -1;
+ 
+@@ -4009,7 +4110,17 @@
+    return 0;
+ }
+ 
++/* 0015: air_metal.h says what it changes and what it never does. */
+ int
++rwa_set_ubo_whole(struct rwa_device *device, int on)
++{
++   if (!device)
++      return -1;
++   device->ubo_whole = on != 0;
++   return 0;
++}
++
++int
+ rwa_passlog_read(struct rwa_device *device, struct rwa_passlog *out, int reset)
+ {
+    if (!device || !out || out->size < sizeof(*out))
+@@ -4024,8 +4135,13 @@
+    out->screen_reused = device->screen_refcnt == 0 ? -1 : device->screen_refcnt > 1;
+    out->mode_known = 0;
+    out->flushes = device->passlog_flushes;
+-   if (reset)
++   out->ubo_user_binds = device->ubo_user_binds;
++   out->ubo_user_bytes = device->ubo_user_bytes;
++   out->ubo_user_unknown = device->ubo_user_unknown;
++   if (reset) {
+       device->passlog_flushes = 0;
++      device->ubo_user_binds = device->ubo_user_bytes = device->ubo_user_unknown = 0;
++   }
+    /* The counters are freedreno's context stats, written by whichever thread flushes this
+     * context; the caller normally holds the lock every other call into this device is made
+     * under (the plug-in's rw_lib_lock), so nothing flushes while they are read. With
+@@ -5227,6 +5343,9 @@
+    void *vert_own_sampler[RWA_MAX_TEXTURES];
+    bool frag_compare_sampler[RWA_MAX_TEXTURES];
+    bool vert_compare_sampler[RWA_MAX_TEXTURES];
++   /* 0015: the most each stage reads of each constant buffer (ubo_read_bounds) */
++   uint32_t frag_ubo_read[PIPE_MAX_CONSTANT_BUFFERS];
++   uint32_t vert_ubo_read[PIPE_MAX_CONSTANT_BUFFERS];
+ 
+    /* the compiled state, made once: a render pipeline has a fixed shape, so unlike a
+     * compute state there is no threadgroup size to recompile for
+@@ -6427,6 +6546,11 @@
+    /* Compile both stages now. A failure here is a creation failure and says so; the
+     * stages are linked later, at the draw.
+     */
++   /* 0015: from the translations, before either is compiled (the generated stage reads
++    * no constant buffer and is never bound through bind_stage) */
++   ubo_read_bounds(fs, render->frag_ubo_read);
++   if (!render->generated_vertex)
++      ubo_read_bounds(vs, render->vert_ubo_read);
+    render->fs_cso = make_stage_cso(device, fs, why, why_size);
+    if (!render->fs_cso)
+       goto fail;
+@@ -7408,13 +7532,13 @@
+    struct rwa_bound fbound = { 0 }, vbound = { 0 };
+    int rc = -1;
+    if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->frag_own_sampler,
+-                  render->frag_compare_sampler,
++                  render->frag_compare_sampler, render->frag_ubo_read,
+                   &draw->fragment, draw->fragment_buffer_table, draw->fragment_buffer_table_count,
+                   fname, &fbound, why, why_size) != 0)
+       goto unbind;
+    if (!render->generated_vertex &&
+        bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vert_own_sampler,
+-                  render->vert_compare_sampler,
++                  render->vert_compare_sampler, render->vert_ubo_read,
+                   &draw->vertex, draw->vertex_buffer_table, draw->vertex_buffer_table_count, vname,
+                   &vbound, why, why_size) != 0)
+       goto unbind;
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -501,8 +501,8 @@
+  *     multiple of 4 -- is bound as a `user_buffer`, which both back ends handle by
+  *     uploading the bytes themselves (freedreno's upload_user_buffer aligns to 64,
+  *     softpipe wraps the pointer). What is copied is `air.buffer_size` where the metadata
+- *     carries one, which is all the shader can read, and the rest of the buffer
+- *     otherwise.
++ *     carries one, which is all the shader can read; else the most its loads can reach
++ *     (0015, rwa_set_ubo_whole); and the rest of the buffer when neither is known.
+  *   - a `device` member or argument (an SSBO) at an offset the GPU cannot fetch from is
+  *     REFUSED BY NAME, and the reason is not symmetry: the shader may WRITE it, and the
+  *     copy that serves a UBO would take the writes with it when it was thrown away.
+@@ -611,6 +611,11 @@
+    uint64_t batches, sysmem, gmem, nondraw;
+    uint64_t bins_total;      /* bins over the interval's GMEM batches */
+    uint64_t bins_max;        /* most bins of any GMEM batch so far in this PROCESS, not the interval */
++   /* 0015, APPENDED: constant buffers bound in the interval through the `user_buffer` path
++    * (an offset the GPU cannot fetch from), the bytes handed to the driver for them, and how
++    * many of those binds had no read bound from the shader (so the rest of the buffer went).
++    * A 0013/0014 caller's struct is 24 bytes shorter and is refused, as any short one is. */
++   uint64_t ubo_user_binds, ubo_user_bytes, ubo_user_unknown;
+ };
+ #define RWA_PASSLOG_DEBUG_GMEM   (1u << 6)   /* FD_DBG_GMEM, freedreno_util.h */
+ #define RWA_PASSLOG_DEBUG_NOBIN  (1u << 8)   /* FD_DBG_NOBIN */
+@@ -620,6 +625,18 @@
+ int rwa_passlog_read(struct rwa_device *device, struct rwa_passlog *out, int reset);
+ 
+ /*
++ * 0015: how much of a constant buffer bound at an offset the GPU cannot fetch from is handed
++ * to the driver as a `user_buffer` (which freedreno copies on every bind). Off, the default,
++ * it is `air.buffer_size` where the metadata has one, otherwise the most the shader's own
++ * load_ubo instructions can reach (worked out once, at pipeline creation, and rounded up to
++ * 64 bytes), otherwise -- a load whose offset has no upper bound -- the rest of the buffer.
++ * On, it is the pre-0015 rule: `air.buffer_size` or the rest of the buffer. Every byte an
++ * in-bounds read sees is the same either way. The plug-in turns it on for boot-arg
++ * sweetmetal_ubowhole=1. 0, or -1 for no device. New in 0015: absent in older libraries.
++ */
++int rwa_set_ubo_whole(struct rwa_device *device, int on);
++
++/*
+  * ---------------------------------------------------------------------------------------
+  * Drawing.
+  *
+--- a/tools/mesa/air/air_metal_test.c
++++ b/tools/mesa/air/air_metal_test.c
+@@ -6653,6 +6653,111 @@
+ }
+ 
+ /*
++ * 0015: AN UNALIGNED CONSTANT BUFFER WITH NO air.buffer_size, in both upload modes. Each
++ * function reads `constant float4 *c [[buffer(0)]]`, bound at byte 20 of 2048 (softpipe
++ * fetches at 16, so it is the user_buffer path). c[k] is { k + .25, k + .5, k + .75, 1 } for
++ * k < 8 (bytes 20..147) and every other float is a distinct negative number, so a read past
++ * the array, or of the wrong element, shows. Both modes must give the expected texel at
++ * (2, 2) and passlog one bind each, with the bytes and the unbounded count of the case; the
++ * pre-0015 mode always uploads the 2028 bytes left.
++ *
++ *   fs_ptr   c[0]                         bounded 64 (16 read, rounded up)
++ *   fs_and   c[(uint(p.x) + 5) & 7] = c[7] bounded 128 (the bound of the AND, 7 * 16 + 16)
++ *   fs_any   c[uint(p.x)] = c[2]          no upper bound: 2028, unbounded 1
++ *   fs_none  never reads c                64 (nothing read, min(left, 64))
++ *
++ *   air_metal_test --draw-ubo FILE.metallib [FUNCTION]   (all four when none is named)
++ */
++static int
++run_ubo_upload(const char *path, const char *only)
++{
++   static const struct {
++      const char *func;
++      int elem;                 /* the c[] element drawn, -1: { p.x, .5, .25, 1 } */
++      uint64_t bytes, unknown;  /* in the bounded mode */
++   } cases[] = {
++      { "fs_ptr", 0, 64, 0 }, { "fs_and", 7, 128, 0 },
++      { "fs_any", 2, 2048 - 20, 1 }, { "fs_none", -1, 64, 0 },
++   };
++   setenv("RWA_SOFTWARE", "1", 0);
++   char why[WHY] = "", name[256];
++   struct metallib lib = { 0 };
++   struct rwa_device *device = rwa_device_open(why, sizeof(why));
++   const struct rwa_texture_shape ts = {
++      .pixel_format = MTL_RGBA32_FLOAT, .type = MTL_TEXTURE_TYPE_2D, .width = 4, .height = 4,
++      .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
++      .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
++   };
++   struct rwa_texture *t = device ? rwa_texture_create(device, &ts, why, sizeof(why)) : NULL;
++   struct rwa_buffer *cbuf = t ? rwa_buffer_create(device, 2048, why, sizeof(why)) : NULL;
++   if (!cbuf || !load_metallib(path, &lib))
++      return printf("air_metal_test: ubo: %s\n", why), 1;
++   float *f = rwa_buffer_map(cbuf);
++   for (unsigned i = 0; i < 512; i++)
++      f[i] = -9.0f - i;
++   for (unsigned k = 0; k < 8; k++)
++      for (unsigned j = 0; j < 4; j++)
++         f[5 + 4 * k + j] = j == 3 ? 1.0f : k + 0.25f * (j + 1);
++   const struct rwa_buffer_bind table[1] = { { cbuf, 20 } };
++   struct rwa_texture *c[1] = { t };
++   const float clear[4] = { -1, -1, -1, -1 };
++   const struct rwa_draw draw = {
++      .color = c, .color_count = 1, .clear_color = clear,
++      .fragment = { .buffers = &cbuf, .buffer_count = 1 },
++      .fragment_buffer_table = table, .fragment_buffer_table_count = 1,
++      .primitive = 4 /* MTLPrimitiveTypeTriangleStrip */, .vertex_start = 0, .vertex_count = 4,
++   };
++   const unsigned origin[3] = { 2, 2, 0 }, one[3] = { 1, 1, 1 };
++   unsigned failed = 0, ran = 0;
++   for (unsigned n = 0; n < COUNT_OF(cases); n++) {
++      if (only && strcmp(only, cases[n].func))
++         continue;
++      ran++;
++      const char *func = cases[n].func;
++      const uint8_t *bits = NULL;
++      size_t nbits = 0;
++      struct rwa_render_shape shape = { .color_count = 1, .sample_count = 1,
++                                        .color_format = { MTL_RGBA32_FLOAT } };
++      struct rwa_render_info info = { 0 };
++      struct rwa_render *render =
++         find_function(&lib, func, name, sizeof(name), &bits, &nbits)
++            ? rwa_render_create(device, NULL, 0, NULL, bits, nbits, func, &shape, &info, why,
++                                sizeof(why))
++            : NULL;
++      float want[4] = { 2.5f, 0.5f, 0.25f, 1.0f };
++      if (cases[n].elem >= 0)
++         memcpy(want, &f[5 + 4 * cases[n].elem], sizeof(want));
++      for (int whole = 0; whole < 2; whole++) {
++         struct rwa_passlog pl = { .size = sizeof(pl) };
++         float px[4] = { 0 };
++         bool ok = render && rwa_set_ubo_whole(device, whole) == 0 &&
++                   rwa_set_passlog(device, 1) == 0 && rwa_passlog_read(device, &pl, 1) == 0 &&
++                   rwa_render_draw(render, &draw, why, sizeof(why)) == 0 &&
++                   rwa_texture_read(t, 0, 0, origin, one, px, 0, why, sizeof(why)) == 0 &&
++                   rwa_passlog_read(device, &pl, 1) == 0;
++         bool good = ok && !memcmp(px, want, sizeof(want)) && pl.ubo_user_binds == 1 &&
++                     pl.ubo_user_bytes == (whole ? 2048 - 20 : cases[n].bytes) &&
++                     pl.ubo_user_unknown == cases[n].unknown;
++         printf("air_metal_test: ubo: %-7s %-7s texel %g %g %g %g; binds %llu, bytes %llu, "
++                "unbounded %llu: %s%s%s\n", func, whole ? "whole" : "bounded", px[0], px[1],
++                px[2], px[3], (unsigned long long)pl.ubo_user_binds,
++                (unsigned long long)pl.ubo_user_bytes,
++                (unsigned long long)pl.ubo_user_unknown, good ? "PASS" : "FAIL",
++                ok ? "" : ": ", ok ? "" : why);
++         failed += !good;
++      }
++      if (render)
++         rwa_render_destroy(render);
++   }
++   rwa_buffer_destroy(cbuf);
++   rwa_texture_destroy(t);
++   rwa_device_close(device);
++   if (!ran)
++      printf("air_metal_test: ubo: no case is called %s\n", only);
++   return failed || !ran ? 1 : 0;
++}
++
++/*
+  * ONE WAIT PER COMMAND BUFFER (0011). The same sequence twice, once with every draw and clear
+  * waiting for itself and once with rwa_set_deferred_wait on and a single rwa_finish at the
+  * end, as the plug-in's -commit does: a clear of A, 64 draws each scissored to one column of
+@@ -6892,6 +6997,14 @@
+     * right answer. Two arguments, like --pixel-formats: a container and a fragment
+     * function whose output this program controls through the texture it samples.
+     */
++   if (argc >= 2 && !strcmp(argv[1], "--draw-ubo")) {   /* 0015 */
++      if (argc < 3) {
++         fprintf(stderr, "usage: %s --draw-ubo FILE.metallib [FUNCTION]\n", argv[0]);
++         return 2;
++      }
++      return run_ubo_upload(argv[2], argc >= 4 ? argv[3] : NULL);
++   }
++
+    if (argc >= 2 && !strcmp(argv[1], "--draw-blend")) {
+       if (argc < 4) {
+          fprintf(stderr, "usage: %s --draw-blend FILE.metallib FUNCTION\n", argv[0]);
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -341,10 +341,14 @@
+ 	uint64_t batches, sysmem, gmem, nondraw;
+ 	uint64_t bins_total;
+ 	uint64_t bins_max;
++	/* 0015, APPENDED: unaligned constant-buffer binds, bytes handed over, binds with no
++	 * read bound; a 0013/0014 library fills 72 bytes and answers size 72 */
++	uint64_t ubo_user_binds, ubo_user_bytes, ubo_user_unknown;
+ };
+ /* the library only refuses a copy that is too short: keep the two layouts from drifting */
+-_Static_assert(sizeof(struct rwa_passlog) == 72, "struct rwa_passlog: air_metal.h changed");
++_Static_assert(sizeof(struct rwa_passlog) == 96, "struct rwa_passlog: air_metal.h changed");
+ _Static_assert(__builtin_offsetof(struct rwa_passlog, bins_max) == 64, "struct rwa_passlog: air_metal.h changed");
++_Static_assert(__builtin_offsetof(struct rwa_passlog, ubo_user_unknown) == 88, "struct rwa_passlog: air_metal.h changed");
+ #define RWA_PASSLOG_DEBUG_GMEM   (1u << 6)
+ #define RWA_PASSLOG_DEBUG_NOBIN  (1u << 8)
+ #define RWA_PASSLOG_DEBUG_SYSMEM (1u << 9)
+@@ -572,6 +576,7 @@
+ 	int (*set_deferred_wait)(struct rwa_device *, int);   /* 0011; absent in older ones */
+ 	int (*set_passlog)(struct rwa_device *, int);         /* 0013; absent in older ones */
+ 	int (*passlog_read)(struct rwa_device *, struct rwa_passlog *, int);
++	int (*set_ubo_whole)(struct rwa_device *, int);       /* 0015; absent in older ones */
+ } mesa;
+ 
+ /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
+@@ -640,6 +645,8 @@
+ 	/* 0013 passlog: absent in an older library, and then the block says so */
+ 	*(void **)&mesa.set_passlog = dlsym(mesa.handle, "rwa_set_passlog");
+ 	*(void **)&mesa.passlog_read = dlsym(mesa.handle, "rwa_passlog_read");
++	/* 0015: absent in an older library, which then uploads as it always did */
++	*(void **)&mesa.set_ubo_whole = dlsym(mesa.handle, "rwa_set_ubo_whole");
+ 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
+ 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
+ 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
+@@ -1420,6 +1427,44 @@
+ }
+ 
+ /*
++ * 0015: how much of a constant buffer bound at an offset the GPU cannot fetch from is copied
++ * per draw. Without the boot-arg the library copies what the shader can read (or all that is
++ * left, where that is not known); boot-arg sweetmetal_ubowhole=1 asks for the pre-0015 rule,
++ * all that is left unless the metadata sizes it. Read once per process, set on the device
++ * right after rwa_device_open, said once. A library without rwa_set_ubo_whole is pre-0015 and
++ * copies the rest whatever the boot-arg says.
++ */
++#define RW_UBOWHOLE_KEY "sweetmetal_ubowhole="
++
++static void
++rw_ubo_mode_open(struct rwa_device *device)
++{
++	static dispatch_once_t once;
++	static bool forced;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_UBOWHOLE_KEY)) != NULL;
++			     at += strlen(RW_UBOWHOLE_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		forced = at != NULL && at[strlen(RW_UBOWHOLE_KEY)] == '1';
++	});
++	bool set = mesa.set_ubo_whole != NULL && mesa.set_ubo_whole(device, forced) == 0;
++	rw_print("uniform uploads: %s\n",
++		 !set ? "rest of the buffer (this library has no rwa_set_ubo_whole)" :
++		 forced ? "rest of the buffer (forced by boot-arg sweetmetal_ubowhole=1)" :
++			  "what the shader reads (sweetmetal_ubowhole=1 copies the rest of the buffer)");
++}
++
++/*
+  * 0012: boot-arg sweetmetal_fddebug=<word[,word]> becomes FD_MESA_DEBUG in this process, so one
+  * boot can run freedreno's existing alternatives (sysmem, gmem, nobin: freedreno_screen.c)
+  * against the default without another library. Mesa reads the variable once, in
+@@ -1814,7 +1859,7 @@
+ static void
+ rw_passlog_print(const struct rw_pl_block *b)
+ {
+-	char lib[320];
++	char lib[320], ubo[160] = "";
+ 
+ 	if (!b->lib_ok) {
+ 		snprintf(lib, sizeof(lib), "library: n/a");
+@@ -1831,12 +1876,21 @@
+ 		snprintf(lib, sizeof(lib), "library: %llu flushes, sysmem/gmem/bins n/a "
+ 			 "(no fd_passlog_read)", (unsigned long long)b->lib.flushes);
+ 	}
++	/* 0015: appended at the very end; a pre-0015 library answers a 72-byte struct */
++	if (b->lib_ok && b->lib.size >= sizeof(b->lib)) {
++		snprintf(ubo, sizeof(ubo), "; ubo uploads %llu, bytes %llu, unbounded %llu",
++			 (unsigned long long)b->lib.ubo_user_binds,
++			 (unsigned long long)b->lib.ubo_user_bytes,
++			 (unsigned long long)b->lib.ubo_user_unknown);
++	} else {
++		snprintf(ubo, sizeof(ubo), "; ubo uploads n/a");
++	}
+ 	/* 0014: with sweetmetal_prof=1 the time the sampler holds this thread suspended is in
+ 	 * wall and not in cpu */
+ 	rw_print("passlog: %.1f s, %llu cbs, %llu draws, %u names (top %u below); %s, "
+-		 "cpu %.2f ms of wall %.2f ms\n",
++		 "cpu %.2f ms of wall %.2f ms%s\n",
+ 		 b->span_ns / 1e9, (unsigned long long)b->cbs, (unsigned long long)b->draws,
+-		 b->names, b->top_n, lib, b->cpu_ns / 1e6, b->wall_ns / 1e6);
++		 b->names, b->top_n, lib, b->cpu_ns / 1e6, b->wall_ns / 1e6, ubo);
+ 	for (unsigned i = 0; i < b->top_n; i++) {
+ 		rw_pl_row_print(&b->top[i]);
+ 	}
+@@ -2416,6 +2470,9 @@
+ 		if (_mesa != NULL && rw_passlog_on()) {
+ 			rw_passlog_open(_mesa);   /* 0013 */
+ 		}
++		if (_mesa != NULL) {
++			rw_ubo_mode_open(_mesa);   /* 0015 */
++		}
+ 		rw_lib_unlock();
+ 	}
+ 
