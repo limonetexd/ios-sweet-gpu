@@ -8,13 +8,13 @@
 
 # Phase: A/B boot, GMEM against sysmem (patch 0012, plug-in only)
 
-Read `CLAUDE.md` and the last section of `TEST_LOG.md`. Plan in ten lines, wait for go-ahead.
+Read `CLAUDE.md` and the last section of `TEST_LOG.md`. Go-ahead for steps 1-4 (write, review, host build, images) already given by the user on 2026-11-13; state the plan in ten lines and proceed. Stop before anything touches the phone: the user flashes and boots.
 
 Spec (one behaviour change, one build, one boot):
 
 1. `redwoodmetal.m`, next to `rw_wait_per_commit` (about line 1355): read boot-arg `sweetmetal_fddebug=<word[,word]>` from `kern.bootargs` once per process, before the library opens the device. If present and made only of `[a-z,]`, at most 63 characters, `setenv("FD_MESA_DEBUG", value, 1)` and `rw_print("FD_MESA_DEBUG: %s (boot-arg sweetmetal_fddebug)\n", value)`. Absent: do nothing, print nothing. No library change, no kernel change, no new packets: the flag selects code paths that exist in Mesa 25.0.7.
 2. In the same patch, one log line at device open with what freedreno decided: `screen->gmemsize_bytes` and the bin layout if the library can reach them without a new entry point; otherwise leave it out and say so (do not add an interface for it in this phase).
-3. Writer: `opus-impl` from this spec; `reviewer` on the diff. Host: build `ios`, `driver`, `test`, `payload`; host tests must still pass (softpipe ignores the flag, so they prove only that the absent-boot-arg path is unchanged).
+3. Writer: the lead itself (user, 2026-11-13: "dale puedes hacerlo tu"; this phase and this patch only), or `opus-impl` if the lead prefers; `reviewer` on the diff either way. Host: build `ios`, `driver`, `test`, `payload`; host tests must still pass (softpipe ignores the flag, so they prove only that the absent-boot-arg path is unchanged).
 4. Images: `0162sB` = 0161wA args + `sweetmetal_fddebug=sysmem`. Control is the existing 0161wA2 log (same library); boot a fresh control `0162sA` (no flag) only if the payload hash changes anything but the plug-in. Auto-return to fastboot must be in the boot-args (check the payload).
 5. Rung: reversible (`fastboot boot`, RAM only; payload flash is snapshot-first, snapshot `work1-pre0012.raw`). The user flashes and boots.
 6. Read after the boot, in this order: faults (`SMMU gfsr`, `fault address`, `THE GPU DID NOT FINISH`), backboardd crashes, self-test count (17 of 21 expected, item 21), then `the GPU worked` per interval and swaps/s against 0161wA2. Sysmem writes the IOSurface directly, so a fault here is a real result, not noise: stop and record.
