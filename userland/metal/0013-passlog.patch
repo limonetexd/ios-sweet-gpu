@@ -1,0 +1,640 @@
+--- a/tools/mesa/air/air_metal.c
++++ b/tools/mesa/air/air_metal.c
+@@ -24,6 +24,7 @@
+  * reason in an NSError that an application will show a person.
+  */
+ 
++#include <dlfcn.h>
+ #include <stdarg.h>
+ #include <stddef.h>
+ #include <stdio.h>
+@@ -124,7 +125,24 @@
+     * drawable into each frame when it was per draw (GPU_DECISION.md "Metal frame time").
+     */
+    bool deferred_wait;
++
++   /* 0013 passlog (rwa_set_passlog): diagnostics only. screen_refcnt is the Gallium
++    * screen's reference count right after this device took it, 0 when not known (software):
++    * 1 means this open made the fd_screen, more means it was already there. */
++   int screen_refcnt;
++   bool passlog;
++   uint64_t passlog_flushes;
++   /* freedreno's fd_passlog_read (freedreno-passlog.patch), NULL when this image has none,
++    * and its six counters at the start of the interval */
++   void (*passlog_hook)(struct pipe_context *, uint64_t[6]);
++   uint64_t passlog_last[6];
+ };
++
++#ifdef GALLIUM_FREEDRENO
++/* freedreno_screen.c; set from FD_MESA_DEBUG in fd_screen_create. Declared here rather
++ * than by including freedreno_util.h, which needs freedreno's generated register headers. */
++extern int fd_mesa_debug;
++#endif
+ 
+ /*
+  * WHAT AN MTLArgumentEncoder LEAVES BEHIND, which is a record and not bytes.
+@@ -495,6 +513,8 @@
+                             "for it, so this GPU is present and unusable");
+          goto fail;
+       }
++      /* 0013: read once, here, under the plug-in's lock; nothing else uses it */
++      device->screen_refcnt = device->screen->refcnt;
+    }
+ #else
+    if (!software) {
+@@ -3098,6 +3118,8 @@
+ {
+    struct pipe_fence_handle *fence = NULL;
+    device->pipe->flush(device->pipe, &fence, 0);
++   if (device->passlog)
++      device->passlog_flushes++;   /* 0013 */
+    if (!fence) {
+       if (!required)
+          return 0;
+@@ -3955,6 +3977,74 @@
+    if (!device)
+       return -1;
+    device->deferred_wait = on != 0;
++   return 0;
++}
++
++/* 0013 passlog: air_metal.h says what each field is and why mode_known is 0. */
++int
++rwa_set_passlog(struct rwa_device *device, int on)
++{
++   if (!device)
++      return -1;
++   device->passlog = on != 0;
++#if defined(GALLIUM_FREEDRENO) && (defined(RTLD_SELF) || defined(RTLD_DEFAULT))
++   /* freedreno's hook, if THIS image has it: freedreno is linked in statically, so libOSMesa
++    * in the same process carries its own copy, and the copy found must be ours or it would be
++    * handed a context it never made -- hence the dladdr check. Looked up only here, so with
++    * passlog off nothing is looked up at all. */
++   if (device->passlog && !device->software && device->passlog_hook == NULL) {
++#ifdef RTLD_SELF
++      void *sym = dlsym(RTLD_SELF, "fd_passlog_read");
++#else
++      void *sym = dlsym(RTLD_DEFAULT, "fd_passlog_read");
++#endif
++      Dl_info mine, theirs;
++      if (sym != NULL && dladdr((void *)rwa_passlog_read, &mine) != 0 &&
++          dladdr(sym, &theirs) != 0 && mine.dli_fbase == theirs.dli_fbase) {
++         *(void **)&device->passlog_hook = sym;
++         device->passlog_hook(device->pipe, device->passlog_last);
++      }
++   }
++#endif
++   return 0;
++}
++
++int
++rwa_passlog_read(struct rwa_device *device, struct rwa_passlog *out, int reset)
++{
++   if (!device || !out || out->size < sizeof(*out))
++      return -1;
++   memset(out, 0, sizeof(*out));
++   out->size = sizeof(*out);
++   out->fd_mesa_debug = -1;
++#ifdef GALLIUM_FREEDRENO
++   if (!device->software)
++      out->fd_mesa_debug = fd_mesa_debug;
++#endif
++   out->screen_reused = device->screen_refcnt == 0 ? -1 : device->screen_refcnt > 1;
++   out->mode_known = 0;
++   out->flushes = device->passlog_flushes;
++   if (reset)
++      device->passlog_flushes = 0;
++   /* The counters are freedreno's context stats, written by whichever thread flushes this
++    * context; the caller normally holds the lock every other call into this device is made
++    * under (the plug-in's rw_lib_lock), so nothing flushes while they are read. With
++    * sweetmetal_nolock=1 it does not: the figures are then approximate, and a delta that
++    * would be negative is given as 0. */
++   if (device->passlog_hook != NULL) {
++      uint64_t now[6];
++
++      device->passlog_hook(device->pipe, now);
++      out->mode_known = 1;
++      out->batches = now[0] >= device->passlog_last[0] ? now[0] - device->passlog_last[0] : 0;
++      out->sysmem = now[1] >= device->passlog_last[1] ? now[1] - device->passlog_last[1] : 0;
++      out->gmem = now[2] >= device->passlog_last[2] ? now[2] - device->passlog_last[2] : 0;
++      out->nondraw = now[3] >= device->passlog_last[3] ? now[3] - device->passlog_last[3] : 0;
++      out->bins_total = now[4] >= device->passlog_last[4] ? now[4] - device->passlog_last[4] : 0;
++      out->bins_max = now[5];
++      if (reset)
++         memcpy(device->passlog_last, now, sizeof(now));
++   }
+    return 0;
+ }
+ 
+--- a/tools/mesa/air/air_metal.h
++++ b/tools/mesa/air/air_metal.h
+@@ -587,6 +587,39 @@
+ int rwa_set_deferred_wait(struct rwa_device *device, int on);
+ 
+ /*
++ * 0013 "passlog": diagnostics only, nothing here changes what is drawn or how. The plug-in
++ * reads boot-arg sweetmetal_passlog=1 (this library reads no boot-args) and turns it on with
++ * rwa_set_passlog; off, the default, the library counts nothing.
++ *
++ * rwa_passlog_read fills `out` (out->size must be at least sizeof(struct rwa_passlog), set
++ * by the caller) with what the screen holds and what was counted since the last read with
++ * `reset` non-zero, which then starts the next interval. 0, or -1 for no device or a short
++ * struct. Both calls are new in 0013 and absent in older libraries.
++ *
++ * The batch figures come from freedreno's fd_passlog_read (tools/mesa/freedreno-passlog.patch),
++ * found with dlsym in this library's own image; a freedreno without that patch (the host
++ * build) leaves mode_known 0 and them unfilled. Never asked of a software screen.
++ */
++struct rwa_passlog {
++   uint32_t size;            /* sizeof(struct rwa_passlog), set by the caller */
++   int32_t fd_mesa_debug;    /* freedreno's fd_mesa_debug; -1: no freedreno screen */
++   int32_t screen_reused;    /* 1 the fd_screen existed before this open, 0 made by it, -1 unknown */
++   uint32_t mode_known;      /* 0: the batch figures below are not filled */
++   uint64_t flushes;         /* pipe->flush calls this library made in the interval */
++   /* batches freedreno rendered in the interval, all of this device's context: in total,
++    * in sysmem, in GMEM, and with no draw at all */
++   uint64_t batches, sysmem, gmem, nondraw;
++   uint64_t bins_total;      /* bins over the interval's GMEM batches */
++   uint64_t bins_max;        /* most bins of any GMEM batch so far in this PROCESS, not the interval */
++};
++#define RWA_PASSLOG_DEBUG_GMEM   (1u << 6)   /* FD_DBG_GMEM, freedreno_util.h */
++#define RWA_PASSLOG_DEBUG_NOBIN  (1u << 8)   /* FD_DBG_NOBIN */
++#define RWA_PASSLOG_DEBUG_SYSMEM (1u << 9)   /* FD_DBG_SYSMEM */
++
++int rwa_set_passlog(struct rwa_device *device, int on);
++int rwa_passlog_read(struct rwa_device *device, struct rwa_passlog *out, int reset);
++
++/*
+  * ---------------------------------------------------------------------------------------
+  * Drawing.
+  *
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -103,6 +103,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/sysctl.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ /* The contract with Mesa's side, copied here rather than included: this file is built by
+@@ -324,7 +325,24 @@
+ 	/* -setScissorRect:, NULL for none: { x, y, width, height }, origin top-left. APPENDED
+ 	 * like everything since the indexed forms, so no field above moves. */
+ 	const unsigned *scissor;
++};
++/* 0013 passlog: diagnostics only; air_metal.h says what each field is */
++struct rwa_passlog {
++	uint32_t size;
++	int32_t fd_mesa_debug;
++	int32_t screen_reused;
++	uint32_t mode_known;
++	uint64_t flushes;
++	uint64_t batches, sysmem, gmem, nondraw;
++	uint64_t bins_total;
++	uint64_t bins_max;
+ };
++/* the library only refuses a copy that is too short: keep the two layouts from drifting */
++_Static_assert(sizeof(struct rwa_passlog) == 72, "struct rwa_passlog: air_metal.h changed");
++_Static_assert(__builtin_offsetof(struct rwa_passlog, bins_max) == 64, "struct rwa_passlog: air_metal.h changed");
++#define RWA_PASSLOG_DEBUG_GMEM   (1u << 6)
++#define RWA_PASSLOG_DEBUG_NOBIN  (1u << 8)
++#define RWA_PASSLOG_DEBUG_SYSMEM (1u << 9)
+ 
+ /*
+  * The library's MTLVertexFormat table, checked against Apple's own header HERE, where the
+@@ -547,6 +565,8 @@
+ 	void (*depth_stencil_destroy)(struct rwa_depth_stencil *);
+ 	int (*finish)(struct rwa_device *, char *, size_t);
+ 	int (*set_deferred_wait)(struct rwa_device *, int);   /* 0011; absent in older ones */
++	int (*set_passlog)(struct rwa_device *, int);         /* 0013; absent in older ones */
++	int (*passlog_read)(struct rwa_device *, struct rwa_passlog *, int);
+ } mesa;
+ 
+ /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
+@@ -612,6 +632,9 @@
+ 	/* One wait per command buffer (0011): absent in an older library, and then every draw
+ 	 * and clear waits for itself as before. */
+ 	*(void **)&mesa.set_deferred_wait = dlsym(mesa.handle, "rwa_set_deferred_wait");
++	/* 0013 passlog: absent in an older library, and then the block says so */
++	*(void **)&mesa.set_passlog = dlsym(mesa.handle, "rwa_set_passlog");
++	*(void **)&mesa.passlog_read = dlsym(mesa.handle, "rwa_passlog_read");
+ 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
+ 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
+ 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
+@@ -1020,8 +1043,10 @@
+ 	RedwoodMetalDevice *_owner;
+ 	struct rwa_render *_render;
+ 	struct rwa_render_info _info;
++	char _passName[48];   /* 0013 passlog: filled only with sweetmetal_passlog=1 */
+ }
+ - (struct rwa_render *)render;
++- (const char *)passName;
+ /* Not part of any Metal protocol: whether this pipeline's fragment shader stores to
+  * [[depth]], which only whoever read the shader knows. A pass without a depth attachment
+  * drops those writes -- Metal's own behaviour -- and a draw that says so is the difference
+@@ -1508,6 +1533,292 @@
+ 	}
+ }
+ 
++/*
++ * 0013 "passlog": boot-arg sweetmetal_passlog=1 makes each process say, at most once per five
++ * seconds, which fragment functions its draws went to and what the command buffers holding
++ * them cost from the start of -commit's replay to the end of its wait (CPU wall clock, the
++ * library's lock held, so it is submit-to-done as this process sees it, not the GPU's own
++ * time). Diagnostics only: nothing drawn changes. Absent, rw_passlog_on() is the only work.
++ *
++ * Fixed tables, no allocation: RW_PL_CB_MAX distinct names per command buffer and
++ * RW_PL_SLOTS per interval, and a name that does not fit is counted in "(other)". The
++ * interval table has its own lock, taken only in rw_passlog_cb_end and always INSIDE the
++ * library's lock when that one is on (rw_lib_lock, then rw_pl.lock: never the other way).
++ * The block is printed after -commit has released both.
++ */
++#define RW_PASSLOG_KEY "sweetmetal_passlog="
++#define RW_PL_NAME 48
++#define RW_PL_CB_MAX 32
++#define RW_PL_SLOTS 32
++#define RW_PL_TOP 10
++#define RW_PL_INTERVAL_NS 5000000000ull
++
++static bool
++rw_passlog_on(void)
++{
++	static dispatch_once_t once;
++	static bool on;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_PASSLOG_KEY)) != NULL;
++			     at += strlen(RW_PASSLOG_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		on = at != NULL && at[strlen(RW_PASSLOG_KEY)] == '1';
++	});
++	return on;
++}
++
++struct rw_pl_row {
++	char name[RW_PL_NAME];
++	uint64_t draws, cbs, ns;   /* ns: summed replay-to-done time of the cbs holding them */
++};
++
++/* one command buffer's draws, on -commit's stack; names point into the pipelines, which
++ * _work keeps alive until after rw_passlog_cb_end */
++struct rw_pl_cb {
++	const char *name[RW_PL_CB_MAX];
++	uint64_t draws[RW_PL_CB_MAX];
++	unsigned n;
++	uint64_t other;
++	uint64_t t0;
++};
++
++struct rw_pl_block {
++	uint64_t span_ns, cbs, draws;
++	unsigned names, top_n;
++	struct rw_pl_row top[RW_PL_TOP];
++	struct rw_pl_row other;
++	bool lib_ok;
++	struct rwa_passlog lib;
++};
++
++static struct {
++	pthread_mutex_t lock;
++	uint64_t start_ns, cbs, draws;
++	unsigned n;
++	struct rw_pl_row rows[RW_PL_SLOTS];
++	struct rw_pl_row other;
++} rw_pl = { .lock = PTHREAD_MUTEX_INITIALIZER };
++
++/* the name a pipeline is counted under: its label, else its fragment function's name, else
++ * "?"; spaces and control characters become '_' so a row stays one grep-able word */
++static void
++rw_passlog_name(MTLRenderPipelineDescriptor *descriptor, char out[RW_PL_NAME])
++{
++	NSString *label = [descriptor label];
++	NSString *name = label != nil && [label length] > 0 ? label
++			  : [[descriptor fragmentFunction] name];
++	const char *bytes = name != nil && [name length] > 0 ? [name UTF8String] : NULL;
++
++	snprintf(out, RW_PL_NAME, "%s", bytes != NULL ? bytes : "?");
++	for (char *c = out; *c != '\0'; c++) {
++		if ((unsigned char)*c <= ' ') {
++			*c = '_';
++		}
++	}
++}
++
++/* after rwa_device_open, under the library's lock: turn the library's counting on and say
++ * what the screen holds */
++static void
++rw_passlog_open(struct rwa_device *device)
++{
++	struct rwa_passlog lib = { .size = sizeof(lib) };
++
++	if (mesa.set_passlog == NULL || mesa.passlog_read == NULL) {
++		rw_print("passlog: open: this library has no rwa_passlog_read (older than 0013), so "
++			 "no FD_MESA_DEBUG or flush figures; draws are still counted\n");
++		return;
++	}
++	mesa.set_passlog(device, 1);
++	if (mesa.passlog_read(device, &lib, 1) != 0) {
++		rw_print("passlog: open: rwa_passlog_read refused\n");
++		return;
++	}
++	if (lib.fd_mesa_debug < 0) {
++		rw_print("passlog: open: FD_MESA_DEBUG n/a (no freedreno screen)\n");
++		return;
++	}
++	unsigned d = (unsigned)lib.fd_mesa_debug;
++	rw_print("passlog: open: FD_MESA_DEBUG=%#x (sysmem %s, gmem %s, nobin %s), fd_screen %s, "
++		 "batch modes %s\n",
++		 d, (d & RWA_PASSLOG_DEBUG_SYSMEM) ? "on" : "off",
++		 (d & RWA_PASSLOG_DEBUG_GMEM) ? "on" : "off",
++		 (d & RWA_PASSLOG_DEBUG_NOBIN) ? "on" : "off",
++		 lib.screen_reused == 0 ? "created by this open" :
++		 lib.screen_reused == 1 ? "reused (existed before this open)" : "unknown",
++		 lib.mode_known ? "counted (fd_passlog_read)" : "n/a (no fd_passlog_read)");
++}
++
++static void
++rw_passlog_cb_begin(struct rw_pl_cb *cb)
++{
++	cb->n = 0;
++	cb->other = 0;
++	cb->t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++}
++
++static void
++rw_passlog_draw(struct rw_pl_cb *cb, const char *name)
++{
++	for (unsigned i = 0; i < cb->n; i++) {
++		if (cb->name[i] == name || strcmp(cb->name[i], name) == 0) {
++			cb->draws[i]++;
++			return;
++		}
++	}
++	if (cb->n == RW_PL_CB_MAX) {
++		cb->other++;
++		return;
++	}
++	cb->name[cb->n] = name;
++	cb->draws[cb->n] = 1;
++	cb->n++;
++}
++
++static void
++rw_pl_add(struct rw_pl_row *row, uint64_t draws, uint64_t ns)
++{
++	row->draws += draws;
++	row->cbs++;
++	row->ns += ns;
++}
++
++/* At the end of -commit, the library's lock still held. Folds this command buffer into the
++ * interval and, once five seconds have passed since the interval began, fills `out` and
++ * starts the next one: true means print `out` (after the library's lock is released). */
++static bool
++rw_passlog_cb_end(struct rw_pl_cb *cb, struct rwa_device *device, struct rw_pl_block *out)
++{
++	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	uint64_t ns = now - cb->t0;
++	uint64_t other = cb->other;
++	bool emit = false;
++
++	pthread_mutex_lock(&rw_pl.lock);
++	if (rw_pl.start_ns == 0) {
++		rw_pl.start_ns = cb->t0;
++	}
++	rw_pl.cbs++;
++	for (unsigned i = 0; i < cb->n; i++) {
++		unsigned j;
++
++		rw_pl.draws += cb->draws[i];
++		for (j = 0; j < rw_pl.n; j++) {
++			if (strcmp(rw_pl.rows[j].name, cb->name[i]) == 0) {
++				break;
++			}
++		}
++		if (j == rw_pl.n && rw_pl.n < RW_PL_SLOTS) {
++			snprintf(rw_pl.rows[j].name, RW_PL_NAME, "%s", cb->name[i]);
++			rw_pl.n++;
++		}
++		if (j < rw_pl.n) {
++			rw_pl_add(&rw_pl.rows[j], cb->draws[i], ns);
++		} else {
++			other += cb->draws[i];
++		}
++	}
++	rw_pl.draws += cb->other;
++	if (other > 0) {
++		rw_pl_add(&rw_pl.other, other, ns);
++	}
++	/* now was read before the lock: with sweetmetal_nolock=1 another thread may already have
++	 * started a later interval, and then this command buffer does not end one */
++	if (now > rw_pl.start_ns && now - rw_pl.start_ns >= RW_PL_INTERVAL_NS) {
++		bool taken[RW_PL_SLOTS] = { false };
++
++		emit = true;
++		out->span_ns = now - rw_pl.start_ns;
++		out->cbs = rw_pl.cbs;
++		out->draws = rw_pl.draws;
++		out->names = rw_pl.n;
++		out->other = rw_pl.other;
++		snprintf(out->other.name, RW_PL_NAME, "(other)");
++		out->top_n = 0;
++		while (out->top_n < RW_PL_TOP) {
++			unsigned best = RW_PL_SLOTS;
++
++			for (unsigned j = 0; j < rw_pl.n; j++) {
++				if (!taken[j] && (best == RW_PL_SLOTS ||
++						  rw_pl.rows[j].draws > rw_pl.rows[best].draws)) {
++					best = j;
++				}
++			}
++			if (best == RW_PL_SLOTS) {
++				break;
++			}
++			taken[best] = true;
++			out->top[out->top_n++] = rw_pl.rows[best];
++		}
++		memset(rw_pl.rows, 0, sizeof(rw_pl.rows));
++		memset(&rw_pl.other, 0, sizeof(rw_pl.other));
++		rw_pl.n = 0;
++		rw_pl.cbs = 0;
++		rw_pl.draws = 0;
++		rw_pl.start_ns = now;
++	}
++	pthread_mutex_unlock(&rw_pl.lock);
++
++	if (emit) {
++		/* the library's interval ends here too; read under the library's lock, which the
++		 * caller holds, and outside rw_pl.lock */
++		memset(&out->lib, 0, sizeof(out->lib));
++		out->lib.size = sizeof(out->lib);
++		out->lib_ok = device != NULL && mesa.passlog_read != NULL &&
++			      mesa.passlog_read(device, &out->lib, 1) == 0;
++	}
++	return emit;
++}
++
++static void
++rw_pl_row_print(const struct rw_pl_row *row)
++{
++	rw_print("passlog:   %-40s draws %llu, in %llu cbs, cb time sum %.2f ms, mean %.3f ms\n",
++		 row->name, (unsigned long long)row->draws, (unsigned long long)row->cbs,
++		 row->ns / 1e6, row->cbs > 0 ? row->ns / 1e6 / row->cbs : 0.0);
++}
++
++static void
++rw_passlog_print(const struct rw_pl_block *b)
++{
++	char lib[320];
++
++	if (!b->lib_ok) {
++		snprintf(lib, sizeof(lib), "library: n/a");
++	} else if (b->lib.mode_known) {
++		snprintf(lib, sizeof(lib), "library: %llu flushes, %llu batches: sysmem %llu, "
++			 "gmem %llu, nondraw %llu; bins %llu (mean %.1f per gmem batch), "
++			 "max %llu (process)", (unsigned long long)b->lib.flushes,
++			 (unsigned long long)b->lib.batches, (unsigned long long)b->lib.sysmem,
++			 (unsigned long long)b->lib.gmem, (unsigned long long)b->lib.nondraw,
++			 (unsigned long long)b->lib.bins_total,
++			 b->lib.gmem > 0 ? (double)b->lib.bins_total / b->lib.gmem : 0.0,
++			 (unsigned long long)b->lib.bins_max);
++	} else {
++		snprintf(lib, sizeof(lib), "library: %llu flushes, sysmem/gmem/bins n/a "
++			 "(no fd_passlog_read)", (unsigned long long)b->lib.flushes);
++	}
++	rw_print("passlog: %.1f s, %llu cbs, %llu draws, %u names (top %u below); %s\n",
++		 b->span_ns / 1e9, (unsigned long long)b->cbs, (unsigned long long)b->draws,
++		 b->names, b->top_n, lib);
++	for (unsigned i = 0; i < b->top_n; i++) {
++		rw_pl_row_print(&b->top[i]);
++	}
++	if (b->other.draws > 0) {
++		rw_pl_row_print(&b->other);
++	}
++}
++
+ /* The one line per process: what the library actually did, from the first pipeline it
+  * made, since only the library knows whether its compiler has 16-bit ALU. */
+ static void
+@@ -1582,6 +1893,9 @@
+ 		_mesa = mesa.device_open(why, sizeof(why));
+ 		rw_print("the compiler library %s\n",
+ 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
++		if (_mesa != NULL && rw_passlog_on()) {
++			rw_passlog_open(_mesa);   /* 0013 */
++		}
+ 		rw_lib_unlock();
+ 	}
+ 
+@@ -3673,6 +3987,9 @@
+ 	_owner = device;
+ 	_render = render;
+ 	_info = *info;
++	if (rw_passlog_on()) {
++		rw_passlog_name(descriptor, _passName);   /* 0013 */
++	}
+ 	if (info->generated_vertex_stage) {
+ 		rw_print("this pipeline's vertex stage was generated, so what it "
+ 		         "draws is the fragment shader over the whole attachment\n");
+@@ -3703,6 +4020,7 @@
+ }
+ 
+ - (struct rwa_render *)render { return _render; }
++- (const char *)passName      { return _passName[0] != '\0' ? _passName : "?"; }
+ - (BOOL)writesDepth           { return _info.fragment_writes_depth != 0; }
+ - (unsigned)vertexStreamMask  { return _info.vertex_stream_mask; }
+ - (unsigned)vertexStreamCount { return _info.vertex_streams; }
+@@ -4320,6 +4638,14 @@
+ 	struct rwa_device *device = [[_queue device] mesaDevice];
+ 	bool once = device != NULL && rw_wait_per_commit();
+ 	bool queued = false;
++	/* 0013 passlog: nothing below is touched unless it is on */
++	bool passlog = rw_passlog_on();
++	struct rw_pl_cb plcb;
++	struct rw_pl_block plblock;
++	bool plemit = false;
++	if (passlog) {
++		rw_passlog_cb_begin(&plcb);
++	}
+ 	if (once) {
+ 		mesa.set_deferred_wait(device, 1);
+ 	}
+@@ -4331,6 +4657,9 @@
+ 		}
+ 		if (work->render != nil) {
+ 			queued = true;
++			if (passlog) {
++				rw_passlog_draw(&plcb, [work->render passName]);
++			}
+ 			if (![self runDraw:work why:why size:sizeof(why)]) {
+ 				goto done;
+ 			}
+@@ -4406,7 +4735,13 @@
+ 			}
+ 		}
+ 	}
++	if (passlog) {
++		plemit = rw_passlog_cb_end(&plcb, device, &plblock);
++	}
+ 	rw_lib_unlock();
++	if (plemit) {
++		rw_passlog_print(&plblock);
++	}
+ 	/* What the work named is let go here, on the thread that committed: every item has
+ 	 * run and been waited for (or was abandoned by a failure), so nothing below needs
+ 	 * it. Left to -dealloc, the last release could come from the completion queue's
+--- /dev/null
++++ b/tools/mesa/freedreno-passlog.patch
+@@ -0,0 +1,42 @@
++--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
+++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
++@@ -691,6 +691,30 @@
++    } else {
++       fd_fence_del(fence);
++    }
+++}
+++
+++/*
+++ * passlog (Darwin on redwood, 0013): read-only counters for libredwoodair's
+++ * rwa_passlog_read. The bin counters are the only state added: one add and one
+++ * compare per GMEM batch, below, after the mode is decided. Per process (all
+++ * contexts of this image), cumulative, never reset. Exported so the library can
+++ * find it with dlsym and still load against a freedreno built without this patch.
+++ */
+++static uint64_t fd_passlog_bins_total, fd_passlog_bins_max;
+++
+++PUBLIC void fd_passlog_read(struct pipe_context *pctx, uint64_t out[6]) in_dt;
+++
+++PUBLIC void
+++fd_passlog_read(struct pipe_context *pctx, uint64_t out[6])
+++{
+++   struct fd_context *ctx = fd_context(pctx);
+++
+++   out[0] = ctx->stats.batch_total;
+++   out[1] = ctx->stats.batch_sysmem;
+++   out[2] = ctx->stats.batch_gmem;
+++   out[3] = ctx->stats.batch_nondraw;
+++   out[4] = fd_passlog_bins_total;
+++   out[5] = fd_passlog_bins_max;
++ }
++ 
++ void
++@@ -786,6 +810,8 @@
++          gmem->bin_w, gmem->bin_h);
++       if (ctx->query_prepare)
++          ctx->query_prepare(batch, gmem->nbins_x * gmem->nbins_y);
+++      fd_passlog_bins_total += gmem->nbins_x * gmem->nbins_y;   /* passlog */
+++      fd_passlog_bins_max = MAX2(fd_passlog_bins_max, gmem->nbins_x * gmem->nbins_y);
++       render_tiles(batch, gmem);
++       trace_end_render_pass(&batch->trace, batch->gmem);
++       batch->gmem_state = NULL;
