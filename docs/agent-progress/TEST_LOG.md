@@ -341,3 +341,25 @@ Reading (lead, `experimental`):
 - Command buffers occupy about 63 % of wall time in pA (10.9/s x 57.5 ms) and the kernel waits on the GPU for 17 %. About 40 of the 58 ms of a frame is therefore not a wait for the GPU: it is spent before the wait, in the plug-in, the library, Mesa or the submit call. Whether that time is on a processor or blocked is not known (no profile yet).
 - `the GPU worked N us` is from the ring write to the first look that finds the submission done, and looks happen only while somebody waits (`SweetAdreno.cpp` 522-546, read 2026-11-13 in `~/Developer/ios-sweet-work/cxnu`). With one wait per command buffer the earlier submissions of a frame are noticed late, so that figure overstates GPU execution. The 0161wA2 reading "a command buffer takes about 80 ms on the GPU" is withdrawn.
 - Two points give a rough split (different draws per frame, so indicative only): 57.5 = a + b and 42.7 = a + 0.444 b give a fixed part of about 31 ms and a pixel part of about 27 ms at 1125x2436.
+
+## Library lock off with passlog, 0164nL, 2026-11-13 (real device, one boot, unattended, synthetic swipes)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | `shim-boot-0164nL.img` (05bad1db...), the 0163pA args + `sweetmetal_nolock=1`; payload 0001-0013, nothing flashed | `tools/sweet-boot-test.sh shim/out/shim-boot-0164nL.img 0164nL 420` (lead, RAM only) | Faster if the library's serialising lock (0009) is part of the frame | `NOT serialized` in three processes. backboardd busy blocks: 219 s, 2155 command buffers (9.8/s), 96.8 draws/cb; **61.7 ms per command buffer** (pA 57.5). 199 active s, 2132 swaps. Self-test 17 of 21. No fault lines. Passlog figures are approximate without the lock (0013 note) | `logs/xnu-0164nL.txt` |
+
+Reading: the lock of 0009 is not what the frame waits on. `partially-working` (one boot).
+
+## Patch 0014 (boot-arg `sweetmetal_prof=1`, sampling profiler; passlog names and thread CPU time), 2026-11-13 (host)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | 0014 on 0001-0013 in `metal-build/donor`, plug-in only (`opus-impl`; `reviewer`: ACCEPT-WITH-FIXES, all six items applied by `opus-impl`; the stop window and the register/unregister paths read by the lead) | `tools/check-patch.py`; fresh worktree of the donor commit + 0001..0014, `cmp` | The series reproduces the build tree; library source untouched | `ok`; `redwoodmetal.m` identical, `air_metal.c` identical | `userland/metal/0014-prof.patch` (6a39d99a16a7ed25...) |
+| 2026-11-13 | the profiler block (between the `0014 prof: begin/end` markers) built alone for this Mac, **x86_64**, with the arm64 register names mapped in the test file | `scratchpad/prof-host/run.sh donor/userland/src/redwoodmetal.m && ./prof_test`, `leaks --atExit` (run by `opus-impl`, not rerun by the lead) | No crash or hang; samples; a second thread refused; a thread that exits registered is dropped and sampling resumes | 2679 samples, 5185 unsampled registrations, 1 error only after the leaked exit, target cleared in 1.1 ms, 268 samples after it, the spin function named in a `prof: leaf` row, 0 leaks. NOT covered: the arm64 register reads, the `api` table (every host sample was `(none)`) | scratchpad, not kept in git |
+| 2026-11-13 | same | `bash tools/metal-build.sh driver`, `test`, `payload` (`driver` wipes `obj/`, so `test` must follow it) | Plug-in changes, library does not | Plug-in 6922f55c... -> **c466594f...**; library a9e8c642... and `metaltest` 142d6a49... unchanged | `metal-build/pay/` |
+| 2026-11-13 | kernel 0161 | `tools/sweet-gpu-image.sh` with the 0163pA args + `sweetmetal_prof=1` | `RAMDISK MATCH`, args read back | MATCH; 09073ea3...; args read back | `shim/out/shim-boot-0165fA.img` |
+
+Notes:
+
+- The sampler stops the replaying thread about once a millisecond (suspend, read registers and frame pointers, resume). Stopped time is in the wall figure and not in the CPU figure, so cpu/wall of a prof boot is not comparable with a passlog-only boot, and frame times of a prof boot are a few percent high.
+- A sample is one millisecond of wall time of the replaying thread inside a command buffer, on a processor or blocked. `ours` skips the link register unless the pc is in one of our images.

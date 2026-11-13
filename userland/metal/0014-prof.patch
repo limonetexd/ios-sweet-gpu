@@ -1,0 +1,630 @@
+--- a/userland/src/redwoodmetal.m
++++ b/userland/src/redwoodmetal.m
+@@ -95,7 +95,12 @@
+ #import <objc/runtime.h>
+ #include <IOKit/IOKitLib.h>
+ #include <dlfcn.h>
++#include <mach-o/loader.h>
++#include <mach/mach.h>
+ #include <pthread.h>
++#if __has_feature(ptrauth_calls)
++#include <ptrauth.h>
++#endif
+ 
+ #include "redwood_drawable.h"
+ #include <stdarg.h>
+@@ -1590,10 +1595,12 @@
+ 	unsigned n;
+ 	uint64_t other;
+ 	uint64_t t0;
++	uint64_t cpu0;   /* 0014: this thread's CPU time at the replay's start */
+ };
+ 
+ struct rw_pl_block {
+ 	uint64_t span_ns, cbs, draws;
++	uint64_t cpu_ns, wall_ns;   /* 0014: summed over the interval's cbs */
+ 	unsigned names, top_n;
+ 	struct rw_pl_row top[RW_PL_TOP];
+ 	struct rw_pl_row other;
+@@ -1604,6 +1611,7 @@
+ static struct {
+ 	pthread_mutex_t lock;
+ 	uint64_t start_ns, cbs, draws;
++	uint64_t cpu_ns, wall_ns;   /* 0014 */
+ 	unsigned n;
+ 	struct rw_pl_row rows[RW_PL_SLOTS];
+ 	struct rw_pl_row other;
+@@ -1618,7 +1626,14 @@
+ 	NSString *name = label != nil && [label length] > 0 ? label
+ 			  : [[descriptor fragmentFunction] name];
+ 	const char *bytes = name != nil && [name length] > 0 ? [name UTF8String] : NULL;
++	/* 0014: Core Animation's names all start with this, which left 18 of the 47 visible
++	 * characters to tell them apart */
++	static const char ca_prefix[] = "com.apple.coreanimation.draw.";
+ 
++	if (bytes != NULL && strncmp(bytes, ca_prefix, sizeof(ca_prefix) - 1) == 0 &&
++	    bytes[sizeof(ca_prefix) - 1] != '\0') {
++		bytes += sizeof(ca_prefix) - 1;
++	}
+ 	snprintf(out, RW_PL_NAME, "%s", bytes != NULL ? bytes : "?");
+ 	for (char *c = out; *c != '\0'; c++) {
+ 		if ((unsigned char)*c <= ' ') {
+@@ -1665,6 +1680,7 @@
+ 	cb->n = 0;
+ 	cb->other = 0;
+ 	cb->t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	cb->cpu0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+ }
+ 
+ static void
+@@ -1701,6 +1717,7 @@
+ {
+ 	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+ 	uint64_t ns = now - cb->t0;
++	uint64_t cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - cb->cpu0;
+ 	uint64_t other = cb->other;
+ 	bool emit = false;
+ 
+@@ -1709,6 +1726,8 @@
+ 		rw_pl.start_ns = cb->t0;
+ 	}
+ 	rw_pl.cbs++;
++	rw_pl.cpu_ns += cpu;
++	rw_pl.wall_ns += ns;
+ 	for (unsigned i = 0; i < cb->n; i++) {
+ 		unsigned j;
+ 
+@@ -1741,6 +1760,8 @@
+ 		out->span_ns = now - rw_pl.start_ns;
+ 		out->cbs = rw_pl.cbs;
+ 		out->draws = rw_pl.draws;
++		out->cpu_ns = rw_pl.cpu_ns;
++		out->wall_ns = rw_pl.wall_ns;
+ 		out->names = rw_pl.n;
+ 		out->other = rw_pl.other;
+ 		snprintf(out->other.name, RW_PL_NAME, "(other)");
+@@ -1765,6 +1786,8 @@
+ 		rw_pl.n = 0;
+ 		rw_pl.cbs = 0;
+ 		rw_pl.draws = 0;
++		rw_pl.cpu_ns = 0;
++		rw_pl.wall_ns = 0;
+ 		rw_pl.start_ns = now;
+ 	}
+ 	pthread_mutex_unlock(&rw_pl.lock);
+@@ -1808,17 +1831,514 @@
+ 		snprintf(lib, sizeof(lib), "library: %llu flushes, sysmem/gmem/bins n/a "
+ 			 "(no fd_passlog_read)", (unsigned long long)b->lib.flushes);
+ 	}
+-	rw_print("passlog: %.1f s, %llu cbs, %llu draws, %u names (top %u below); %s\n",
++	/* 0014: with sweetmetal_prof=1 the time the sampler holds this thread suspended is in
++	 * wall and not in cpu */
++	rw_print("passlog: %.1f s, %llu cbs, %llu draws, %u names (top %u below); %s, "
++		 "cpu %.2f ms of wall %.2f ms\n",
+ 		 b->span_ns / 1e9, (unsigned long long)b->cbs, (unsigned long long)b->draws,
+-		 b->names, b->top_n, lib);
++		 b->names, b->top_n, lib, b->cpu_ns / 1e6, b->wall_ns / 1e6);
+ 	for (unsigned i = 0; i < b->top_n; i++) {
+ 		rw_pl_row_print(&b->top[i]);
+ 	}
+ 	if (b->other.draws > 0) {
+ 		rw_pl_row_print(&b->other);
++	}
++}
++
++/* 0014 prof: begin */
++/*
++ * 0014 "prof": boot-arg sweetmetal_prof=1 starts, at the first command buffer, one thread
++ * ("redwood prof") that every millisecond stops the thread replaying a command buffer, if
++ * one is, reads its pc, lr and frame-pointer chain, and lets it go. Wall-clock sampling: a
++ * thread blocked in the kernel is sampled too, and counted as waiting. Diagnostics only;
++ * absent, rw_prof_on() is the only work.
++ *
++ * The rules of the stop window (thread_suspend .. thread_resume): the target may hold any
++ * lock in the process (malloc's, dyld's, stdio's, the library's), so between the two calls
++ * this file does nothing that can take a lock or allocate -- two mach calls, reads of the
++ * target's stack inside the bounds it registered, and stores into static arrays. Anything
++ * else (classifying, dladdr, printing) happens after thread_resume.
++ *
++ * rw_prof.lock guards the target and the counters registering threads touch. The sampler
++ * holds it across the stop window, so a target that is unregistering waits at most one
++ * window. The target is held by a send right of its own (mach_thread_self, +1), so its name
++ * cannot be reused while registered; the right belongs to `target`, and whoever clears
++ * `target` under the lock deallocates it once, after unlocking: rw_prof_unregister, or the
++ * sampler when the target is gone (thread_info/thread_suspend failed) or a resume failed.
++ * A failed resume also sets `dead`: no more sampling and no more registering, ever. The
++ * tables are the sampler thread's alone and are never reset.
++ */
++#define RW_PROF_KEY "sweetmetal_prof="
++#define RW_PROF_DEPTH 24
++#define RW_PROF_LEAF_SLOTS 2048
++#define RW_PROF_OURS_SLOTS 2048
++#define RW_PROF_API_SLOTS 256
++#define RW_PROF_PERIOD_NS 1000000ull
++#ifndef RW_PROF_PRINT_NS   /* the host test shortens it */
++#define RW_PROF_PRINT_NS 60000000000ull
++#endif
++#define RW_PROF_PRINT_MIN 200
++#define RW_PROF_PRINT_LINES 80
++
++static bool
++rw_prof_on(void)
++{
++	static dispatch_once_t once;
++	static bool on;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at = NULL;
++
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			for (at = args; (at = strstr(at, RW_PROF_KEY)) != NULL;
++			     at += strlen(RW_PROF_KEY)) {
++				if (at == args || at[-1] == ' ') {
++					break;
++				}
++			}
++		}
++		on = at != NULL && at[strlen(RW_PROF_KEY)] == '1';
++	});
++	return on;
++}
++
++struct rw_prof_slot {
++	uintptr_t addr;   /* 0: empty */
++	uint64_t count;
++};
++
++static struct {
++	pthread_mutex_t lock;
++	/* under lock */
++	bool started;
++	bool dead;                   /* a resume failed: nothing more, ever */
++	mach_port_t target;          /* MACH_PORT_NULL: none; owns one send right */
++	uintptr_t stack_lo, stack_hi;
++	uint64_t cbs, unsampled;
++	/* the sampler thread's alone */
++	uint64_t samples, running, waiting, errors, dropped, ours_none, api_none;
++	uintptr_t self_lo, self_hi, lib_lo, lib_hi;
++	struct rw_prof_slot leaf[RW_PROF_LEAF_SLOTS];
++	struct rw_prof_slot ours[RW_PROF_OURS_SLOTS];
++	struct rw_prof_slot api[RW_PROF_API_SLOTS];
++	bool taken[RW_PROF_LEAF_SLOTS];   /* the top-N scan's scratch */
++	/* one sample: [0] pc, [1] lr, [2..] return addresses innermost first */
++	uintptr_t frame[RW_PROF_DEPTH + 2];
++	unsigned frames;
++} rw_prof = { .lock = PTHREAD_MUTEX_INITIALIZER };
++
++static uintptr_t
++rw_prof_strip(uintptr_t addr)
++{
++#if __has_feature(ptrauth_calls)
++	return (uintptr_t)ptrauth_strip((void *)addr, ptrauth_key_return_address);
++#else
++	return addr;
++#endif
++}
++
++/* the image holding `address`: [base, base + __TEXT's vmsize), from its own load commands */
++static void
++rw_prof_image(const void *address, uintptr_t *lo, uintptr_t *hi)
++{
++	Dl_info info;
++
++	*lo = *hi = 0;
++	if (address == NULL || dladdr(address, &info) == 0 || info.dli_fbase == NULL) {
++		return;
+ 	}
++	const struct mach_header_64 *mh = info.dli_fbase;
++	if (mh->magic != MH_MAGIC_64) {
++		return;
++	}
++	const uint8_t *at = (const uint8_t *)(mh + 1);
++	for (uint32_t i = 0; i < mh->ncmds; i++) {
++		const struct load_command *lc = (const struct load_command *)at;
++
++		if (lc->cmd == LC_SEGMENT_64) {
++			const struct segment_command_64 *seg = (const void *)lc;
++
++			if (strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0) {
++				*lo = (uintptr_t)mh;
++				*hi = (uintptr_t)mh + (uintptr_t)seg->vmsize;
++				return;
++			}
++		}
++		at += lc->cmdsize;
++	}
+ }
+ 
++static bool
++rw_prof_in(uintptr_t addr, uintptr_t lo, uintptr_t hi)
++{
++	return addr >= lo && addr < hi;
++}
++
++static void
++rw_prof_count(struct rw_prof_slot *table, unsigned slots, uintptr_t addr)
++{
++	unsigned i = (unsigned)(((uint64_t)(addr >> 2) * 0x9E3779B97F4A7C15ull) >> 40) &
++		     (slots - 1);
++
++	for (unsigned probe = 0; probe < slots; probe++, i = (i + 1) & (slots - 1)) {
++		if (table[i].addr == addr) {
++			table[i].count++;
++			return;
++		}
++		if (table[i].addr == 0) {
++			table[i].addr = addr;
++			table[i].count = 1;
++			return;
++		}
++	}
++	rw_prof.dropped++;
++}
++
++/* one taken sample (rw_prof.frame), after the target has been resumed */
++static void
++rw_prof_classify(void)
++{
++	uintptr_t ours = 0, api = 0;
++
++	if (rw_prof.frame[0] != 0) {
++		rw_prof_count(rw_prof.leaf, RW_PROF_LEAF_SLOTS, rw_prof.frame[0]);
++	}
++	/* "ours" is the pc when it is in one of our two images, else the innermost return
++	 * address READ FROM THE STACK that is. lr is skipped: it is the live return address
++	 * only in a frameless leaf, and stale anywhere else. The price: when the pc is in a
++	 * frameless leaf outside our images (a mach trap, say), the frame that called that leaf
++	 * is not seen, and "ours" is the first of our frames further out. */
++	for (unsigned i = 0; i < rw_prof.frames; i++) {
++		uintptr_t a = rw_prof.frame[i];
++
++		if (i == 1) {
++			continue;   /* lr: see above (if the pc were ours, i == 0 already won) */
++		}
++		if (a != 0 && (rw_prof_in(a, rw_prof.self_lo, rw_prof.self_hi) ||
++			       rw_prof_in(a, rw_prof.lib_lo, rw_prof.lib_hi))) {
++			ours = a;
++			break;
++		}
++	}
++	/* the outermost return address in the library: walk from the outside in */
++	for (unsigned i = rw_prof.frames; i > 0; i--) {
++		uintptr_t a = rw_prof.frame[i - 1];
++
++		if (a != 0 && rw_prof_in(a, rw_prof.lib_lo, rw_prof.lib_hi)) {
++			api = a;
++			break;
++		}
++	}
++	if (ours != 0) {
++		rw_prof_count(rw_prof.ours, RW_PROF_OURS_SLOTS, ours);
++	} else {
++		rw_prof.ours_none++;
++	}
++	if (api != 0) {
++		rw_prof_count(rw_prof.api, RW_PROF_API_SLOTS, api);
++	} else {
++		rw_prof.api_none++;
++	}
++}
++
++/* clears the target under rw_prof.lock and hands back its send right, which the caller
++ * deallocates after unlocking */
++static mach_port_t
++rw_prof_drop_target_locked(void)
++{
++	mach_port_t port = rw_prof.target;
++
++	rw_prof.target = MACH_PORT_NULL;
++	rw_prof.stack_lo = rw_prof.stack_hi = 0;
++	return port;
++}
++
++enum rw_prof_result { RW_PROF_NONE, RW_PROF_TAKEN, RW_PROF_DEAD };
++
++/* Takes one sample of the registered target, if there is one. RW_PROF_TAKEN: rw_prof.frame
++ * holds it. RW_PROF_DEAD: a resume failed and the sampler must stop. */
++static enum rw_prof_result
++rw_prof_sample(void)
++{
++	bool taken = false;
++	mach_port_t release = MACH_PORT_NULL;
++
++	pthread_mutex_lock(&rw_prof.lock);
++	mach_port_t target = rw_prof.target;
++	uintptr_t lo = rw_prof.stack_lo, hi = rw_prof.stack_hi;
++
++	if (rw_prof.dead || target == MACH_PORT_NULL ||
++	    target == pthread_mach_thread_np(pthread_self())) {
++		pthread_mutex_unlock(&rw_prof.lock);
++		return RW_PROF_NONE;
++	}
++	/* before the stop: whether it was on a CPU or blocked. A failure here or in the
++	 * suspend means the thread is gone (it exited registered): drop it. */
++	thread_basic_info_data_t basic;
++	mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
++	if (thread_info(target, THREAD_BASIC_INFO, (thread_info_t)&basic, &basic_count) !=
++	    KERN_SUCCESS) {
++		rw_prof.errors++;
++		release = rw_prof_drop_target_locked();
++		pthread_mutex_unlock(&rw_prof.lock);
++		mach_port_deallocate(mach_task_self(), release);
++		return RW_PROF_NONE;
++	}
++
++	/* ---- stop window: no locks, no allocation, no logging, no dladdr ---- */
++	if (thread_suspend(target) != KERN_SUCCESS) {
++		rw_prof.errors++;
++		release = rw_prof_drop_target_locked();
++		pthread_mutex_unlock(&rw_prof.lock);
++		mach_port_deallocate(mach_task_self(), release);
++		return RW_PROF_NONE;
++	}
++	arm_thread_state64_t state;
++	mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
++	if (thread_get_state(target, ARM_THREAD_STATE64, (thread_state_t)&state,
++			     &state_count) == KERN_SUCCESS) {
++		uintptr_t fp = (uintptr_t)arm_thread_state64_get_fp(state);
++		uintptr_t sp = (uintptr_t)arm_thread_state64_get_sp(state);
++		unsigned n = 0;
++
++		/* only sp .. top is known to be mapped; the registered range below sp may not be */
++		if (sp > lo) {
++			lo = sp;
++		}
++		rw_prof.frame[n++] = rw_prof_strip((uintptr_t)arm_thread_state64_get_pc(state));
++		rw_prof.frame[n++] = rw_prof_strip((uintptr_t)arm_thread_state64_get_lr(state));
++		while (n < RW_PROF_DEPTH + 2 && hi >= 16 && fp >= lo && fp <= hi - 16 &&
++		       (fp & 15) == 0) {
++			uintptr_t next = ((const uintptr_t *)fp)[0];
++			uintptr_t ret = rw_prof_strip(((const uintptr_t *)fp)[1]);
++
++			if (ret == 0) {
++				break;
++			}
++			rw_prof.frame[n++] = ret;
++			if (next <= fp) {   /* strictly increasing, or the chain ends */
++				break;
++			}
++			fp = next;
++		}
++		rw_prof.frames = n;
++		taken = true;
++	}
++	kern_return_t resumed = thread_resume(target);
++	/* ---- end of stop window ---- */
++
++	if (resumed != KERN_SUCCESS) {
++		/* the target may stay stopped; never touch it, or anything, again */
++		rw_prof.errors++;
++		rw_prof.dead = true;
++		release = rw_prof_drop_target_locked();
++		pthread_mutex_unlock(&rw_prof.lock);
++		mach_port_deallocate(mach_task_self(), release);
++		rw_print("prof: THREAD_RESUME FAILED (%d); the sampler stops for good and the "
++			 "thread it stopped may stay stopped\n", resumed);
++		return RW_PROF_DEAD;
++	}
++	if (!taken) {
++		rw_prof.errors++;
++	} else {
++		rw_prof.samples++;
++		if (basic.run_state == TH_STATE_RUNNING) {
++			rw_prof.running++;
++		} else {
++			rw_prof.waiting++;
++		}
++	}
++	pthread_mutex_unlock(&rw_prof.lock);
++	return taken ? RW_PROF_TAKEN : RW_PROF_NONE;
++}
++
++static void
++rw_prof_line(const char *kind, uintptr_t addr, uint64_t count)
++{
++	Dl_info info;
++
++	if (dladdr((const void *)addr, &info) != 0 && info.dli_fbase != NULL) {
++		const char *base = info.dli_fname != NULL ? strrchr(info.dli_fname, '/') : NULL;
++
++		base = base != NULL ? base + 1 : info.dli_fname != NULL ? info.dli_fname : "?";
++		rw_print("prof: %s %llu %s+0x%lx %s+0x%lx\n", kind, (unsigned long long)count,
++			 base, (unsigned long)(addr - (uintptr_t)info.dli_fbase),
++			 info.dli_sname != NULL ? info.dli_sname : "?",
++			 info.dli_saddr != NULL ? (unsigned long)(addr - (uintptr_t)info.dli_saddr)
++						: 0ul);
++	} else {
++		rw_print("prof: %s %llu ?+0x%lx ?+0x0\n", kind, (unsigned long long)count,
++			 (unsigned long)addr);
++	}
++}
++
++/* the `top` largest of `table`, at most `*budget` lines */
++static void
++rw_prof_top(const char *kind, const struct rw_prof_slot *table, unsigned slots, unsigned top,
++	    unsigned *budget)
++{
++	memset(rw_prof.taken, 0, sizeof(rw_prof.taken));
++	for (unsigned k = 0; k < top && *budget > 0; k++) {
++		unsigned best = slots;
++
++		for (unsigned i = 0; i < slots; i++) {
++			if (table[i].addr != 0 && !rw_prof.taken[i] &&
++			    (best == slots || table[i].count > table[best].count)) {
++				best = i;
++			}
++		}
++		if (best == slots) {
++			break;
++		}
++		rw_prof.taken[best] = true;
++		rw_prof_line(kind, table[best].addr, table[best].count);
++		(*budget)--;
++	}
++}
++
++static void
++rw_prof_print(void)
++{
++	unsigned budget = RW_PROF_PRINT_LINES;
++
++	pthread_mutex_lock(&rw_prof.lock);
++	uint64_t cbs = rw_prof.cbs, unsampled = rw_prof.unsampled;
++	pthread_mutex_unlock(&rw_prof.lock);
++
++	rw_print("prof: %llu samples (running %llu, waiting %llu), %llu cbs sampled, "
++		 "%llu unsampled, %llu errors, %llu dropped; RedwoodMetal base 0x%lx, "
++		 "libredwoodair base 0x%lx\n",
++		 (unsigned long long)rw_prof.samples, (unsigned long long)rw_prof.running,
++		 (unsigned long long)rw_prof.waiting, (unsigned long long)cbs,
++		 (unsigned long long)unsampled, (unsigned long long)rw_prof.errors,
++		 (unsigned long long)rw_prof.dropped, (unsigned long)rw_prof.self_lo,
++		 (unsigned long)rw_prof.lib_lo);
++	budget--;
++	rw_prof_top("leaf", rw_prof.leaf, RW_PROF_LEAF_SLOTS, 30, &budget);
++	rw_prof_top("ours", rw_prof.ours, RW_PROF_OURS_SLOTS, 30, &budget);
++	if (rw_prof.ours_none > 0 && budget > 0) {
++		rw_print("prof: ours %llu (none)\n", (unsigned long long)rw_prof.ours_none);
++		budget--;
++	}
++	rw_prof_top("api", rw_prof.api, RW_PROF_API_SLOTS, 12, &budget);
++	if (rw_prof.api_none > 0 && budget > 0) {
++		rw_print("prof: api %llu (none)\n", (unsigned long long)rw_prof.api_none);
++		budget--;
++	}
++}
++
++static void *
++rw_prof_main(void *arg)
++{
++	(void)arg;
++	pthread_setname_np("redwood prof");
++	/* once, and outside any stop window: dladdr takes dyld's lock */
++	rw_prof_image((const void *)rw_prof_main, &rw_prof.self_lo, &rw_prof.self_hi);
++	rw_prof_image(*(void **)&mesa.device_open, &rw_prof.lib_lo, &rw_prof.lib_hi);
++	rw_print("prof: sampling every %llu us; RedwoodMetal 0x%lx-0x%lx, libredwoodair "
++		 "0x%lx-0x%lx%s\n", RW_PROF_PERIOD_NS / 1000, (unsigned long)rw_prof.self_lo,
++		 (unsigned long)rw_prof.self_hi, (unsigned long)rw_prof.lib_lo,
++		 (unsigned long)rw_prof.lib_hi,
++		 rw_prof.lib_lo == 0 ? " (library not found: api is all (none))" : "");
++
++	uint64_t last_print = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++	uint64_t printed_samples = 0;
++	for (;;) {
++		struct timespec period = { 0, (long)RW_PROF_PERIOD_NS };
++
++		nanosleep(&period, NULL);
++		enum rw_prof_result r = rw_prof_sample();
++		if (r == RW_PROF_DEAD) {
++			return NULL;
++		}
++		if (r == RW_PROF_TAKEN) {
++			rw_prof_classify();
++		}
++		uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++		if (now - last_print >= RW_PROF_PRINT_NS) {
++			last_print = now;
++			if (rw_prof.samples - printed_samples >= RW_PROF_PRINT_MIN) {
++				printed_samples = rw_prof.samples;
++				rw_prof_print();
++			}
++		}
++	}
++}
++
++/* At the replay's start, on the replaying thread: become the sample target if nobody is.
++ * True means this thread must call rw_prof_unregister on its way out of the replay. */
++static bool
++rw_prof_register(void)
++{
++	pthread_t self = pthread_self();
++	mach_port_t port = mach_thread_self();   /* +1 send right: `target` owns it if taken */
++	uintptr_t hi = (uintptr_t)pthread_get_stackaddr_np(self);
++	uintptr_t lo = hi - (uintptr_t)pthread_get_stacksize_np(self);
++	bool start = false, registered = false;
++
++	pthread_mutex_lock(&rw_prof.lock);
++	if (rw_prof.dead) {
++		pthread_mutex_unlock(&rw_prof.lock);
++		mach_port_deallocate(mach_task_self(), port);
++		return false;
++	}
++	if (!rw_prof.started) {
++		rw_prof.started = start = true;
++	}
++	if (rw_prof.target == MACH_PORT_NULL && port != MACH_PORT_NULL) {
++		rw_prof.target = port;
++		rw_prof.stack_lo = lo;
++		rw_prof.stack_hi = hi;
++		rw_prof.cbs++;
++		registered = true;
++	} else {
++		rw_prof.unsampled++;
++	}
++	pthread_mutex_unlock(&rw_prof.lock);
++	if (!registered && port != MACH_PORT_NULL) {
++		mach_port_deallocate(mach_task_self(), port);
++	}
++
++	if (start) {
++		pthread_attr_t attr;
++		pthread_t thread;
++		int rc;
++
++		pthread_attr_init(&attr);
++		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++		/* not preempted between its suspend and its resume by what it is stopping */
++		pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
++		rc = pthread_create(&thread, &attr, rw_prof_main, NULL);
++		pthread_attr_destroy(&attr);
++		if (rc != 0) {
++			rw_print("prof: no sampler thread (pthread_create %d); nothing is sampled\n",
++				 rc);
++		}
++	}
++	return registered;
++}
++
++/* The name compared is the same one mach_thread_self gave (a task has one name per thread
++ * port); if the sampler already dropped this target, it has also released the right. */
++static void
++rw_prof_unregister(void)
++{
++	mach_port_t port = pthread_mach_thread_np(pthread_self());
++	mach_port_t release = MACH_PORT_NULL;
++
++	pthread_mutex_lock(&rw_prof.lock);
++	if (port != MACH_PORT_NULL && rw_prof.target == port) {
++		release = rw_prof_drop_target_locked();
++	}
++	pthread_mutex_unlock(&rw_prof.lock);
++	if (release != MACH_PORT_NULL) {
++		mach_port_deallocate(mach_task_self(), release);
++	}
++}
++/* 0014 prof: end */
++
+ /* The one line per process: what the library actually did, from the first pipeline it
+  * made, since only the library knows whether its compiler has 16-bit ALU. */
+ static void
+@@ -4643,6 +5163,8 @@
+ 	struct rw_pl_cb plcb;
+ 	struct rw_pl_block plblock;
+ 	bool plemit = false;
++	/* 0014 prof: this thread is sampled from here to the end of the wait below `done:` */
++	bool profiled = rw_prof_on() && rw_prof_register();
+ 	if (passlog) {
+ 		rw_passlog_cb_begin(&plcb);
+ 	}
+@@ -4738,6 +5260,9 @@
+ 	if (passlog) {
+ 		plemit = rw_passlog_cb_end(&plcb, device, &plblock);
+ 	}
++	if (profiled) {
++		rw_prof_unregister();
++	}
+ 	rw_lib_unlock();
+ 	if (plemit) {
+ 		rw_passlog_print(&plblock);
