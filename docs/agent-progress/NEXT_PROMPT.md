@@ -1,18 +1,25 @@
 > State 2026-11-13 (device unless noted):
-> - Phone root = `work1.raw` + payload 0001-0011 (library 3560a9da..., `RedwoodMetal` 62645657..., `metaltest` 142d6a49...). Phone being returned to fastboot by the user; no daemon or boot test running. Snapshots in `~/Developer/ios-sweet-work/root/`: `work1-pre0011.raw` (0001-0010), `work1-pre0010.raw`, `work1-pre0008.raw`.
-> - 0011 (one GPU wait per command buffer): `partially-working`, 0161wA2, one boot. Subs/swap 98 -> 7.3, kernel cache cost 32.7 s/183 s -> 1.9 s/76 s, max 15 swaps/s; self-test 17 of 21, item 21 PASS. User: no better performance by eye; widgets and Control Centre still broken. Submit-to-done is now about 80 ms per submission (1310 of 1431 over 4 ms). Old path: `sweetmetal_drawwait=1` (image `shim/out/shim-boot-0161wB.img`, never booted).
-> - Tools: `python3 -I tools/sweet-subs-per-swap.py logs/xnu-TAG.txt` and `tools/sweet-fps-summary.py`. After any boot, `rg 'SMMU gfsr|fault address|THE GPU DID NOT FINISH' logs/xnu-TAG.txt` first.
-> - Builds: `bash tools/metal-build.sh ios`, `driver`, `test`, `payload`, in that order (`driver` empties `obj/`). Lesson from 0161wA: softpipe runs work at flush, so it cannot catch a lifetime bug in a deferred batch. Read freedreno's reference rules before changing what a batch holds.
-> - Budget: Fable weekly allowance used up until Nov 15 19:00 Europe/Madrid; check the meter first.
+> - Phone root = `work1.raw` + payload 0001-0011 (library 3560a9da..., `RedwoodMetal` 62645657..., `metaltest` 142d6a49...). Phone in fastboot (user); no daemon or boot test running. Snapshots in `~/Developer/ios-sweet-work/root/`: `work1-pre0011.raw` (0001-0010), `work1-pre0010.raw`, `work1-pre0008.raw`.
+> - 0011: `partially-working`, 0161wA2, one boot. Subs/swap 7.3; steady-state submit-to-done 19-41 ms per submission (the 82.6 ms mean is skewed by two early intervals).
+> - Host reading 2026-11-13 (`TEST_LOG.md` last section): UI batches run GMEM, about 24 bins (4x6 of 288x416 if GMEM is 512 KiB; the size our backend reports was not found), a load and a store per bin. Per-draw framebuffer rebind does not split the batch (inferred, batch-cache lookup unread). GPU clock is not logged anywhere.
+> - Tools: `python3 -I tools/sweet-subs-per-swap.py logs/xnu-TAG.txt`, `tools/sweet-fps-summary.py`. After any boot, `rg 'SMMU gfsr|fault address|THE GPU DID NOT FINISH' logs/xnu-TAG.txt` first.
+> - Builds: `bash tools/metal-build.sh ios`, `driver`, `test`, `payload`, in that order (`driver` empties `obj/`).
+> - Budget: Fable weekly allowance; check the meter first. Delegate typing to opus/sonnet.
 
-# Phase: where the 80 ms per command buffer goes (measure before changing)
+# Phase: A/B boot, GMEM against sysmem (patch 0012, plug-in only)
 
-Read `CLAUDE.md`, the last two sections of `TEST_LOG.md`, and `GPU_DECISION.md` "Metal frame time". Plan in ten lines, wait for go-ahead.
+Read `CLAUDE.md` and the last section of `TEST_LOG.md`. Plan in ten lines, wait for go-ahead.
 
-1. Host, existing logs: the `0161wA` trace had `fd_gmem_render_tiles`, so batches now run tiled. Read (do not change) freedreno's sysmem/GMEM choice in Mesa 25.0.7 (`freedreno_gmem.c`, the `FD_MESA_DEBUG` flags `sysmem` and `gmem`), the bin count for a 1125x2436 BGRA target on the A618 GMEM size, and what each bin restores and resolves.
-2. Host: does the library rebind the framebuffer per draw (`bind_pass_framebuffer` / `release_pass_framebuffer` with an empty framebuffer between draws), and does that cost anything inside one freedreno batch?
-3. Kernel log: is the running GPU clock logged? If not, it is the missing measurement (read-only).
-4. Output: one measurement boot, or one A/B pair, with a boot-arg that only selects an existing Mesa mode (for example `FD_MESA_DEBUG=sysmem` set by the plug-in before the device opens). No register writes, no new packets. Spec only until the user approves.
-5. Record in `TEST_LOG.md` (host fidelity), `METAL_FINDINGS.md` 10 item 6, and `GPU_DECISION.md`; write the next prompt.
+Spec (one behaviour change, one build, one boot):
 
-Not in this phase: widgets (check the `0xDEAD10CC` WidgetExtension kills first), Control Centre glyphs, masks, battery icon, brightness, Wi-Fi.
+1. `redwoodmetal.m`, next to `rw_wait_per_commit` (about line 1355): read boot-arg `sweetmetal_fddebug=<word[,word]>` from `kern.bootargs` once per process, before the library opens the device. If present and made only of `[a-z,]`, at most 63 characters, `setenv("FD_MESA_DEBUG", value, 1)` and `rw_print("FD_MESA_DEBUG: %s (boot-arg sweetmetal_fddebug)\n", value)`. Absent: do nothing, print nothing. No library change, no kernel change, no new packets: the flag selects code paths that exist in Mesa 25.0.7.
+2. In the same patch, one log line at device open with what freedreno decided: `screen->gmemsize_bytes` and the bin layout if the library can reach them without a new entry point; otherwise leave it out and say so (do not add an interface for it in this phase).
+3. Writer: `opus-impl` from this spec; `reviewer` on the diff. Host: build `ios`, `driver`, `test`, `payload`; host tests must still pass (softpipe ignores the flag, so they prove only that the absent-boot-arg path is unchanged).
+4. Images: `0162sB` = 0161wA args + `sweetmetal_fddebug=sysmem`. Control is the existing 0161wA2 log (same library); boot a fresh control `0162sA` (no flag) only if the payload hash changes anything but the plug-in. Auto-return to fastboot must be in the boot-args (check the payload).
+5. Rung: reversible (`fastboot boot`, RAM only; payload flash is snapshot-first, snapshot `work1-pre0012.raw`). The user flashes and boots.
+6. Read after the boot, in this order: faults (`SMMU gfsr`, `fault address`, `THE GPU DID NOT FINISH`), backboardd crashes, self-test count (17 of 21 expected, item 21), then `the GPU worked` per interval and swaps/s against 0161wA2. Sysmem writes the IOSurface directly, so a fault here is a real result, not noise: stop and record.
+7. Outcomes: sysmem clearly faster (steady state well under 19 ms) -> next phase makes the choice per pass, behind the flag. No change -> tiling is not the cost; next phase is the GPU clock readback (kernel, read-only register reads, its own spec). Slower or faulting -> record, keep GMEM.
+8. Optional second boot only with the user's approval: `sweetmetal_fddebug=nobin` (GMEM without the binning pass).
+9. Record in `TEST_LOG.md`, `METAL_FINDINGS.md` 10 item 6, `GPU_DECISION.md`; one boot is `partially-working` at most; write the next prompt.
+
+Not in this phase: GPU clock changes, widgets (check the `0xDEAD10CC` WidgetExtension kills first), Control Centre glyphs, masks, battery icon, brightness, Wi-Fi.
