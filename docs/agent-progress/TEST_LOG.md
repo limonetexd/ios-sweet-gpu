@@ -302,3 +302,42 @@ Notes:
 - The per-name time is CPU wall clock from replay start to the end of the wait in the plug-in, per command buffer. It is not the kernel's `the GPU worked` figure and is shared by every name in the command buffer.
 - `sweetgpu_swipe=90` (synthetic swipe every 3 s) is in both images because the user is away. pA and pB share that workload; neither is comparable with the hand-touched 0162 runs.
 - Bin counters are per process, batch counters per context; with `sweetmetal_nolock=1` (not set here) all figures are approximate.
+
+## Patch 0013 on the device, 0163pA and 0163pB, 2026-11-13 (real device, one boot each, unattended, synthetic swipes)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | `shim-boot-0163pA.img` (ecd50afe...), root `work1.raw` + payload 0001-0013 (library a9e8c642..., plug-in 6922f55c...); `userdata` flashed by the lead on the user's typed pre-authorisation, snapshot `work1-pre0013.raw` | `tools/metal-flash-test.sh ~/Developer/ios-sweet-work/root/work1.raw shim/out/shim-boot-0163pA.img 0163pA 420` (flash 461 s, back in fastboot after 334 s) | `passlog:` lines; no fault | 440 `passlog:` lines; open line in backboardd, SpringBoard, metaltest: `FD_MESA_DEBUG=0`, screen created by this open, hook found. No `SMMU gfsr`, `fault address`, `THE GPU DID NOT FINISH`, `table arena full`. `sweet-passlog-summary.py`, backboardd busy blocks: 198 s, 2148 command buffers (10.9/s), 97.4 draws/cb, 2.0 flushes/cb, 6.4 batches/cb = sysmem 4.37 + GMEM 1.81 + nondraw 0.26, 41.7 bins per GMEM batch (max 54); **57.5 ms per command buffer**. `sweet-subs-per-swap.py`: 198 active s, 2212 swaps, max 18/s, subs/swap 4.0. `the GPU worked`: last six intervals 3.7-4.8 s of submit-to-done per interval of about 5 s, 209-269 submissions each | `logs/xnu-0163pA.txt` |
+| 2026-11-13 | `shim-boot-0163pB.img` (7dd512a9...), same root and payload, nothing flashed, + `sweetmetal_fddebug=sysmem` | `tools/sweet-boot-test.sh shim/out/shim-boot-0163pB.img 0163pB 420` (lead, RAM only) | GMEM batches go to 0 if the flag is real; faster or not | Open line `FD_MESA_DEBUG=0x200 (sysmem on ...)`, screen created by this open. backboardd busy blocks: 199 s, 2159 command buffers (10.8/s), 97.6 draws/cb, 6.5 batches/cb = **sysmem 6.18 + GMEM 0.00** + nondraw 0.28; **58.7 ms per command buffer**. 199 active s, 2174 swaps, max 17/s, subs/swap 3.9. No fault lines, no `table arena full`. Last six intervals 3.2-4.4 s of submit-to-done per about 5 s | `logs/xnu-0163pB.txt` |
+
+Reading (lead, two logs, `experimental`):
+
+- **The sysmem flag is real and changes nothing.** 1.81 GMEM batches of about 42 bins per frame become sysmem batches and the frame costs the same (57.5 against 58.7 ms). Tiling is not what costs us on this workload. This closes reading (b) of `FRAME_RATE_RESEARCH.md` section 6.
+- **A frame is one command buffer of about 97 draws and it takes about 58 ms**, nearly all of it waiting: about 4 submissions per frame at 17-19 ms submit-to-done each, the GPU side occupied about 75-80 % of the time. 97 draws in 58 ms is 0.6 ms a draw.
+- **`luma_boost` is not the cost here.** The only candidate name, `...PBGRAXm_TlubA2Xhf_` (truncated; unconfirmed that it is luma boost), is 29 draws of 209000 in pA. The names are cut at 47 characters and all start with `com.apple.coreanimation.draw.`, so suffixes are lost: fix in the plug-in before relying on names.
+- The top name is `...PBGRABsovXm_TimgA2` (image, source-over), about 45 draws a frame; then `...PBGRAXm_TcimBdsoA2` (17), `...PBGRABsovXm_TmuaA2` (9), `...PBGRAXm_A2Xhfc` (7).
+- Per-name time is the command buffer's, so every name that is in every frame shows the same 57-59 ms: the log ranks command buffers, not draws. A per-batch or per-draw GPU time needs another change.
+- Workload caveat: page swipes every 3 s from `sweetgpu_swipe=90`, nobody at the phone. Not comparable with 0162sA/sB (hand touches; 9.6 swaps per active s there, 11 here).
+
+0013: `partially-working` (two boots, the counters agree with the flag); passlog adds no fault. 0012's effect on the render mode: `partially-working` (one boot, 0163pB).
+
+## 750x1624 with passlog, 0164z2, 2026-11-13 (real device, one boot, unattended, synthetic swipes)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | `shim-boot-0164z2.img` (37985535...), the 0163pA args built with `SWEET_SCALE=2`; same root and payload, nothing flashed | `tools/sweet-boot-test.sh shim/out/shim-boot-0164z2.img 0164z2 420` (lead, RAM only) | If the frame cost is pixels, 2.25 times less | `SWEET FB: device tree canvas 750x1624 ... scaled to the panel`. backboardd busy blocks: 194 s, 2703 command buffers (13.9/s), 81.3 draws/cb, 6.2 batches/cb = sysmem 4.19 + GMEM 1.77 + nondraw 0.21, 18.9 bins per GMEM batch; **42.7 ms per command buffer** (pA 57.5). 195 active s, 2796 swaps, max 22/s. Self-test 17 of 21. No fault lines | `logs/xnu-0164z2.txt` |
+
+Kernel wait accounting, last 20 statistics intervals of each log (host arithmetic on `RedwoodGPU:` lines, `experimental`):
+
+| Log | Wall | Waits for the GPU | Cache flush in submit | IOSurface take |
+| --- | --- | --- | --- | --- |
+| 0162sA | 122 s | 915 waits, 7.9 s (6 %) | 6.5 s (5 %) | 1.9 s (2 %) |
+| 0163pA | 102 s | 1200 waits, 17.2 s (17 %) | 4.3 s (4 %) | 2.5 s (2 %) |
+| 0163pB | 101 s | 1154 waits, 16.3 s (16 %) | 4.3 s (4 %) | 2.4 s (2 %) |
+| 0164z2 | 102 s | 1468 waits, 5.9 s (6 %) | 2.4 s (2 %) | 1.4 s (1 %) |
+
+Reading (lead, `experimental`):
+
+- Command buffers occupy about 63 % of wall time in pA (10.9/s x 57.5 ms) and the kernel waits on the GPU for 17 %. About 40 of the 58 ms of a frame is therefore not a wait for the GPU: it is spent before the wait, in the plug-in, the library, Mesa or the submit call. Whether that time is on a processor or blocked is not known (no profile yet).
+- `the GPU worked N us` is from the ring write to the first look that finds the submission done, and looks happen only while somebody waits (`SweetAdreno.cpp` 522-546, read 2026-11-13 in `~/Developer/ios-sweet-work/cxnu`). With one wait per command buffer the earlier submissions of a frame are noticed late, so that figure overstates GPU execution. The 0161wA2 reading "a command buffer takes about 80 ms on the GPU" is withdrawn.
+- Two points give a rough split (different draws per frame, so indicative only): 57.5 = a + b and 42.7 = a + 0.444 b give a fixed part of about 31 ms and a pixel part of about 27 ms at 1125x2436.

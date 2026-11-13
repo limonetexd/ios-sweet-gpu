@@ -28,7 +28,7 @@ Re-planned 2026-11-11 (full list: `METAL_FINDINGS.md` section 10; routing: `SUBA
 1. GPU fault then compositor crash (0160d9, `METAL_FINDINGS.md` 10 item 1b). Respring on app exit is `partially-working` with patches 0008+0009 (one boot, attribution unknown).
 2. (withdrawn) Blue tint of whites: camera artefact, not on the screen (user, 2026-11-11).
 3. Visual faults: patch 0010 (scissor rectangle) is on the phone, `partially-working` (0161sA/0161sB, one boot each, 2026-11-12): green fault and app-close fault gone with it, back without it; self-test 16 of 20. Left: status-bar battery icon, dotted blur, Control Centre glyphs, widgets.
-4. Frame rate (user priority 1): 0011 on the phone (0161wA2, one boot): submissions per swap 98 -> 7.3, cache cost gone, but no better by eye; a command buffer now takes about 80 ms on the GPU. Next: measure GMEM against sysmem and the GPU clock (`NEXT_PROMPT.md`). Then widgets and Control Centre (still broken); brightness and Wi-Fi later.
+4. Frame rate (user priority 1): 0013 on the phone (0163pA/pB, 0164z2, one boot each, synthetic swipes): a frame is one command buffer of about 97 draws and 58 ms; forcing sysmem changes nothing (GMEM 1.8 -> 0 batches a frame, 58.7 ms); the kernel waits on the GPU for only about 17 % of wall time, so most of the 58 ms is CPU-side in the plug-in, the library or the submit path, not GPU execution (the earlier "80 ms on the GPU" was the kernel's late-noticed figure). 750x1624 gives 42.7 ms. Next: 0014, a sampling profiler of the replay thread (`NEXT_PROMPT.md`, `FRAME_RATE_RESEARCH.md` section 9). Then widgets and Control Centre (still broken); brightness and Wi-Fi later.
 
 Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 
@@ -39,6 +39,6 @@ Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 - **Finding:** the 0139 "worked" figure is latency, not GPU busy. Ring occupied 6–21 ms per swap at native; GPU unfinished on 19–48 % of native ticks with a new frame. Two Phase 0 readings corrected in `GPU_DECISION.md`.
 - **Verified (host/CI/read-only device):** git state, upstream divergence, CI status, patch format check, phone is `sweet` / `SM7 UFS` / secure.
 - **Verified by reading source:** the GPU path is GLES over Mesa freedreno, the msm-shaped kernel interface, CPU-copy present.
-- **Not verified:** GPU execution per frame; running GPU clock (430 MHz requested); per-frame intervals; bandwidth; time before the first draw; Wi-Fi rung 3.
+- **Not verified:** GPU execution per frame; running GPU clock (level 6, 650 MHz requested and acknowledged at boot); per-frame intervals; bandwidth; time before the first draw; Wi-Fi rung 3.
 - **Risk:** donor license unresolved (`ios-topaz` none detected, `hackios` NOASSERTION). 0143r, the only no-idle run, has 539 VA errors. `tools/xnu-tree.sh:44-45` runs `git reset --hard` and `clean -fdx` in its `XNU_TREE` target (default `~/cxnu`), so never point it at this repository. `CLAUDE.md` names the wrong upstream for this clone. `NOTES.md` handoff not updated.
 - **Next:** user starts M1. Prompt: `NEXT_PROMPT.md`.

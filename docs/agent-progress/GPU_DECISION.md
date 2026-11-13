@@ -50,7 +50,7 @@ Phase 1b (2026-11-08): GPU execution still cannot be ranked. The 0139 figure is 
 
 - **R1 not shown.** Past correctness failures each closed with a bounded patch (surface leak, pool clamp, VA window). The open freeze has no root cause.
 - **R2 not shown.** The measured workload is GLES; Metal is a missing feature, not a limit of this path. DC28088's frontend claims to reuse the same kernel GPU driver (upstream claim, low confidence).
-- **R3 not shown, but closer.** The Phase 0 statement that every measured loss is CPU-side or pacing no longer holds. Occupancy of 14–21 ms a swap appears only in 0143r (539 VA errors), includes queueing, and is at a requested 430 MHz with no cut to encoding or churn, so the trigger below is unmet. R1 and R2 are unchanged.
+- **R3 not shown, but closer.** The Phase 0 statement that every measured loss is CPU-side or pacing no longer holds. Occupancy of 14–21 ms a swap appears only in 0143r (539 VA errors), includes queueing, and is at a requested 430 MHz (as written then; corrected 2026-11-13: the shim asks the GMU for level 6, 650 MHz, and the kernel logs `gfx3d cfg 0x101 dcvs perf 0x30000006 return 0` at boot, 0163pA; the PLL multiplier is not logged, so the running rate is still unverified) with no cut to encoding or churn, so the trigger below is unmet. R1 and R2 are unchanged.
 
 ## What would change this
 

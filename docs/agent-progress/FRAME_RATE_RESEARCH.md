@@ -81,3 +81,30 @@ Not recommended now: porting upstream's C++ driver (`hakios-metal`). It targets 
 ## 8. Not verified
 
 Upstream's figures; that any of them carries to an A618; the render mode in 0162sB; whether `luma_boost` runs here; the running GPU clock; DDR rate. One boot each: `partially-working` at most.
+
+## 9. Inside a frame: 0163pA, 0163pB, 0164z2 (real device, one boot each, synthetic swipes, 2026-11-13)
+
+Rows and procedures: `TEST_LOG.md`, the three sections after "Patch 0013". All `experimental`.
+
+| | 0163pA (default) | 0163pB (sysmem) | 0164z2 (750x1624) |
+| --- | --- | --- | --- |
+| Command buffers per busy s | 10.9 | 10.8 | 13.9 |
+| Draws per command buffer | 97 | 98 | 81 |
+| Batches per command buffer: sysmem / GMEM | 4.4 / 1.8 | 6.2 / 0 | 4.2 / 1.8 |
+| Bins per GMEM batch | 42 | - | 19 |
+| Time per command buffer | 57.5 ms | 58.7 ms | 42.7 ms |
+| Kernel waits for the GPU, share of wall | 17 % | 16 % | 6 % |
+
+What this settles from sections 6 and 7:
+
+- Step 1 is done. `sweetmetal_fddebug=sysmem` does take effect (step 3 is not needed) and it buys nothing: tiling is not our cost.
+- `luma_boost` (step 2) is not our cost on the home screen: at most 29 draws of 209000, and the name is unconfirmed (truncated).
+- The GPU is not the main cost either. The frame is about 58 ms and only about a third of it is a wait for the GPU. Upstream's 38x sysmem gain and its `luma_boost` share do not carry over to this path.
+- The larger part, about 40 ms for 97 draws (0.4 ms a draw), is spent before the wait. darwin-lisa called 55-110 us a draw slow (DeepSeek notes, unverified), so ours is four to seven times that.
+- Fewer pixels help by a quarter (57.5 -> 42.7 ms), less than the 2.25 a pixel-bound frame would give.
+
+Revised order (replaces steps 2-4 of section 7; 5-9 stand):
+
+1. **Profile the replay thread** (patch 0014, plug-in only, boot-arg `sweetmetal_prof=1`): a sampler thread takes the replaying thread's stack every millisecond and prints the top functions. Also thread CPU time per block, and pipeline names without the common prefix.
+2. Fix what the profile names, one change a boot. Candidates before any data, not to be acted on without it: per-draw state rebuilt from nothing, a lock or a kernel call per draw, shader variant lookups, buffer copies per draw.
+3. GPU clock: the configuration can be read without writing (`gfx3d cfg`, PLL L and fraction at GPUCC `0x1020`/`0x101c`/PLL0, the offsets the shim already uses); upstream's counter writes registers (section 7 item 4). Low priority while the GPU is a third of the frame.
