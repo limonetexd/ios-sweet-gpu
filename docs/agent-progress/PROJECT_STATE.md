@@ -1,4 +1,4 @@
-# Project state — 2026-11-13
+# Project state — 2026-11-14
 
 **Revision:** branch `gpu`; see `git log` for the commit holding these records. Local only, nothing pushed. Untracked and left alone: `.claude/`, `CLAUDE.md`, `SUBAGENTS.md`, and the kickoff, protocol and subagent files in this directory.
 
@@ -28,7 +28,7 @@ Re-planned 2026-11-11 (full list: `METAL_FINDINGS.md` section 10; routing: `SUBA
 1. GPU fault then compositor crash (0160d9, `METAL_FINDINGS.md` 10 item 1b). Respring on app exit is `partially-working` with patches 0008+0009 (one boot, attribution unknown).
 2. (withdrawn) Blue tint of whites: camera artefact, not on the screen (user, 2026-11-11).
 3. Visual faults: patch 0010 (scissor rectangle) is on the phone, `partially-working` (0161sA/0161sB, one boot each, 2026-11-12): green fault and app-close fault gone with it, back without it; self-test 16 of 20. Left: status-bar battery icon, dotted blur, Control Centre glyphs, widgets.
-4. Frame rate (user priority 1): 0013 on the phone (0163pA/pB, 0164z2, one boot each, synthetic swipes): a frame is one command buffer of about 97 draws and 58 ms; forcing sysmem changes nothing (GMEM 1.8 -> 0 batches a frame, 58.7 ms); the kernel waits on the GPU for only about 17 % of wall time, so most of the 58 ms is CPU-side in the plug-in, the library or the submit path, not GPU execution (the earlier "80 ms on the GPU" was the kernel's late-noticed figure). 750x1624 gives 42.7 ms. Next: 0014, a sampling profiler of the replay thread (`NEXT_PROMPT.md`, `FRAME_RATE_RESEARCH.md` section 9). Then widgets and Control Centre (still broken); brightness and Wi-Fi later.
+4. Frame rate (user priority 1), 2026-11-14: RAM boots only. 750x1624 + sysmem + 60 Hz (0168z60): 9.6 ms a command buffer, best second 57 swaps, 0 faults; with `SWEET_CPUMAX=1` 9.15 ms and 59 (one boot each, `partially-working`). Sustained 60 not reached. 1125x2436 is capped at 30 (26 ms a frame). The 60 Hz fault is a GMEM over-fetch, avoided by `sweetmetal_fddebug=sysmem`. Kernel 0162 (`gpu_pagelist`, `sweet_surfclear_ms`) pushed, not booted. Detail: `FPS_INVESTIGATION.md`; next: `NEXT_PROMPT.md`.
 
 Video (decoder, YUV compositing) needs its own audit and is `not-tested`.
 

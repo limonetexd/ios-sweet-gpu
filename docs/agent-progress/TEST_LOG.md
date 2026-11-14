@@ -386,3 +386,27 @@ Reading: same payload, same workload, one boot each: 11.1 -> 18.7 command buffer
 - Image `shim-boot-0167h60.img` (aee58e06...), 0015 payload, passlog on, profiler off, `sweetfb_hz=60`, synthetic swipes.
 - Log: 12 `SMMU gfsr`, 14 `THE GPU DID NOT FINISH`, 8 `table arena full`. Screen went black; the user put the phone back in fastboot. Not a valid frame-rate result (the 1051 swaps / 42 per s figure is from a broken run).
 - Reading: 60 Hz exposes the GPU address-space and fault problems; do not compare it with 0166uA/uB.
+
+## 60 Hz with sysmem, 0168s60, 2026-11-14 (real device, RAM boot, one boot, synthetic swipes)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0168s60.img` (4b582cf0...), kernel 0161, payload 0001-0015 on the phone, nothing flashed; the 0167h60 args + `sweetmetal_fddebug=sysmem` | `PATH=$HOME/Developer/ios-sweet-work/bin:$PATH bash tools/sweet-gpu-image.sh ...` with `SWEETFB_HZ=60`; `tools/sweet-boot-test.sh shim/out/shim-boot-0168s60.img 0168s60 420` (lead) | No fault if the 0167h60 fault is the GMEM restore over-fetch (`FPS_INVESTIGATION.md` section 2) | `FD_MESA_DEBUG: sysmem` in backboardd and SpringBoard; **0** `SMMU gfsr`, 0 `THE GPU DID NOT FINISH`, 0 `table arena full`. backboardd busy blocks: 208 s, 3573 command buffers (17.2/s), 96.5 draws/cb, 6.3 sysmem + 0 GMEM batches. 26.1 ms a command buffer, 9.3 ms of it thread CPU; 3682 waits of 16.9 ms; 986 us a submission in the kernel walk, 4.0 submissions a cb; surface take 2.1 ms; panel copy 4.9 ms. 168 active s, 3588 swaps, **max 29 a second, none above** | `logs/xnu-0168s60.txt` |
+
+Reading: consistent with section 2 (one boot; 0166uA also had no fault at 30 Hz, so this does not prove it). At 1125x2436 a frame is over 16.7 ms, so every frame takes two ticks of the 60 Hz grid: 30 a second is the ceiling at this size whatever the copy rate. `partially-working`.
+
+## 750x1624 at 60 Hz with sysmem, 0168z60, 2026-11-14 (real device, RAM boot, one boot, synthetic swipes)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0168z60.img` (c86f35a9...), the 0168s60 args built with `SWEET_SCALE=2`; kernel 0161, payload 0001-0015, nothing flashed | `tools/sweet-boot-test.sh shim/out/shim-boot-0168z60.img 0168z60 420` (lead) | GPU wait about 4 ms, a frame under 16.7 ms | 0 fault lines; no backboardd or SpringBoard crash (assetsd, MapKit, driverkitd did, as in other boots). backboardd busy blocks: 199 s, **5518 command buffers (27.8/s)**, 84.8 draws/cb. **9.6 ms a command buffer**, 5.9 ms of it thread CPU; 5539 waits of 3.8 ms; 482 us a submission in the kernel walk, 4.0 a cb; surface take 0.9 ms; panel copy 4.7 ms. 176 active s, 5533 swaps; per second: **max 57**, 27 seconds at 50-59, 24 at 40-49; in the seconds of 50 or more, 3 to 17 frames each took two ticks (`33 ms longest`). Picture not judged: the only screenshot in the log is the boot bar | `logs/xnu-0168z60.txt` |
+
+Reading: against 0168s60 one change (the size): 26.1 -> 9.6 ms a command buffer, best second 29 -> 57. Not sustained 60: frames that miss a tick remain. The per-second figures mix swipes and pauses, so they are a floor, not a frame-time distribution. `partially-working` (one boot).
+
+## Top CPU frequency at 750x1624, 0168zM, 2026-11-14 (real device, RAM boot, one boot, synthetic swipes)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0168zM.img`, the 0168z60 image built with `SWEET_CPUMAX=1` (shim: gold perf state 13 = 2304 MHz, silver 9 = 1805 MHz; default 10 and 8) | `tools/sweet-boot-test.sh shim/out/shim-boot-0168zM.img 0168zM 420` (lead) | Less thread CPU a frame | 0 fault lines, no backboardd or SpringBoard crash. 5583 command buffers in 197 busy s (28.3/s); **9.15 ms a command buffer** (0168z60: 9.61), **5.37 ms thread CPU** (5.92); waits 3.8 ms; walk 456 us a submission; best second 59 swaps (57); frames taking two ticks in the seconds of 50 or more: 5.5 on average (7.7). Peak 58.5 C CPU (53.7). The shim's `CPUFREQ` line is on the shim console, not in the pulled log: the state is inferred from the 9 % and the 5 C, not read | `logs/xnu-0168zM.txt` |
+
+Reading: a small gain, inside what one boot can show. `experimental`. No thermal limit exists in this kernel: not a default until one does.
