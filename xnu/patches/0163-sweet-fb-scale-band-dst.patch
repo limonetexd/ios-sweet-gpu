@@ -1,0 +1,29 @@
+From: HakiOS
+Subject: [PATCH 0163] sweet: the scaled band copy writes every band at its own rows (750x1624 shows a strip)
+
+0129's copy of a 750x1624 frame scaled to the 1080x2400 panel wrote each band's rows at
+`job->dst` (the first band's panel row) instead of at the band's own start, so all 38 bands
+landed in panel rows 0-63 and the rest of the panel kept the previous frame. The last band,
+the bottom of the crop (the dock), is what stayed on the screen: the user's photos of 0169pl
+show exactly that strip at the top of the screen, and it glitches because each band rewrites it.
+
+`dst` in sweet_fb_copy_band() is already `job->dst + y0 * dstRowBytes` (the 1:1 path uses it),
+so the scaled loop uses `dst` too. Geometry, crop and column map are unchanged.
+
+Log: after a boot with the 750x1624 ADT (`SWEET_SCALE=2`), the whole screen shows the frame
+scaled 1.5x, not a strip of the dock at the top. Not compiled locally; CI is the compiler.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 79238e9..393d3db 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1206,7 +1206,8 @@ sweet_fb_copy_band(SweetCopyJob *job, uint32_t band)
+ 		for (uint32_t y = y0; y < y1; y++) {
+ 			uint32_t sy = (uint32_t)((uint64_t)y * job->scaleSrcH / job->scaleDstH);
+ 			uintptr_t srow = job->srcRows + (uint64_t)sy * job->srcRowBytes + job->srcColumn;
+-			uint32_t *drow = (uint32_t *)(job->dst + (uint64_t)(y - y0) * job->dstRowBytes);
++			/* 0163: `dst` already starts at this band's first row (job->dst would put every band at the first) */
++			uint32_t *drow = (uint32_t *)(dst + (uint64_t)(y - y0) * job->dstRowBytes);
+ 			for (uint32_t x = 0; x < job->scaleDstW; x++) {
+ 					drow[x] = *(const uint32_t *)(srow + (uint64_t)job->scaleX[x] * 4);
+ 			}

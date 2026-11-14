@@ -81,3 +81,24 @@ Kernel patch 0162 (`xnu/patches/0162-sweet-gpu-pagelist-surfclear.patch`, commit
 
 
 **Correction 2026-11-14 (user, photos of boot 0169pl):** at 750x1624 the screen shows only a strip at the top (part of the dock), glitching; touch works. The 750x1624 figures of 0168z60, 0168zM and 0164z2 are therefore NOT valid frame-rate evidence: a mostly empty frame is cheap. Which of the size, sysmem at that size, or kernel 0162 causes the strip is not established (0169pl changed the kernel as well). Do not boot `SWEET_SCALE=2` again until the picture is explained. Valid result of this phase: 0168s60 only (1125x2436, 26.1 ms, best second 29, 0 faults).
+
+## 8. The 750x1624 strip is a band destination bug (0163)
+
+Found by reading `sweet_fb_copy_band()` in the 0001-0162 tree (`SweetFramebuffer.cpp` 1205-1213):
+the scaled loop took its destination row pointer from `job->dst` (the first band's panel row) and
+added `(y - y0)` rows, while the 1:1 path uses the band-local `dst` (`job->dst + y0 * dstRowBytes`).
+Every band therefore wrote panel rows `pdy .. pdy+63`; the other 2336 rows kept the previous frame.
+All 38 bands still did their full scale work, so a band's cost — and the 9.6 ms a command buffer of
+0168z60 — is real. What stayed on the screen was the last band written, rows 1578-1599 of the crop,
+i.e. the dock: exactly the user's photo of 0169pl (strip at the top, glitching, touch correct).
+
+Patch `0163-sweet-fb-scale-band-dst` (3 added lines, `check-patch.py` ok, apply check ok). Not built
+before the push; one RAM boot at 750x1624 with the user watching is the test. The 0131 column map and
+the crop 15,12 720x1600 -> 1080x2400 are unchanged, so the fix is either "the whole screen appears,
+scaled and blocky" or nothing changes at all.
+
+0162 flags, measured at 1125x2436 (0169a/pg/sf/sf2, four boots, TEST_LOG): `gpu_pagelist=1` flush
+949 -> 892 us/sub; `sweet_surfclear_ms=0` moves the surface bzero off the window server's thread
+(`zeroed now` -> `zeroed already`, first cleans 41 GB -> 0.2 GB). Neither lowers wall time at full
+size (25.5-25.6 ms) because the frame is 16.9 ms of GPU wait. They are only worth a default at
+750x1624, where the frame is ~9.6 ms and CPU work is the larger share: decide after the 0163 boot.
