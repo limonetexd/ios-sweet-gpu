@@ -510,3 +510,23 @@ Verdict: v2 is neither a win nor a regression against v1 (18.4 / 19.8 / 23.7 acr
 2.25x the pixels costs **4.6x** the GPU time and 4.0x the cache cleaning (82 -> 323 MB). A linear fit through the two points gives a negative intercept, so no `a + b*pixels` model holds: the cost per pixel at native is about 6.1 ns against 3.0 ns at 2x. That is the shape of congestion (utilisation approaching a shared limit), not of a fixed per-frame cost. It also means the 2x numbers of 0168z60/0168zM were not comparable for a second reason beyond the strip bug: the picture was mostly empty.
 
 Verdict: at 2x the good seconds reach 57 and the frame fits a 16.67 ms tick; at native the frame is 35-38 ms and no amount of commit-side work changes that. The native GPU cost is the thing to attack, and the mode it runs in is the workaround, not the design: `sweetmetal_fddebug=sysmem` because a GMEM batch restores an imported IOSurface whose height is not a multiple of 4 and reads past its mapped bytes (`FPS_INVESTIGATION.md` 2).
+
+## The GPU's own occupancy, from the kernel's five-second line (`RedwoodGPU: the GPU worked ...`)
+
+The number `GPU_DECISION.md` calls missing ("GPU execution per frame: no valid number") was in every
+boot log already: submission latency (submit to fence) times submissions per second is the GPU's
+queue depth, and a depth that never reaches zero is a saturated GPU.
+
+| Boot | Size | Submission latency | Submissions/s | Queue depth (Little's law) | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| 0164c | 1125x2436 | **23.8 ms** | 52 | **1.24** | never empty: the GPU is the wall for every client |
+| 0164e | 750x1624 | 6.8 ms | 69 | 0.47 | about half busy: the frame is CPU and pacing there |
+
+3.5x the latency for 2.25x the pixels, and at native the queue is always occupied, so the 1125x2436
+frame is decided by GPU execution and by nothing else. 60 Hz allows 16.67 ms a frame: at native the
+GPU alone needs 23.8 ms a submission and 2.6 submissions a frame go out, so no commit, pacing or copy
+change can reach 60 -- only less GPU work per frame can, by roughly 3x. At 2x there is headroom and
+the CPU (5.87 replay + 4.70 panel copy + 0.98 take per frame) is what holds 57 fps to bursts.
+
+Consequence for the next boot: a GMEM (tiled) A/B at native is the only bandwidth lever left, and it
+needs the over-fetch that forced `sweetmetal_fddebug=sysmem` fixed first (`FPS_INVESTIGATION.md` 2).
