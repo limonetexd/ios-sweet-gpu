@@ -1,7 +1,8 @@
 # Spec 0016: `-commit` returns before the GPU fence (pipelined frame)
 
-Status: spec only, no code. Owner: next implementation agent. Needs a userland build and a
-`userdata` flash to test (`tools/metal-flash-test.sh`).
+Status: implementing as `userland/metal/0016-commit-no-wait.patch` (built, host-proven, not yet on the
+phone: needs a `userdata` flash). The design below was written before the code; where the code
+differs, "As built" at the end says how and why.
 
 ## Why
 
@@ -97,3 +98,38 @@ clock margin to add; a smaller GPU frame is the next lever after this one, not p
 
 The remaining GPU-side cut (a cheaper frame than 16.9 ms), the 750x1624 path (0163 fixed the strip;
 the picture is nearest-scaled and the user asked for native), and B1 (a new 13.9 MB surface a frame).
+
+## As built (2026-11-14)
+
+`userland/metal/0016-commit-no-wait.patch`, 4 files, 17 hunks:
+
+- **`rwa_flush`** (`air_metal.c`, `air_metal.h`): `pipe->flush` and the fence is dropped, not kept.
+  A submission nobody waits on cannot be certified by a fence nobody keeps, and freedreno's flush
+  submits on this thread and leaves the last fence in the context, so the next `rwa_finish` -- which
+  flushes again and, with nothing new queued, reuses that fence -- waits for exactly this work.
+  This is why no per-buffer fence handle was needed, which was design step 1's open question.
+- **`-commit`**: with the new default (no `sweetmetal_commitwait=1`) it takes the queue's one
+  pending buffer, pays its fence *before* the replay (design step 2 said after; before is what makes
+  the wait cover the previous frame only -- paid after, the replay's own draws are already queued
+  and the wait would cover them too, which is the serial frame this change exists to remove), then
+  replays, then `mesa.flush` instead of `mesa.finish`, parks itself as pending and keeps `_work`.
+- **`-redwoodPayFenceLocked` / `-redwoodPayFence`**: the one place a fence is paid. Idempotent, so
+  the three callers (`-commit`, `-waitUntilCompleted`, the queue's `-dealloc`) cannot pay twice.
+  It sets Completed only after the fence, releases `_work` there, and fails the buffer with the
+  library's sentence when the GPU did not finish.
+- **`-addCompletedHandler:`** after a commit no longer assumes the fence is paid (it is not, under
+  0016): it pays first, then delivers. `-addScheduledHandler:` is unchanged -- "submitted" is true.
+- **Queue**: `_pending`, retained, one buffer. The cycle queue->pending->queue (the buffer retains
+  its queue) is broken by the next commit's take or by the queue's `-dealloc`, and in between it is
+  one frame. A queue cannot reach `-dealloc` with a pending buffer while the cycle holds, so that
+  path is the order for a future that breaks the cycle another way rather than a live one.
+
+Proof, host softpipe: `air_metal_test --draw-deferred dw.metallib` (its 0011 case now calls
+`rwa_flush` before its single `rwa_finish` when deferred) -- per draw PASS, deferred PASS, same
+bytes PASS, 0 checks failed; `--clear` 0 cases failed. Shaders: `tools/air/dw.metal` (one function
+per compilation: a metallib holds one LLVM module per function and the library takes the module's
+own entry point). The whole patch set re-applies to the pinned donor in name order and reproduces
+the working tree byte for byte.
+
+Rollback: the plug-in and the library only (`metal-build/pay/`), one `userdata` flash each way; the
+kernel and the iOS root are untouched by this change.

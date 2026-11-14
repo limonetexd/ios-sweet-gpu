@@ -1,5 +1,47 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 2026-11-14: native resolution measured; Metal 0016 built, waiting for a flash <<<
+
+Goal for this stretch: make the UI faster at **1125x2436** (native). The 750x1624 scaled path is
+dropped: it is nearest-neighbour 1.5x (pixelated, said by the user on 0163z) and the grader for a
+frame there is not comparable.
+
+**Observed, one RAM boot each (`logs/xnu-*.txt`, rows in `docs/agent-progress/TEST_LOG.md`):**
+- 1125x2436, kernel 0162 with/without the flags, five boots: wall/cb **25.46-27.56 ms**, cpu/cb
+  8.91-9.57, GPU wait 16.8-17.2 ms, 18.8-20.7 swaps/s, best second 29. `gpu_pagelist=1
+  sweet_surfclear_ms=0` cut the first cache cleans (41 GB -> 0.2 GB) and bought **no wall time**:
+  accepted as a non-default, not a win.
+- The GPU is already at its top DCVS level: `SWEET GPU: gfx3d cfg 0x101 dcvs perf 0x30000006
+  return 0` = perf level 6 (650 MHz). The shim plog's "lvl=4 / 430 MHz" is stale text in a scratch
+  area nobody overwrites any more; **do not trust `tools/sweet-plog-pull.sh` for a fresh boot**, the
+  kernel ring is the reliable channel (`grep 'SWEET GPU'`).
+- So the frame is 9.4 ms of CPU and 17.2 ms of GPU, strictly serial, and the only lever left at
+  native is overlap. Ceiling ~17.2 ms = 58 swaps/s, one tick short of 60 at 16.67 ms.
+
+**Built but not on the phone: userland 0016 (`userland/metal/0016-commit-no-wait.patch`).**
+`-[RedwoodMetalCommandBuffer commit]` now submits with a new library entry `rwa_flush` and returns;
+the **next** commit on the same queue pays the previous command buffer's fence *before* it replays
+its own draws, so recording frame N+1 overlaps the GPU's frame N. `_work` (everything a frame names)
+is kept until the fence is paid, on the thread that pays it. `sweetmetal_commitwait=1` restores the
+old fence-inside-commit for an A/B in one image.
+- Proof so far: `tools/metal-build.sh` builds all stages; the host test passes --
+  `air_metal_test --draw-deferred dw.metallib` (shaders in `tools/air/dw.metal`, commands in its
+  header) reports per draw PASS, deferred PASS, same bytes PASS, 0 checks failed, and
+  `--clear` 0 cases failed. The patch set re-applies to the pinned donor (`a79ff07`) in name order
+  and reproduces the working tree exactly.
+- Not proven: anything about the picture on the device. Expect tearing, a stale frame or a
+  `THE GPU DID NOT` line if the app rewrites a buffer the GPU is still reading; that is the risk
+  `docs/agent-progress/SPEC-0016-commit-no-wait.md` names.
+
+**Next:** the user's typed yes to `tools/metal-flash-test.sh` (it writes `userdata`), then one boot
+without the boot-arg and one with it (`sweetmetal_commitwait=1`), same 420 s window, comparing
+`wall/cb`, `cpu/cb`, `waits`, swaps/s and looking at the screen. Snapshot the root first
+(`work1-pre*.raw` is still the rollback).
+
+**Also open, not started:** `AegirPoster` aborts (SIGABRT, `pc 0x1cb1e7198`, 50 restarts) and the
+wallpaper never appears. Present at 1125x2436 in 0163n/0163z and 0168s60, absent in
+0168z60/0169a -- intermittent, not caused by the scaled path. Unexplained.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> 2026-11-07 (DeepSeek lead): rung 1+2 PASSED; clock 2026; rung 3a testing <<<

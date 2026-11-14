@@ -457,3 +457,15 @@ User, watching: the picture is very pixelated (nearest 1.5x, expected); the wall
 Reading: the 0162 flags and 0163 change nothing at native (25.6-26.6 ms across five boots). 0163 only touches the scaled path, as intended. The GPU clock is at the top level the GMU accepts, so the 16.9 ms GPU wait of a frame cannot be bought down with a vote; the remaining lever is CPU/GPU overlap, spec `SPEC-0016-commit-no-wait.md`.
 
 Note: `tools/sweet-plog-pull.sh` (new) reads the shim probe log from userdata. The area it reads held the 0163n text (seq 39) after the 0163d boots too, so that region is stale and must not be trusted for a fresh boot; the kernel log is the reliable channel (`SWEET GPU: gfx3d ... dcvs perf`).
+
+## Userland 0016 (commit without the fence), host softpipe, 2026-11-14 (no device, no flash)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `metal-build/donor` at `a79ff07` + `userland/metal/0001-0016`, `tools/metal-build.sh` all stages | `ninja src/gallium/drivers/freedreno/air_metal_test`; `air_metal_test --draw-deferred dw.metallib`; `--clear` | the 0011 case still gives the same picture and bytes with `rwa_flush` before its one `rwa_finish` | `per draw` PASS, `deferred` PASS, `per draw and deferred give the same bytes` PASS, 0 checks failed; `--clear` 0 cases failed. Softpipe runs work at flush, so this proves order and result without the waits, not overlap | `tools/air/dw.metal`, `userland/metal/0016-commit-no-wait.patch` |
+
+Note: `dw.metal` needs one function per compilation (`xcrun metal -c -DENTRY_fs_pos` / `-DENTRY_fs_copy`,
+then `metalib`): a .metallib holds one LLVM module per function and `rwa_render_create` takes the
+module's own entry point, so a module with two functions answers for only the first
+("this module's entry point is fs_pos"). No vertex function: a draw with no vertex stream gets a
+fullscreen quad from the library and `[[position]]` is the pixel centre.
