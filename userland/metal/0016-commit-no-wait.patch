@@ -103,15 +103,10 @@
  @end
  
  @interface RedwoodMetalComputeEncoder : _MTLCommandEncoder
-@@ -1422,6 +1428,49 @@
- 			 "one per command buffer (sweetmetal_drawwait=1 waits per draw)" :
- 			 forced ? "per draw (forced by boot-arg sweetmetal_drawwait=1)" :
- 				  "per draw (this library has no rwa_set_deferred_wait)");
-+	});
-+	return enabled;
-+}
-+
-+/*
+@@ -1427,6 +1433,49 @@
+ }
+ 
+ /*
 + * 0016: whether -commit returns once its work is submitted (the default) or pays the GPU fence
 + * itself, as it did before. Boot-arg sweetmetal_commitwait=1 is the control for an A/B inside
 + * one image: with it a frame costs the CPU's part plus the GPU's; without it, the larger of
@@ -150,9 +145,14 @@
 +			 "inside -commit)" :
 +			 forced ? "waits for the GPU (forced by boot-arg sweetmetal_commitwait=1)" :
 +				  "waits for the GPU (this library has no rwa_flush)");
- 	});
- 	return enabled;
- }
++	});
++	return enabled;
++}
++
++/*
+  * 0015: how much of a constant buffer bound at an offset the GPU cannot fetch from is copied
+  * per draw. Without the boot-arg the library copies what the shader can read (or all that is
+  * left, where that is not known); boot-arg sweetmetal_ubowhole=1 asks for the pre-0015 rule,
 @@ -4808,6 +4857,11 @@
  	 * lied to, and -setCompletionQueue: explains the third below. */
  	NSUInteger _gpuPriority, _backgroundGPUPriority;
@@ -165,10 +165,12 @@
  }
  
  - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device descriptor:(id)descriptor
-@@ -4853,6 +4907,30 @@
+@@ -4851,8 +4905,42 @@
+ 		_outstanding--;
+ 	}
  	_returned++;
- }
- 
++}
++
 +/* 0016: hand over the reference this queue holds on the buffer whose fence is still owed, or
 + * nil. The caller owns the reference it gets and pays the fence before letting go (see
 + * -commit). Called with the library lock held, like everything that touches device state. */
@@ -184,6 +186,16 @@
 + * work named with it -- while the GPU is still reading it. This is the one place this driver
 + * holds a command buffer itself; the cycle it makes with the buffer's own _queue reference is
 + * broken by -redwoodTakePending or by -dealloc below, and in between it is one buffer. */
++/* 0016: let go of the buffer whose fence was paid somewhere other than the next commit. */
++- (void)redwoodClearPending:(id)buffer
++{
++	if (_pending != buffer) {
++		return;
++	}
++	_pending = nil;
++	[buffer release];   /* the caller of -redwoodPayFence still holds the buffer */
+ }
+ 
 +- (void)redwoodSetPending:(id)buffer
 +{
 +	if (_pending == buffer) {
@@ -196,7 +208,7 @@
  - (id)commandBuffer
  {
  	return [[[RedwoodMetalCommandBuffer alloc] initWithRedwoodQueue:self] autorelease];
-@@ -4988,6 +5066,14 @@
+@@ -4988,6 +5076,21 @@
  
  - (void)dealloc
  {
@@ -206,12 +218,19 @@
 +	 * With the reference cycle this queue and its pending buffer make (see
 +	 * -redwoodSetPending:), a queue cannot reach here with one still held; this is the
 +	 * order for a future that breaks the cycle another way. */
-+	[_pending redwoodPayFence];
-+	[_pending release];
++	{
++		/* taken first, so that a pay which clears the queue's own pending cannot
++		 * release this queue's last reference to the buffer inside the pay */
++		id pending = _pending;
++
++		_pending = nil;
++		[pending redwoodPayFence];
++		[pending release];
++	}
  	/* Only the copy this driver keeps itself: the one in Apple's ivar belongs to
  	 * -[_MTLCommandQueue dealloc], and releasing it twice would be worse than leaking
  	 * one dispatch queue in the Metal where that dealloc does not. */
-@@ -5044,6 +5130,9 @@
+@@ -5044,6 +5147,9 @@
  	BOOL _owesSlot;                 /* this buffer holds one of the queue's slots */
  	NSMutableArray *_scheduled, *_completed;   /* handler blocks, copied to the heap */
  	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
@@ -221,7 +240,23 @@
  }
  
  /*
-@@ -5214,6 +5303,9 @@
+@@ -5201,6 +5307,15 @@
+ {
+ 	char why[512] = { 0 };
+ 
++	if (_status != RW_CB_ENQUEUED) {
++		/* Metal forbids committing a buffer twice, and this driver's queue holds one
++		 * submitted buffer at a time: a second commit would find ITSELF as the previous
++		 * buffer, pay its own fence, replay an empty _work and put its status back to
++		 * Scheduled (review, 2026-11-14). Refused rather than half done. */
++		RW_ONCE("a command buffer was committed more than once; Metal forbids it and this "
++			"driver ignores the second commit\n");
++		return;
++	}
+ 	_status = RW_CB_COMMITTED;
+ 	/* The whole replay under the library's lock: the context keeps the framebuffer, the
+ 	 * bound pipeline and the current batch between calls, so another command buffer's draws
+@@ -5214,6 +5329,9 @@
  	 * library's; nothing else runs on it while the lock is held. */
  	struct rwa_device *device = [[_queue device] mesaDevice];
  	bool once = device != NULL && rw_wait_per_commit();
@@ -231,7 +266,7 @@
  	bool queued = false;
  	/* 0013 passlog: nothing below is touched unless it is on */
  	bool passlog = rw_passlog_on();
-@@ -5222,12 +5314,30 @@
+@@ -5222,11 +5340,29 @@
  	bool plemit = false;
  	/* 0014 prof: this thread is sampled from here to the end of the wait below `done:` */
  	bool profiled = rw_prof_on() && rw_prof_register();
@@ -243,7 +278,7 @@
  	}
  	if (once) {
  		mesa.set_deferred_wait(device, 1);
- 	}
++	}
 +	if (pipelined) {
 +		/* The hook this is for: pay the previous buffer's fence HERE, before this one's
 +		 * draws are queued. Nothing of ours has been submitted since that buffer's own
@@ -258,11 +293,10 @@
 +		if (previous != nil) {
 +			[previous redwoodPayFenceLocked];
 +		}
-+	}
+ 	}
  	for (RedwoodMetalWork *work in _work) {
  		if (work->clearOnly) {
- 			queued = true;
-@@ -5305,11 +5415,24 @@
+@@ -5305,11 +5441,29 @@
  		mesa.set_deferred_wait(device, 0);
  		if (queued) {
  			char late[512] = { 0 };
@@ -275,12 +309,17 @@
 +			if (pipelined && _status != RW_CB_ERROR) {
 +				/* 0016: submitted, not waited for. The fence is this buffer's debt
 +				 * and is paid by the next commit on this queue, by
-+				 * -waitUntilCompleted, or by -dealloc; _work is kept until then
-+				 * because it names everything the GPU is reading. */
++				 * -waitUntilCompleted, or by the queue's teardown; _work is kept until
++				 * then because it names everything the GPU is reading. */
 +				rc = mesa.flush(device, late, sizeof(late));
 +				if (rc == 0) {
 +					_fenceDue = YES;
 +					[_queue redwoodSetPending:self];
++				} else {
++					/* A library that says "no submission" may still have submitted:
++					the wait is what makes the failure safe, so _work is not let go
++					on a promise nobody kept (review, 2026-11-14). */
++					mesa.finish(device, late, sizeof(late));
 +				}
 +			} else {
 +				rc = mesa.finish(device, late, sizeof(late));
@@ -291,20 +330,7 @@
  				[self failWith:late];
  			}
  		}
-@@ -5324,13 +5447,26 @@
- 	if (plemit) {
- 		rw_passlog_print(&plblock);
- 	}
-+	if (previous != nil) {
-+		/* 0016: the buffer committed before this one. Its fence has been paid above (or
-+		 * its failure recorded), so the promise its handlers were given is now true and
-+		 * what its work named can go. Outside the lock, because a handler runs on this
-+		 * thread when the process has no completion queue and may call back in. */
-+		[previous redwoodDeliverHandlers];
-+		[previous release];
-+	}
- 	/* What the work named is let go here, on the thread that committed: every item has
- 	 * run and been waited for (or was abandoned by a failure), so nothing below needs
+@@ -5329,12 +5483,27 @@
  	 * it. Left to -dealloc, the last release could come from the completion queue's
  	 * thread and destroy a buffer or texture while this thread is inside a draw -- the
  	 * library has no lock of its own -- and a command buffer somebody keeps would pin a whole
@@ -320,7 +346,21 @@
  	/* The queue's slot goes back here and on every way out of this method, a failed draw
  	 * included: a buffer that errored is as finished as one that drew, and a slot kept
  	 * because of an error would turn one bad draw into a queue that blocks for ever. */
-@@ -5560,29 +5696,68 @@
+ 	[self redwoodReturnSlot];
++	if (previous != nil) {
++		/* 0016: the buffer committed before this one. Its fence has been paid above (or
++		 * its failure recorded), so the promise its handlers were given is now true and
++		 * what its work named can go. After the slot, so that a handler which commits
++		 * again cannot wait on the semaphore for a slot this commit still holds; outside
++		 * the lock, because a handler runs on this thread when the process has no
++		 * completion queue and may call back in. */
++		[previous redwoodDeliverHandlers];
++		[previous release];
++	}
+ 	/* and only then the handlers, so that a handler which makes the next command buffer
+ 	 * is not waiting for a slot this one still holds */
+ 	[self redwoodDeliverHandlers];
+@@ -5560,29 +5729,77 @@
  
  /* The fence is the whole point: a dispatch that the GPU does not finish must not read as a
   * result. air_run learned that the expensive way (docs/air.md section 5). */
@@ -342,15 +382,17 @@
 -	if (_status == RW_CB_ERROR) {
 -		return;
 +	if (!_fenceDue) {
-+		/* Nothing of ours is outstanding. An empty command buffer still promised
-+		 * "completed" once committed, so it is waited for as before (this waits for
-+		 * whatever else the device has, which is what the pre-0016 code did). */
-+		if (_status == RW_CB_SCHEDULED) {
++		/* Nothing of ours is outstanding. Nothing to pay means nothing to wait for --
++		 * except in the states this driver has always waited in: an empty command buffer
++		 * past its commit still promised "completed", and a buffer another thread is
++		 * inside -commit with has work on its way (a -waitUntilCompleted from a second
++		 * thread used to wait for it, and still does). */
++		if (_status == RW_CB_COMPLETED)
++			return YES;
++		{
 +			struct rwa_device *device = [[_queue device] mesaDevice];
 +
 +			rc = device != NULL ? mesa.finish(device, why, sizeof(why)) : 0;
-+		} else {
-+			return _status != RW_CB_ERROR;
 +		}
 +	} else {
 +		struct rwa_device *device = [[_queue device] mesaDevice];
@@ -372,13 +414,12 @@
  
 -	/* locked per call: this is reached from -redwoodDeliverHandlers after -commit has let
 -	 * go, and from an application's own -waitUntilCompleted on any thread */
--	rw_lib_lock();
--	rc = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
 +- (BOOL)redwoodPayFence
 +{
 +	BOOL ok;
 +
-+	rw_lib_lock();
+ 	rw_lib_lock();
+-	rc = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
 +	ok = [self redwoodPayFenceLocked];
  	rw_lib_unlock();
 -	if (rc != 0) {
@@ -387,6 +428,13 @@
 -					  userInfo:@{ NSLocalizedDescriptionKey:
 -						      [NSString stringWithUTF8String:why] }] retain];
 -		_status = RW_CB_ERROR;
++	/* A fence paid here is not paid again by the next commit, so if this buffer is the
++	 * one the queue is holding it can be let go now: an application that stops committing
++	 * after waiting would otherwise keep the queue, this buffer and what its work named
++	 * for the life of the process (review, 2026-11-14). */
++	if (!_fenceDue) {
++		[_queue redwoodClearPending:self];
++	}
 +	return ok;
 +}
 +
@@ -404,7 +452,7 @@
  }
  
  - (void)waitUntilScheduled { }
-@@ -5641,6 +5816,11 @@
+@@ -5641,6 +5858,11 @@
  		return;
  	}
  	if (_status >= RW_CB_SCHEDULED) {
