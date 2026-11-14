@@ -1,0 +1,170 @@
+From: HakiOS
+Subject: [PATCH 0162] sweet: gpu_pagelist and sweet_surfclear_ms (both default as before)
+
+gpu_pagelist=1: RedwoodGPU keeps the page numbers of a buffer the first time it is pushed
+out of the cache, so the walk before every submission no longer asks the memory descriptor
+for each page (measured 0166uA/0168s60: about 0.95 ms a submission, four a frame, mostly
+the 13.9 MB screen surface). Same decisions per page as before; the list goes in freeBuffer().
+
+sweet_surfclear_ms=N: when kept surface memory is zeroed and cleaned by the thread call
+(default 40 ms after it was kept, as before; 0: at once). In 0166uA 3000 of 3004 reuses
+were "zeroed now": the window server's thread paid the bzero and the first submission a
+whole clean.
+
+Log: "RedwoodGPU: page lists kept for the walk before a submission (gpu_pagelist)";
+"SWEET SURF: big surfaces' memory kept ... cleared N ms after (sweet_surfclear_ms)".
+Not compiled locally, not tested.
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index c27c2c2..37ad693 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -537,6 +537,8 @@ struct gpu_buffer {
+ 	bool                            pool;           /* memory from the GPU pool (write-combined, given back to it) */
+ 	bool                            whole;          /* pushed out of the cache whole once: from then on, written pages only */
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++	ppnum_t *                       pages;          /* gpu_pagelist=1: its pages' numbers for toMemoryWritten() (0: not a valid page), or NULL */
++	uint32_t                        pageCount;      /* how many there are in `pages` */
+ };
+ 
+ /*
+@@ -1030,6 +1032,12 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ {
+ 	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
+ 
++	/* 0162: the page list is this handle's, whatever becomes of the memory (left, kept, stuck or freed) */
++	if (b->pages != NULL) {
++		IODelete(b->pages, ppnum_t, b->pageCount);
++		b->pages = NULL;
++		b->pageCount = 0;
++	}
+ 	if (busy && fLeftCount == GPU_LEFT) {
+ 		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
+ 	}
+@@ -1244,6 +1252,8 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 	b->whole = false;
+ 	b->fence = 0;
+ 	b->surface = NULL;
++	b->pages = NULL;                /* (0162: freeBuffer() deleted the last one's) */
++	b->pageCount = 0;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+ 	rangeEnter(b->address, size, *handle, kind);
+@@ -1555,6 +1565,17 @@ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ 	return ret;
+ }
+ 
++/*
++ * 0162: boot-arg gpu_pagelist=1: the numbers of a buffer's pages are found once, the first time it
++ * is pushed out, and kept with the buffer, instead of asking the descriptor for every page at
++ * every submission (about 0.95 ms a submission, four a frame, mostly the 13.9 MB screen surface).
++ * The list stays right for as long as the buffer is there: the buffers that come here are
++ * IOBufferMemoryDescriptors of the kernel's task (wired, their pages never move) or a surface's
++ * memory that is not the GPU pool's and not wrapped client memory (submit() sends neither here),
++ * and the buffer holds that memory (and the surface) until freeBuffer(), which deletes the list.
++ */
++static TUNABLE(uint32_t, gGPUPageList, "gpu_pagelist", 0);
++
+ /*
+  * (ios-sailfish 0182) Push out of the cache only the pages the processor has written since the
+  * last time: the pmap's modified bit is set by the first write through a user mapping after
+@@ -1575,6 +1596,52 @@ toMemoryWritten(struct gpu_buffer * b)
+ 		gGPUStat.wholeBytes += b->size;
+ 	}
+ 
++	if (gGPUPageList != 0 && b->pages == NULL) {
++		uint32_t count = (uint32_t) ((b->size + PAGE_SIZE - 1) / PAGE_SIZE);
++		ppnum_t * pages = count != 0 ? IONew(ppnum_t, count) : NULL;
++
++		if (pages != NULL) {
++			static bool said;
++
++			if (!said) {
++				said = true;
++				IOLog("RedwoodGPU: page lists kept for the walk before a submission (gpu_pagelist)\n");
++			}
++			for (uint32_t i = 0; i < count; i++) {
++				IOByteCount len = 0;
++				addr64_t pa = b->memory->getPhysicalSegment((uint64_t) i * PAGE_SIZE, &len, kIOMemoryMapperNone);
++				ppnum_t pn = (ppnum_t) (pa >> PAGE_SHIFT);
++
++				pages[i] = pa != 0 && pmap_valid_page(pn) ? pn : 0;
++			}
++			b->pages = pages;
++			b->pageCount = count;
++		}
++		/* (none to be had: the walk below, as before) */
++	}
++	if (b->pages != NULL) {
++		for (uint32_t i = 0; i < b->pageCount; i++) {
++			uint64_t off = (uint64_t) i * PAGE_SIZE;
++			uint64_t n = b->size - off < PAGE_SIZE ? b->size - off : PAGE_SIZE;
++			ppnum_t pn = b->pages[i];
++
++			if (pn == 0) {
++				if (!*whole) {
++					redwood_gpu_to_memory(b->kernel + off, n);
++					pushed += n;
++				}
++				continue;
++			}
++			if (!*whole || pmap_is_modified(pn)) {
++				pmap_clear_modify(pn);
++				redwood_gpu_to_memory(b->kernel + off, n);
++				pushed += n;
++			}
++		}
++		*whole = true;
++		return pushed;
++	}
++
+ 	for (uint64_t off = 0; off < b->size; off += PAGE_SIZE) {
+ 		IOByteCount len = 0;
+ 		addr64_t pa = b->memory->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7b66369..69051e7 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -164,6 +164,7 @@ static IOLock        *sweet_surf_kept_lock;
+ static thread_call_t  sweet_surf_clearing;
+ static int            sweet_surf_keep = -1;
+ static int            sweet_surf_clean = 1;      /* A5 0142: clean kept memory in the thread call */
++static uint32_t       sweet_surf_clear_ms = SWEET_SURF_CLEAR_MS;        /* 0162: boot-arg sweet_surfclear_ms (0: at once) */
+ static uint32_t       sweet_surf_reused, sweet_surf_made;
+ 
+ static void
+@@ -201,6 +202,10 @@ sweet_surf_keeping(void)
+ 		IOLock *lock = IOLockAlloc();
+ 		(void)PE_parse_boot_argn("sweet_surfclean", &clean, sizeof(clean));
+ 		sweet_surf_clean = clean != 0;
++		uint32_t clear_ms = SWEET_SURF_CLEAR_MS;
++		if (PE_parse_boot_argn("sweet_surfclear_ms", &clear_ms, sizeof(clear_ms))) {
++			sweet_surf_clear_ms = clear_ms;
++		}
+ 		(void)PE_parse_boot_argn("sweet_surfkeep", &keep, sizeof(keep));
+ 		thread_call_t call = keep ? thread_call_allocate(&sweet_surf_clear_kept, NULL) : NULL;
+ 		if (lock == NULL || call == NULL) {
+@@ -220,7 +225,8 @@ sweet_surf_keeping(void)
+ 		}
+ 		sweet_surf_clearing = call;
+ 		sweet_surf_keep = 1;
+-		IOLog("SWEET SURF: big surfaces' memory kept for the next (sweet_surfkeep=0: freed)\n");
++		IOLog("SWEET SURF: big surfaces' memory kept for the next (sweet_surfkeep=0: freed), cleared %u ms after (sweet_surfclear_ms)\n",
++		    sweet_surf_clear_ms);
+ 	}
+ 	return sweet_surf_keep == 1 && sweet_surf_clearing != NULL;
+ }
+@@ -297,8 +303,12 @@ sweet_surf_memory_back(IOBufferMemoryDescriptor *m)
+ 		IOLockUnlock(sweet_surf_kept_lock);
+ 		OSSafeReleaseNULL(evicted);
+ 		if (m == NULL) {
++			if (sweet_surf_clear_ms == 0) {
++				thread_call_enter(sweet_surf_clearing);         /* 0162: cleared at once */
++				return;
++			}
+ 			uint64_t deadline;
+-			clock_interval_to_deadline(SWEET_SURF_CLEAR_MS, kMillisecondScale, &deadline);
++			clock_interval_to_deadline(sweet_surf_clear_ms, kMillisecondScale, &deadline);
+ 			thread_call_enter_delayed(sweet_surf_clearing, deadline);
+ 			return;
+ 		}
