@@ -54,13 +54,14 @@ what sysmem mode throws away. Before spending another flash, the honest options 
 
 **Next, and it needs no flash:** (a) a per-frame timeline in the passlog -- who paid the fence and
 when, plus the client's wait -- so the 16.7 ms is attributed instead of inferred; (b) the AegirPoster
-crash loop (50 rests a boot, no wallpaper, pollutes every A/B). Then one boot to rank the GPU. The
+crash loop (50 restarts a boot; the wallpaper does appear, so it is cost and A/B pollution only). Then one boot to rank the GPU. The
 user has been asked which track to take: native with a real GPU-side attack, or a smaller internal
 render with a filtered upscale (the 750x1624 numbers of 0168z60/0168zM are invalid -- that boot drew
 only the top strip -- so a valid 2x measurement does not exist yet).
 
-**Also open, not started:** `AegirPoster` aborts (SIGABRT, `pc 0x1cb1e7198`, 50 restarts) and the
-wallpaper never appears. Present at 1125x2436 in 0163n/0163z and 0168s60, absent in
+**Also open, not started:** `AegirPoster` aborts (SIGABRT, `pc 0x1cb1e7198`, 50 restarts a boot).
+The user says the wallpaper IS visible, so the restarts are noise and cost, not a defect to chase
+first. Present at 1125x2436 in 0163n/0163z and 0168s60, absent in
 0168z60/0169a -- intermittent, not caused by the scaled path. Unexplained.
 
 ## Agent handoff / active work (2026-10-15, latest)

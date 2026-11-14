@@ -499,3 +499,14 @@ Verdict: v2 is neither a win nor a regression against v1 (18.4 / 19.8 / 23.7 acr
 | Sum | 35-38 ms | matches the measured `38 ms longest` swap gap in good seconds |
 
 60 Hz needs 16.67 ms. Both halves are over it, and they are serial.
+
+## The GPU curve against pixels, 0164c (1125x2436) against 0164e (750x1624), 2026-11-14 (one RAM boot each, kernel 0163, same flags, same synthetic swipes)
+
+| Size | Pixels | GPU wait a frame | Replay CPU a frame | Panel copy | Take | Swaps/s (active s) | Best second |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 750x1624 (`SWEET_SCALE=2`) | 1.22 Mpx | 3.63 ms | 5.87 ms | 4.70 ms | 0.98 ms | 31.1 (175 s) | 57 |
+| 1125x2436 (native) | 2.74 Mpx | 16.66 ms | 9.63 ms | 3.81 ms | 2.14 ms | 19.8 (185 s) | 28 |
+
+2.25x the pixels costs **4.6x** the GPU time and 4.0x the cache cleaning (82 -> 323 MB). A linear fit through the two points gives a negative intercept, so no `a + b*pixels` model holds: the cost per pixel at native is about 6.1 ns against 3.0 ns at 2x. That is the shape of congestion (utilisation approaching a shared limit), not of a fixed per-frame cost. It also means the 2x numbers of 0168z60/0168zM were not comparable for a second reason beyond the strip bug: the picture was mostly empty.
+
+Verdict: at 2x the good seconds reach 57 and the frame fits a 16.67 ms tick; at native the frame is 35-38 ms and no amount of commit-side work changes that. The native GPU cost is the thing to attack, and the mode it runs in is the workaround, not the design: `sweetmetal_fddebug=sysmem` because a GMEM batch restores an imported IOSurface whose height is not a multiple of 4 and reads past its mapped bytes (`FPS_INVESTIGATION.md` 2).
