@@ -1,27 +1,31 @@
 --- a/tools/mesa/air/air_metal.c
 +++ b/tools/mesa/air/air_metal.c
-@@ -4072,7 +4072,44 @@
+@@ -4070,9 +4070,77 @@
+ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
+ {
     return finish_or_say_why(device, false, "work", why, why_size);
- }
- 
++}
++
 +/*
-+ * 0016: hand the queued work to the GPU and return as soon as it has it, without waiting
-+ * for it to finish. The point is overlap: with a draw and a clear returning early (0011)
-+ * but one wait per command buffer, a frame costs the CPU's part plus the GPU's part; with
-+ * the wait moved to the next commit it costs the larger of the two. 1125x2436 measured
-+ * 8.9 ms of CPU and 17.2 ms of GPU a frame (logs/xnu-0163n.txt).
++ * 0016: hand the queued work to the GPU and return the fence for THAT submission, without
++ * waiting for it. The point is overlap: with a draw and a clear returning early (0011) but
++ * one wait per command buffer, a frame costs the CPU's part plus the GPU's part; with the
++ * wait moved to the next commit it costs the larger of the two. 1125x2436 measured 8.9 ms
++ * of CPU and 17.2 ms of GPU a frame (logs/xnu-0163n.txt).
 + *
-+ * The fence is dropped on purpose. A submission nobody waits on cannot be certified by a
-+ * fence nobody keeps, and keeping one would be a resource held per command buffer for a
-+ * promise no caller reads. The submission itself is already made: freedreno's flush
-+ * submits the batch on this thread and keeps the last fence in the context, so the next
-+ * rwa_finish -- which flushes again and, with nothing new queued, reuses that fence --
-+ * waits for exactly this work. That is the contract: after rwa_flush the GPU has the work
-+ * and the CPU must not read, rewrite or destroy anything that work named until an
-+ * rwa_finish has returned.
++ * The fence comes back to the caller, and rwa_wait_fence is how it is paid. Not rwa_finish:
++ * a finish flushes again, and a flush with new work in the batch ends that batch early --
++ * measured on the device as batches per frame 6.5 -> 15.6, submissions +57%, 18.4 swaps/s
++ * against 23.7 in the same image with sweetmetal_commitwait=1 (logs/xnu-0164a.txt against
++ * xnu-0164b.txt). Waiting on the submission's own fence waits for exactly this work and
++ * touches no batch.
++ *
++ * The fence must be waited for and released (rwa_wait_fence) before the CPU reads, rewrites
++ * or destroys anything this work named. A NULL `fence` is allowed and drops it, which is
++ * only for a caller that has nothing later to wait with.
 + */
- int
-+rwa_flush(struct rwa_device *device, char *why, size_t why_size)
++int
++rwa_flush(struct rwa_device *device, void **fence_out, char *why, size_t why_size)
 +{
 +   struct pipe_fence_handle *fence = NULL;
 +
@@ -31,13 +35,42 @@
 +   if (device->passlog)
 +      device->passlog_flushes++;   /* 0013 */
 +   if (!fence) {
-+      /* No submission at all, so there is nothing the next finish could wait for: said
++      /* No submission at all, so there is nothing a later wait could wait for: said
 +       * rather than left to look like a frame that simply has not finished yet. */
 +      say(why, why_size, "the GPU driver gave no submission for the queued work, so it "
 +                         "cannot be waited for later either");
 +      return -1;
 +   }
++   if (fence_out)
++      *fence_out = fence;
++   else
++      device->screen->fence_reference(device->screen, &fence, NULL);
++   return 0;
+ }
+ 
++/*
++ * 0016: wait for one submission and release its fence. This is the fence rwa_flush handed
++ * back, so the wait covers that work and not whatever was queued after it. A fence that is
++ * not waited for is leaked with the batch reference it holds; -1 and a sentence when the GPU
++ * did not finish in time (the same two seconds and the same wording as rwa_finish, because
++ * it is the same failure).
++ */
+ int
++rwa_wait_fence(struct rwa_device *device, void *fence_handle, char *why, size_t why_size)
++{
++   struct pipe_fence_handle *fence = fence_handle;
++   bool done = true;
++
++   if (!device || !fence)
++      return -1;
++   done = device->screen->fence_finish(device->screen, NULL, fence, RWA_FENCE_TIMEOUT_NS);
 +   device->screen->fence_reference(device->screen, &fence, NULL);
++   if (!done) {
++      say(why, why_size, "the GPU did not finish the work within two seconds. Anything in "
++                         "the buffers is what was put there, not what the shader computed, "
++                         "and one timeout wedges this GPU for the rest of the boot");
++      return -1;
++   }
 +   return 0;
 +}
 +
@@ -47,54 +80,65 @@
     if (!device)
 --- a/tools/mesa/air/air_metal.h
 +++ b/tools/mesa/air/air_metal.h
-@@ -577,6 +577,12 @@
+@@ -577,6 +577,16 @@
  
  /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
  int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 +
-+/* 0016: submit everything queued so far and return once the GPU has it, without waiting for
-+ * it to finish. 0, or -1 and a sentence when the driver gave no submission. What the work
-+ * named must not be read, rewritten or destroyed until an rwa_finish has returned after it.
++/* 0016: submit everything queued so far and hand back that submission's fence, without
++ * waiting for it. 0, or -1 and a sentence when the driver gave no submission. What the work
++ * named must not be read, rewritten or destroyed until rwa_wait_fence has returned for it.
 + * New in 0016: absent in older libraries. */
-+int rwa_flush(struct rwa_device *device, char *why, size_t why_size);
++int rwa_flush(struct rwa_device *device, void **fence, char *why, size_t why_size);
++
++/* 0016: wait for one rwa_flush fence and release it. 0, or -1 and a sentence when the GPU
++ * did not finish in time. The fence is released either way. New in 0016. */
++int rwa_wait_fence(struct rwa_device *device, void *fence, char *why, size_t why_size);
  
  /* Whether rwa_render_draw and rwa_render_clear wait for the GPU themselves (off, the
   * default) or return once the work is queued (on). With it on, a failure on the GPU is
 --- a/tools/mesa/air/air_metal_test.c
 +++ b/tools/mesa/air/air_metal_test.c
-@@ -6822,6 +6822,11 @@
+@@ -6822,6 +6822,16 @@
        .primitive = 4, .vertex_start = 0, .vertex_count = 4,
     };
     ok = ok && rwa_render_draw(copy, &rd, why, sizeof(why)) == 0;
 +   /* 0016: the submit without the wait, made where the plug-in's -commit makes it and
-+    * followed by the one fence. The picture must be the same either way: on softpipe a
-+    * flush runs at once, so this proves order and result, not overlap. */
-+   if (deferred)
-+      ok = ok && rwa_flush(device, why, sizeof(why)) == 0;
++    * followed by the wait on that submission's own fence. The picture must be the same
++    * either way: on softpipe a flush runs at once, so this proves order and result, not
++    * overlap. */
++   if (deferred) {
++      void *fence = NULL;
++
++      ok = ok && rwa_flush(device, &fence, why, sizeof(why)) == 0;
++      ok = ok && rwa_wait_fence(device, fence, why, sizeof(why)) == 0;
++   }
     ok = ok && rwa_finish(device, why, sizeof(why)) == 0;
     ok = ok && rwa_set_deferred_wait(device, 0) == 0;
     ok = ok && rwa_texture_read(a, 0, 0, origin, extent, outa, 0, why, sizeof(why)) == 0 &&
 --- a/userland/src/redwoodmetal.m
 +++ b/userland/src/redwoodmetal.m
-@@ -577,6 +577,7 @@
+@@ -577,6 +577,8 @@
  	int (*set_passlog)(struct rwa_device *, int);         /* 0013; absent in older ones */
  	int (*passlog_read)(struct rwa_device *, struct rwa_passlog *, int);
  	int (*set_ubo_whole)(struct rwa_device *, int);       /* 0015; absent in older ones */
-+	int (*flush)(struct rwa_device *, char *, size_t);    /* 0016; absent in older ones */
++	int (*flush)(struct rwa_device *, void **, char *, size_t);   /* 0016; absent in older */
++	int (*wait_fence)(struct rwa_device *, void *, char *, size_t);/* 0016; absent in older */
  } mesa;
  
  /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
-@@ -647,6 +648,9 @@
+@@ -647,6 +649,10 @@
  	*(void **)&mesa.passlog_read = dlsym(mesa.handle, "rwa_passlog_read");
  	/* 0015: absent in an older library, which then uploads as it always did */
  	*(void **)&mesa.set_ubo_whole = dlsym(mesa.handle, "rwa_set_ubo_whole");
-+	/* 0016: the submit without the wait; absent in an older library, and then -commit
-+	 * waits as it did before 0016 */
++	/* 0016: the submit without the wait, and the wait on that submission's own fence;
++	 * absent in an older library, and then -commit waits as it did before 0016 */
 +	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
++	*(void **)&mesa.wait_fence = dlsym(mesa.handle, "rwa_wait_fence");
  	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
  	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
  		/* rwa_dispatch's arguments changed when textures were added to the contract, so
-@@ -1028,6 +1032,8 @@
+@@ -1028,6 +1034,8 @@
  - (instancetype)initWithRedwoodQueue:(RedwoodMetalCommandQueue *)queue;
  - (void)recordWork:(RedwoodMetalWork *)work;
  - (id)device;
@@ -103,10 +147,15 @@
  @end
  
  @interface RedwoodMetalComputeEncoder : _MTLCommandEncoder
-@@ -1427,6 +1433,49 @@
- }
- 
- /*
+@@ -1422,6 +1430,49 @@
+ 			 "one per command buffer (sweetmetal_drawwait=1 waits per draw)" :
+ 			 forced ? "per draw (forced by boot-arg sweetmetal_drawwait=1)" :
+ 				  "per draw (this library has no rwa_set_deferred_wait)");
++	});
++	return enabled;
++}
++
++/*
 + * 0016: whether -commit returns once its work is submitted (the default) or pays the GPU fence
 + * itself, as it did before. Boot-arg sweetmetal_commitwait=1 is the control for an A/B inside
 + * one image: with it a frame costs the CPU's part plus the GPU's; without it, the larger of
@@ -137,23 +186,18 @@
 +			}
 +		}
 +		bool forced = at != NULL && at[strlen(RW_COMMITWAIT_KEY)] == '1';
-+		enabled = !forced && mesa.flush != NULL && mesa.finish != NULL &&
-+			  mesa.set_deferred_wait != NULL;
++		enabled = !forced && mesa.flush != NULL && mesa.wait_fence != NULL &&
++			  mesa.finish != NULL && mesa.set_deferred_wait != NULL;
 +		rw_print("GPU commit: %s\n", enabled ?
 +			 "returns once the work is submitted; its fence is paid by the next "
 +			 "commit or by -waitUntilCompleted (sweetmetal_commitwait=1 pays it "
 +			 "inside -commit)" :
 +			 forced ? "waits for the GPU (forced by boot-arg sweetmetal_commitwait=1)" :
 +				  "waits for the GPU (this library has no rwa_flush)");
-+	});
-+	return enabled;
-+}
-+
-+/*
-  * 0015: how much of a constant buffer bound at an offset the GPU cannot fetch from is copied
-  * per draw. Without the boot-arg the library copies what the shader can read (or all that is
-  * left, where that is not known); boot-arg sweetmetal_ubowhole=1 asks for the pre-0015 rule,
-@@ -4808,6 +4857,11 @@
+ 	});
+ 	return enabled;
+ }
+@@ -4808,6 +4859,11 @@
  	 * lied to, and -setCompletionQueue: explains the third below. */
  	NSUInteger _gpuPriority, _backgroundGPUPriority;
  	dispatch_queue_t _completionQueue;   /* only used when Apple's own ivar is missing */
@@ -165,12 +209,10 @@
  }
  
  - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device descriptor:(id)descriptor
-@@ -4851,8 +4905,42 @@
- 		_outstanding--;
- 	}
+@@ -4853,6 +4909,40 @@
  	_returned++;
-+}
-+
+ }
+ 
 +/* 0016: hand over the reference this queue holds on the buffer whose fence is still owed, or
 + * nil. The caller owns the reference it gets and pays the fence before letting go (see
 + * -commit). Called with the library lock held, like everything that touches device state. */
@@ -194,8 +236,8 @@
 +	}
 +	_pending = nil;
 +	[buffer release];   /* the caller of -redwoodPayFence still holds the buffer */
- }
- 
++}
++
 +- (void)redwoodSetPending:(id)buffer
 +{
 +	if (_pending == buffer) {
@@ -208,7 +250,7 @@
  - (id)commandBuffer
  {
  	return [[[RedwoodMetalCommandBuffer alloc] initWithRedwoodQueue:self] autorelease];
-@@ -4988,6 +5076,21 @@
+@@ -4988,6 +5078,21 @@
  
  - (void)dealloc
  {
@@ -230,17 +272,20 @@
  	/* Only the copy this driver keeps itself: the one in Apple's ivar belongs to
  	 * -[_MTLCommandQueue dealloc], and releasing it twice would be worse than leaking
  	 * one dispatch queue in the Metal where that dealloc does not. */
-@@ -5044,6 +5147,9 @@
+@@ -5044,6 +5149,12 @@
  	BOOL _owesSlot;                 /* this buffer holds one of the queue's slots */
  	NSMutableArray *_scheduled, *_completed;   /* handler blocks, copied to the heap */
  	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
 +	/* 0016: this buffer's work has been submitted and its fence has not been paid. While
-+	 * it is set, _work is kept: it names everything the GPU is reading. */
++	 * it is set, _work is kept: it names everything the GPU is reading. _fence is that
++	 * submission's own fence, which is what waits for exactly it -- a finish would flush
++	 * again and end the next batch early. */
 +	BOOL _fenceDue;
++	void *_fence;
  }
  
  /*
-@@ -5201,6 +5307,15 @@
+@@ -5201,6 +5312,15 @@
  {
  	char why[512] = { 0 };
  
@@ -256,7 +301,7 @@
  	_status = RW_CB_COMMITTED;
  	/* The whole replay under the library's lock: the context keeps the framebuffer, the
  	 * bound pipeline and the current batch between calls, so another command buffer's draws
-@@ -5214,6 +5329,9 @@
+@@ -5214,6 +5334,9 @@
  	 * library's; nothing else runs on it while the lock is held. */
  	struct rwa_device *device = [[_queue device] mesaDevice];
  	bool once = device != NULL && rw_wait_per_commit();
@@ -266,7 +311,7 @@
  	bool queued = false;
  	/* 0013 passlog: nothing below is touched unless it is on */
  	bool passlog = rw_passlog_on();
-@@ -5222,11 +5340,29 @@
+@@ -5222,11 +5345,29 @@
  	bool plemit = false;
  	/* 0014 prof: this thread is sampled from here to the end of the wait below `done:` */
  	bool profiled = rw_prof_on() && rw_prof_register();
@@ -296,7 +341,7 @@
  	}
  	for (RedwoodMetalWork *work in _work) {
  		if (work->clearOnly) {
-@@ -5305,11 +5441,29 @@
+@@ -5305,11 +5446,32 @@
  		mesa.set_deferred_wait(device, 0);
  		if (queued) {
  			char late[512] = { 0 };
@@ -311,9 +356,12 @@
 +				 * and is paid by the next commit on this queue, by
 +				 * -waitUntilCompleted, or by the queue's teardown; _work is kept until
 +				 * then because it names everything the GPU is reading. */
-+				rc = mesa.flush(device, late, sizeof(late));
++				void *fence = NULL;
++
++				rc = mesa.flush(device, &fence, late, sizeof(late));
 +				if (rc == 0) {
 +					_fenceDue = YES;
++					_fence = fence;
 +					[_queue redwoodSetPending:self];
 +				} else {
 +					/* A library that says "no submission" may still have submitted:
@@ -330,7 +378,7 @@
  				[self failWith:late];
  			}
  		}
-@@ -5329,12 +5483,27 @@
+@@ -5329,12 +5491,27 @@
  	 * it. Left to -dealloc, the last release could come from the completion queue's
  	 * thread and destroy a buffer or texture while this thread is inside a draw -- the
  	 * library has no lock of its own -- and a command buffer somebody keeps would pin a whole
@@ -360,7 +408,7 @@
  	/* and only then the handlers, so that a handler which makes the next command buffer
  	 * is not waiting for a slot this one still holds */
  	[self redwoodDeliverHandlers];
-@@ -5560,29 +5729,77 @@
+@@ -5560,29 +5737,83 @@
  
  /* The fence is the whole point: a dispatch that the GPU does not finish must not read as a
   * result. air_run learned that the expensive way (docs/air.md section 5). */
@@ -398,7 +446,13 @@
 +		struct rwa_device *device = [[_queue device] mesaDevice];
 +
 +		_fenceDue = NO;
-+		rc = device != NULL ? mesa.finish(device, why, sizeof(why)) : 0;
++		if (device == NULL)
++			rc = 0;
++		else if (_fence != NULL && mesa.wait_fence != NULL)
++			rc = mesa.wait_fence(device, _fence, why, sizeof(why));
++		else
++			rc = mesa.finish(device, why, sizeof(why));   /* an older library, or no fence */
++		_fence = NULL;
  	}
 -	int rc;
 +	if (rc != 0) {
@@ -414,12 +468,13 @@
  
 -	/* locked per call: this is reached from -redwoodDeliverHandlers after -commit has let
 -	 * go, and from an application's own -waitUntilCompleted on any thread */
+-	rw_lib_lock();
+-	rc = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
 +- (BOOL)redwoodPayFence
 +{
 +	BOOL ok;
 +
- 	rw_lib_lock();
--	rc = mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
++	rw_lib_lock();
 +	ok = [self redwoodPayFenceLocked];
  	rw_lib_unlock();
 -	if (rc != 0) {
@@ -452,7 +507,7 @@
  }
  
  - (void)waitUntilScheduled { }
-@@ -5641,6 +5858,11 @@
+@@ -5641,6 +5872,11 @@
  		return;
  	}
  	if (_status >= RW_CB_SCHEDULED) {

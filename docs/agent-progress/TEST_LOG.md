@@ -469,3 +469,12 @@ then `metalib`): a .metallib holds one LLVM module per function and `rwa_render_
 module's own entry point, so a module with two functions answers for only the first
 ("this module's entry point is fs_pos"). No vertex function: a draw with no vertex stream gets a
 fullscreen quad from the library and `[[position]]` is the pixel centre.
+
+## Userland 0016 v1 on the device (commit returns at submit, fence paid by a `rwa_finish` at the next commit), 0164a, 2026-11-14 (real device, RAM boot, one boot each, synthetic swipes, 1125x2436)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0164a.img` (`25d0a3e6...`), kernel 0163, root `work1.raw` + payload 0001-0016 v1 (library `2a9802ec...`, plug-in `2bd7ea9b...`), flashed `userdata` (rollback = the two 0015 files in `root/rollback-0015/`) | `fastboot -S 512M flash userdata 0164a.simg`, then `tools/sweet-boot-test.sh shim/out/shim-boot-0164a.img 0164a 420` | overlap: wall/cb down, swaps up, no fault | Mode line `GPU commit: returns once the work is submitted` in 3 processes. wall/cb 13.52, cpu/cb 19.62 (the accounting moved: the wait is no longer inside commit), waits mean 11039 us (was 16904), **18.4 swaps/s over 213 active s, best second 33**, 17 s at 30-39. But **batches 15.6/cb (6.5 before), subs 26220 (16679), first cleans 906 of 519 MB (187 MB)**: the start-of-commit `rwa_finish` flushes again and ends the next batch early | `logs/xnu-0164a.txt` |
+| 2026-11-14 | same root and image, args + `sweetmetal_commitwait=1` | `tools/sweet-boot-test.sh shim/out/shim-boot-0164b.img 0164b 420` | the old serial path for the A/B | Mode line `GPU commit: waits for the GPU (forced by boot-arg ...)`. wall/cb 17.95, cpu/cb 9.00, waits mean 9048 us, **23.7 swaps/s over 172 active s**, 44 s at 30-39, batches 6.5/cb, subs 16679, cleans 187 MB | `logs/xnu-0164b.txt` |
+
+Verdict: v1 is **slower** than the control it was supposed to beat (18.4 against 23.7 swaps/s), and the log says why -- paying the fence with `rwa_finish` adds a flush per frame, which splits the next batch (batches/cb 6.5 -> 15.6, submissions +57%, cache cleans 2.8x) and adds more GPU work than the 8 ms of overlap saves. v2 keeps the submission's own fence instead (`rwa_flush` returns it, `rwa_wait_fence` waits for it and touches no batch). Not yet on the device.
