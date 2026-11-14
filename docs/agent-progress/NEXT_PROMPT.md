@@ -1,4 +1,5 @@
 > State 2026-11-14 (end of the investigation phase):
+> - **CORRECTION (user photos): 750x1624 draws only a strip at the top of the screen. Every 750x1624 number below is invalid. Never build with `SWEET_SCALE=2`. The valid baseline is 0168s60: 1125x2436, `wall/cb 26.1`, `cpu/cb 9.3`, `flush 986 us/sub`, best second 29, faults 0.**
 > - Phone: in fastboot. Root `work1.raw` + payload 0001-0015. Nothing was flashed in this phase; every boot was `fastboot boot` (RAM only).
 > - Best result: 0168z60 = 750x1624 + `sweetmetal_fddebug=sysmem` + `sweetfb_hz=60`: 9.6 ms a command buffer, best second 57 swaps, 0 faults. 0168zM (+ `SWEET_CPUMAX=1`): 9.15 ms, best second 59. One boot each, `partially-working`. Sustained 60 is NOT reached: 5 to 8 frames in each fast second take two ticks.
 > - At 1125x2436 a frame is 26 ms: 30 a second is the ceiling there.
@@ -42,7 +43,7 @@ Boot 1 (`gpu_pagelist=1`):
 
 ```bash
 A="sweetgpu_reboot=300 sweetmetal=1 metal_profile=1 sweetmetal_procs=* sweetnull=backboardd,SpringBoard,metaltest sweetmetal_passlog=1 sweetgpu_swipe=90 sweetmetal_fddebug=sysmem"
-SWEET_SCALE=2 SWEETFB_HZ=60 bash tools/sweet-gpu-image.sh ~/Developer/ios-sweet-work/kernel-0162 0169pl "$A gpu_pagelist=1"
+SWEETFB_HZ=60 bash tools/sweet-gpu-image.sh ~/Developer/ios-sweet-work/kernel-0162 0169pl "$A gpu_pagelist=1"
 rg -a -o 'gpu_pagelist=1|sweetgpu_reboot=300|sweetfb_hz=60' shim/out/shim-boot-0169pl.img | sort -u
 bash tools/sweet-boot-test.sh shim/out/shim-boot-0169pl.img 0169pl 420
 bash tools/sweet-boot-summary.sh 0169pl
@@ -56,7 +57,7 @@ Append one row for each boot to `TEST_LOG.md`, in the form of the 0168z60 row, w
 
 ## How to judge (mechanical)
 
-Compare with 0168z60: `wall/cb 9.61`, `cpu/cb 5.92`, `flush 482 us/sub`, `late in >=50 s: 7.7`, faults 0.
+Compare with 0168s60: `wall/cb 26.1`, `cpu/cb 9.3`, `flush 986 us/sub`, faults 0. Boot 0169pl of this phase was already run once at 750x1624 by the lead and is invalid: run it again at full size under tag `0169pf`, and boot 2 as `0169sf`.
 
 - "Better" means: gfsr, notfinish and arena all empty or 0, no `CRASH backboardd` or `CRASH SpringBoard`, AND `wall/cb` lower by 0.5 ms or more.
 - Anything else is "not better". Write which condition failed.
@@ -73,7 +74,8 @@ Compare with 0168z60: `wall/cb 9.61`, `cpu/cb 5.92`, `flush 482 us/sub`, `late i
 Not for a small model: these touch memory lifetime, the kernel, or the root image.
 
 1. Decide from Phase A whether 0162's options become defaults in the test image script.
-2. The user looks at the screen at 750x1624 and says whether it is acceptable. Until then it is a test configuration, not a default.
+2. Find why 750x1624 shows only a strip (size, sysmem at that size, or the present path). Read-only first; no boot at that size without the user's go-ahead.
+2b. After every boot of a new configuration the user confirms the picture before any number is recorded as a result.
 3. Commit returns before the GPU wait (`FPS_INVESTIGATION.md` section 7 item 5). Written spec first, `opus-impl`, `reviewer`, host tests, then a flash with the user's typed yes.
 4. Over-fetch fix in the kernel (item 6), so the sysmem flag is not needed.
 5. A thermal cap before `SWEET_CPUMAX=1` is used outside a test.

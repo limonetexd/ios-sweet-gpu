@@ -78,3 +78,6 @@ Kernel patch 0162 (`xnu/patches/0162-sweet-gpu-pagelist-surfclear.patch`, commit
 | 7 | Why CoreAnimation makes a surface a frame (B1) | take 0.9 ms + create | unknown | open since 2026-11-07 | research |
 | 8 | `sweet_fbpool=1` | walk and clean gone at full size only | froze CoreAnimation with GL (NOTES 774) | old runs | not now |
 | 9 | Unbounded uniform uploads (`fs_and`) | under 0.3 ms | low | section 1 | not now |
+
+
+**Correction 2026-11-14 (user, photos of boot 0169pl):** at 750x1624 the screen shows only a strip at the top (part of the dock), glitching; touch works. The 750x1624 figures of 0168z60, 0168zM and 0164z2 are therefore NOT valid frame-rate evidence: a mostly empty frame is cheap. Which of the size, sysmem at that size, or kernel 0162 causes the strip is not established (0169pl changed the kernel as well). Do not boot `SWEET_SCALE=2` again until the picture is explained. Valid result of this phase: 0168s60 only (1125x2436, 26.1 ms, best second 29, 0 faults).
