@@ -1240,7 +1240,9 @@ static void gmu_boot(void)
 		wr32(GMU_REG(GMU_DCVS_ACK_OPTION), 0);
 		wr32(GMU_REG(GMU_DCVS_PERF_SETTING), (3u << 28) | (uint32_t)lvl);
 		wr32(GMU_REG(GMU_DCVS_BW_SETTING), 0xff);
+		con_hex2("DCVS", "try lvl=", (uint32_t)lvl, "set=", rd32(GMU_REG(GMU_DCVS_PERF_SETTING)));
 		rc = oob(23, 31);
+		con_hex2("DCVS", "ack rc=", (uint32_t)rc, "ret=", rd32(GMU_REG(GMU_DCVS_RETURN)));
 		wr32(GMU_REG(GMU_H2G_SET), 1u << 31);	/* clear DCVS_SET */
 		if (!rc && rd32(GMU_REG(GMU_DCVS_RETURN)) == 0)
 			break;
