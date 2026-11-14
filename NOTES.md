@@ -33,10 +33,31 @@ old fence-inside-commit for an A/B in one image.
   `THE GPU DID NOT` line if the app rewrites a buffer the GPU is still reading; that is the risk
   `docs/agent-progress/SPEC-0016-commit-no-wait.md` names.
 
-**Next:** the user's typed yes to `tools/metal-flash-test.sh` (it writes `userdata`), then one boot
-without the boot-arg and one with it (`sweetmetal_commitwait=1`), same 420 s window, comparing
-`wall/cb`, `cpu/cb`, `waits`, swaps/s and looking at the screen. Snapshot the root first
-(`work1-pre*.raw` is still the rollback).
+**Tested, 0164a (v1) and 0164c (v2), one boot each, against 0164b (`sweetmetal_commitwait=1`):**
+v1 18.4 / v2 19.8 / control 23.7 swaps/s. v2 fixed v1's own damage (batches/cb back to 5.7 from 15.6,
+submissions 16679 -> 11160) but bought nothing, and 0164c is the measurement that says why:
+**`waits 3841` for `cbs 3794`, mean 16659 us, and the passlog's `cpu 9.63` against `wall 9.58` says
+the wait is NOT inside `-commit`.** CoreAnimation calls `-waitUntilCompleted` after every commit, so
+the client itself serialises the frame: record 9.5 ms, GPU 16.7 ms, panel copy 3.5-4.5 ms, kernel
+walk + take 5.8 ms, total 35-38 ms, which is exactly the swap gap in the good seconds. No commit-side
+change can overlap what the client waits for. 0016 is not the lever; it is neutral and can stay
+(its boot-arg keeps the old path). 0164b is also the only one of the three boots without the
+AegirPoster crash loop, so its 23.7 is not a like-for-like control.
+
+**What that means for 60 Hz at 1125x2436:** both halves of the frame are over the 16.67 ms budget
+and they are serial. 60 needs roughly half of the GPU work and half of the replay CPU. The GPU half
+is the one with no valid breakdown at all (`GPU_DECISION.md`: "GPU execution per frame: no valid
+number"); 16.7 ms a frame for 2.7 Mpx with a 13.9 MB drawable reads as bandwidth-bound (about
+270 MB and 16 GB/s if a frame is ten full-screen passes), which is what tiling (GMEM) exists for and
+what sysmem mode throws away. Before spending another flash, the honest options are in
+`docs/agent-progress/FPS_INVESTIGATION.md` and section 7 of it needs re-ranking with the 0164c row.
+
+**Next, and it needs no flash:** (a) a per-frame timeline in the passlog -- who paid the fence and
+when, plus the client's wait -- so the 16.7 ms is attributed instead of inferred; (b) the AegirPoster
+crash loop (50 rests a boot, no wallpaper, pollutes every A/B). Then one boot to rank the GPU. The
+user has been asked which track to take: native with a real GPU-side attack, or a smaller internal
+render with a filtered upscale (the 750x1624 numbers of 0168z60/0168zM are invalid -- that boot drew
+only the top strip -- so a valid 2x measurement does not exist yet).
 
 **Also open, not started:** `AegirPoster` aborts (SIGABRT, `pc 0x1cb1e7198`, 50 restarts) and the
 wallpaper never appears. Present at 1125x2436 in 0163n/0163z and 0168s60, absent in

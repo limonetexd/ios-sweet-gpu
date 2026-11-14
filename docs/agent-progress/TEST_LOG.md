@@ -478,3 +478,24 @@ fullscreen quad from the library and `[[position]]` is the pixel centre.
 | 2026-11-14 | same root and image, args + `sweetmetal_commitwait=1` | `tools/sweet-boot-test.sh shim/out/shim-boot-0164b.img 0164b 420` | the old serial path for the A/B | Mode line `GPU commit: waits for the GPU (forced by boot-arg ...)`. wall/cb 17.95, cpu/cb 9.00, waits mean 9048 us, **23.7 swaps/s over 172 active s**, 44 s at 30-39, batches 6.5/cb, subs 16679, cleans 187 MB | `logs/xnu-0164b.txt` |
 
 Verdict: v1 is **slower** than the control it was supposed to beat (18.4 against 23.7 swaps/s), and the log says why -- paying the fence with `rwa_finish` adds a flush per frame, which splits the next batch (batches/cb 6.5 -> 15.6, submissions +57%, cache cleans 2.8x) and adds more GPU work than the 8 ms of overlap saves. v2 keeps the submission's own fence instead (`rwa_flush` returns it, `rwa_wait_fence` waits for it and touches no batch). Not yet on the device.
+
+## Userland 0016 v2 on the device (the submission's own fence), 0164c, 2026-11-14 (real device, RAM boot, 1125x2436)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0164c.img` (`fe872503...`), kernel 0163, root `work1.raw` + payload 0001-0016 v2 (library `d604ff13...`, plug-in `d9112327...`) | `fastboot -S 512M flash userdata 0164c.simg`, `tools/sweet-boot-test.sh shim/out/shim-boot-0164c.img 0164c 420` | batches per command buffer back to ~6, swaps above the 23.7 of 0164b | Mode line `GPU commit: returns once the work is submitted` in 3 processes. Batches 5.7/cb (**the v1 batch split is gone**), subs 11160 (16679), cleans 323 MB (519). But 19.8 swaps/s over 185 active s (best second 28) and **waits mean 16659 us, 3841 waits for 3794 cbs**: one wait a frame, 16.7 ms, and the passlog says it is not inside `-commit` (cpu 9.63, wall 9.58). It is CoreAnimation calling `-waitUntilCompleted` after every commit | `logs/xnu-0164c.txt` |
+
+Verdict: v2 is neither a win nor a regression against v1 (18.4 / 19.8 / 23.7 across 0164a / 0164c / 0164b, and 0164b is the only boot of the three without the AegirPoster crash loop, so the A/B is confounded). The mechanism is now measured rather than guessed: **the client waits for the frame's own fence every frame**, so no commit-side change can overlap the CPU with the GPU. `waits`/`cbs` = 1.01 in all three boots. 0016 cannot pay for itself while that wait exists; it is not the lever.
+
+## Where the 1125x2436 frame goes, 0164c (backboardd, steady state, one 5 s interval)
+
+| Part | Time | Source |
+| --- | --- | --- |
+| Replay + submit, thread CPU | 9.5 ms | passlog `110 cbs, 10873 draws, cpu 1044.94 ms of wall 1045.79` |
+| of it, per draw | 96 us | 10873 draws / 1044.94 ms |
+| GPU, paid outside `-commit` | 16.7 ms | `waits 3841 mean 16659 us` |
+| Panel copy (kernel vsync thread, 3 helpers) | 3.5-4.5 ms | `presents (3554-4783 us average)` |
+| Kernel walk + surface take | 3.7 + 2.1 ms | `FPS_INVESTIGATION.md` 1, same kernel |
+| Sum | 35-38 ms | matches the measured `38 ms longest` swap gap in good seconds |
+
+60 Hz needs 16.67 ms. Both halves are over it, and they are serial.
