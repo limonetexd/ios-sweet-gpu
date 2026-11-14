@@ -1,0 +1,194 @@
+From: HakiOS
+Subject: [PATCH 0164] sweet gpu: map a slack granule after an imported surface (gpu_slack=1)
+
+
+A GMEM batch that restores a render target reads it in 16x4 blocks, and Mesa
+over-allocates its own textures to a height multiple of 4 for that
+(fd6_layout.c 242-250). An IOSurface imported as it is has no such slack: the
+281x609 surface of FPS_INVESTIGATION.md 2 has 704512 bytes mapped and 612 rows
+are read, 3456 bytes past the end of them. The GPU then reads into an unmapped
+hole, the SMMU reports a translation fault and the ring stops: every command
+buffer after it times out after 2 s and the table arena fills. That is why
+native runs with sweetmetal_fddebug=sysmem (no GMEM at all), which throws away
+the bandwidth tiling exists for.
+
+This maps one spare 64 KiB granule in the GPU's address window after every
+imported surface, filled with a single scratch page taken once from the GPU
+pool (write-combined, so no cache maintenance, and no client reads it as data).
+An over-fetch now reads garbage nobody looks at instead of faulting.
+
+Only surfaces get it: Mesa's own buffers are already over-allocated, and the
+window is 512 MiB with every buffer's addresses taken out of it. The page is
+taken once, on the first surface, and said in the log, so a boot either has the
+slack or does not; gpu_va_size() gives the same answer at allocation and at
+freeBuffer/reap/dropKept, so a buffer is always given back over exactly the
+addresses it took.
+
+Off by default: boot-arg gpu_slack=1. How to see it: "RedwoodGPU: over-fetch
+slack (0164) at ... mapped after every surface" once, then a native boot with
+GMEM (no sweetmetal_fddebug=sysmem) renders instead of stopping on FAR 0xac000
+from the surface's start, "0x0 past the end of the mapped bytes".
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 37ad693..cf4895a 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -189,6 +189,68 @@ struct redwood_show {
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+ #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
+ 
++/*
++ * 0164: a GMEM batch that restores a render target reads it in 16x4 blocks, and Mesa over-allocates
++ * its own textures to a height multiple of 4 for that (fd6_layout.c 242-250). An IOSurface imported
++ * as it is has no such slack: 609 rows over-fetch to 612, 3456 bytes past a 704512-byte map
++ * (FPS_INVESTIGATION.md 2), and the GPU reads into an unmapped hole. The SMMU fault that follows
++ * stops the ring. `gpu_slack=1` gives an imported surface one spare 64 KiB granule in the GPU's
++ * window, mapped to a scratch page, so the over-fetch reads bytes nobody looks at instead of
++ * faulting. Only surfaces: Mesa's own buffers are over-allocated already, and every kilobyte given
++ * away here is one the 512 MiB window does not have. Default off.
++ */
++#define GPU_SLACK               0x10000ull
++static TUNABLE(uint32_t, gGPUSlack, "gpu_slack", 0);
++
++static uint64_t gpu_slack_page(void);
++
++/* Does this buffer get the spare granule? Decided once, in gpu_slack_page(), and never changes. */
++static inline bool
++gpu_has_slack(bool surface)
++{
++	return gGPUSlack != 0 && surface && gpu_slack_page() != 0;
++}
++
++/*
++ * The addresses a buffer of `size` bytes takes in the GPU's window: its own, to a granule, plus the
++ * slack. The same answer every time, because the slack page is made once and never given back, so a
++ * buffer is unmapped and given back over exactly the addresses it took (freeBuffer, reap, dropKept).
++ */
++static uint64_t
++gpu_va_size(uint64_t size, bool surface)
++{
++	uint64_t va = (size + 0xffff) & ~0xffffull;
++
++	if (gpu_has_slack(surface)) {
++		va += GPU_SLACK;
++	}
++	return va;
++}
++
++/*
++ * The one page every surface's slack is mapped to, from the GPU pool: write-combined, so it needs no
++ * cache maintenance, and no client ever reads it as data. Taken once (0: not at all, and no buffer
++ * gets slack) and said so in the log, so an A/B never mixes the two answers in one boot.
++ */
++static uint64_t
++gpu_slack_page(void)
++{
++	static uint64_t page;
++	static bool decided;
++
++	if (!decided && gGPUSlack != 0) {
++		decided = true;                         /* (one try, whatever the pool answers) */
++		page = sweet_gpu_pool_range(GPU_SLACK, NULL);
++		if (page != 0) {
++			IOLog("RedwoodGPU: over-fetch slack (0164) at %#llx, mapped after every surface\n",
++			    (unsigned long long) page);
++		} else {
++			IOLog("RedwoodGPU: gpu_slack=1 and the pool gave no page: no slack this boot\n");
++		}
++	}
++	return page;
++}
++
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+ static bool gGPUReported;
+ static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+@@ -1070,9 +1132,9 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 			b->memory = NULL;               /* (now the kept one's) */
+ 			rangeState(b->address, kRangeKept);
+ 		} else if (redwood_gpu_ready()) {
+-			redwood_gpu_unmap(b->address, b->size);
+-			redwood_gpu_address_free(b->address, b->size);
+-			rangeUnmapped(b->address, b->size, b->surface != NULL ? kRangeSurface : b->pool ? kRangePool : kRangeOwn,
++			redwood_gpu_unmap(b->address, gpu_va_size(b->size, b->surface != NULL));          /* 0164: the slack goes with it */
++			redwood_gpu_address_free(b->address, gpu_va_size(b->size, b->surface != NULL));
++			rangeUnmapped(b->address, gpu_va_size(b->size, b->surface != NULL), b->surface != NULL ? kRangeSurface : b->pool ? kRangePool : kRangeOwn,
+ 			    kUnmapFreeBuffer);
+ 		} else {
+ 			rangeState(b->address, kRangeStuck);    /* (the GPU is given back: nothing is unmapped any more) */
+@@ -1110,9 +1172,9 @@ RedwoodGPUUserClient::reap(void)
+ 			left->memory = NULL;
+ 			rangeState(left->address, kRangeKept);
+ 		} else if (redwood_gpu_ready()) {
+-			redwood_gpu_unmap(left->address, left->size);
+-			redwood_gpu_address_free(left->address, left->size);
+-			rangeUnmapped(left->address, left->size, left->surface != NULL ? kRangeSurface : left->pool ? kRangePool : kRangeOwn,
++			redwood_gpu_unmap(left->address, gpu_va_size(left->size, left->surface != NULL)); /* 0164: the slack goes with it */
++			redwood_gpu_address_free(left->address, gpu_va_size(left->size, left->surface != NULL));
++			rangeUnmapped(left->address, gpu_va_size(left->size, left->surface != NULL), left->surface != NULL ? kRangeSurface : left->pool ? kRangePool : kRangeOwn,
+ 			    kUnmapReap);
+ 		} else {
+ 			rangeState(left->address, kRangeStuck);
+@@ -1191,6 +1253,10 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ {
+ 	struct gpu_buffer * b = NULL;
+ 	bool mapped = true;
++	/* 0164: what the page tables take for this buffer: its own bytes, plus the slack after them */
++	bool surface = kind == kRangeSurface;
++	uint64_t mapped_size = gpu_va_size(size, surface);
++	uint64_t slack = mapped_size > ((size + 0xffff) & ~0xffffull) ? gpu_slack_page() : 0;
+ 
+ 	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
+ 		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
+@@ -1211,20 +1277,27 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 	 */
+ 	for (int attempt = 0; b != NULL; attempt++) {
+ 		mapped = true;
+-		if ((b->address = redwood_gpu_address(size)) != 0) {
++		if ((b->address = redwood_gpu_address(mapped_size)) != 0) {
+ 			for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
+ 				IOByteCount length = 0;
+ 				addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+ 
+ 				mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+ 			}
++			/*
++			 * 0164: the bytes past the buffer read the scratch page, so an over-fetch is a read of
++			 * garbage instead of a fault. From the first whole page after the buffer's own.
++			 */
++			for (uint64_t offset = (size + 0xfff) & ~0xfffull; slack != 0 && mapped && offset < mapped_size; offset += 4096) {
++				mapped = redwood_gpu_map(b->address + offset, slack, false);
++			}
+ 			redwood_gpu_mapped();
+ 			if (mapped) {
+ 				break;
+ 			}
+-			redwood_gpu_unmap(b->address, size);
+-			redwood_gpu_address_free(b->address, size);
+-			rangeUnmapped(b->address, size, kind, kUnmapNewBuffer);
++			redwood_gpu_unmap(b->address, mapped_size);
++			redwood_gpu_address_free(b->address, mapped_size);
++			rangeUnmapped(b->address, mapped_size, kind, kUnmapNewBuffer);
+ 			b->address = 0;
+ 		}
+ 		if (attempt > 0 || fKeptBytes == 0) {
+@@ -1256,6 +1329,7 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 	b->pageCount = 0;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
++	/* (the range records the buffer's own bytes: a fault in the 0164 slack still reads as one past them) */
+ 	rangeEnter(b->address, size, *handle, kind);
+ 	return b;
+ }
+@@ -1268,9 +1342,9 @@ RedwoodGPUUserClient::dropKept(struct gpu_kept * k)
+ 		return;
+ 	}
+ 	if (redwood_gpu_ready()) {
+-		redwood_gpu_unmap(k->address, k->size);
+-		redwood_gpu_address_free(k->address, k->size);
+-		rangeUnmapped(k->address, k->size, kRangeOwn, kUnmapDropKept);
++		redwood_gpu_unmap(k->address, gpu_va_size(k->size, false));                     /* 0164: kept ones are not surfaces */
++		redwood_gpu_address_free(k->address, gpu_va_size(k->size, false));
++		rangeUnmapped(k->address, gpu_va_size(k->size, false), kRangeOwn, kUnmapDropKept);
+ 	} else {
+ 		rangeState(k->address, kRangeStuck);
+ 	}
