@@ -380,3 +380,9 @@ Notes:
 | 2026-11-13 | `shim-boot-0166uB.img` (d080635e...), same payload + `sweetmetal_ubowhole=1` | `tools/sweet-boot-test.sh ... 0166uB 420` (RAM only) | As before the patch | `uniform uploads: rest of the buffer (forced ...)`. 197 s, **2183 command buffers (11.1/s)**, 97.7 draws/cb. 198 active s, **2218 swaps**, max 18/s. No fault lines | `logs/xnu-0166uB.txt` |
 
 Reading: same payload, same workload, one boot each: 11.1 -> 18.7 command buffers per busy second (+68 %), 2218 -> 3710 swaps. 0015: `partially-working`. Left: the unbounded uploads; `sweetfb_hz=30` now caps the best second (29).
+
+## sweetfb_hz=60 on 0015, 0167h60, 2026-11-14 (real device, RAM boot, not a clean run)
+
+- Image `shim-boot-0167h60.img` (aee58e06...), 0015 payload, passlog on, profiler off, `sweetfb_hz=60`, synthetic swipes.
+- Log: 12 `SMMU gfsr`, 14 `THE GPU DID NOT FINISH`, 8 `table arena full`. Screen went black; the user put the phone back in fastboot. Not a valid frame-rate result (the 1051 swaps / 42 per s figure is from a broken run).
+- Reading: 60 Hz exposes the GPU address-space and fault problems; do not compare it with 0166uA/uB.

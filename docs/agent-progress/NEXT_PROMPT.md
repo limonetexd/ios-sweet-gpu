@@ -1,18 +1,21 @@
-> State 2026-11-13 late:
-> - Phone (device): root = `work1.raw` + payload 0001-0013 (library a9e8c642..., `RedwoodMetal` 6922f55c..., `metaltest` 142d6a49...), in fastboot. Snapshots `work1-pre0013.raw` (0001-0012), `work1-pre0012.raw`.
-> - 0013 booted three times (0163pA default, 0163pB sysmem, 0164z2 750x1624), all with `sweetgpu_swipe=90`: 58 / 59 / 43 ms per command buffer of about 97 draws; the kernel waits on the GPU for 17 / 16 / 6 % of wall time. Read `FRAME_RATE_RESEARCH.md` section 9 first.
-> - Patch 0014 (sampling profiler, plug-in only) was specified and handed to `opus-impl` on 2026-11-13; check `userland/metal/0014-prof.patch` and `TEST_LOG.md` for how far it got.
-> - The user pre-authorised flashes and RAM boots for the 2026-11-13 session only. A new session needs its own typed yes for a flash.
-> - Traps: image builds need `PATH=~/Developer/ios-sweet-work/bin:$PATH` (check `RAMDISK MATCH`); a clean `ios` rebuild changes the library hash (0014 needs only `driver` and `payload`); never run `metal-flash-test.sh` in two tabs; about 29 GiB free and a flash needs 12.
-> - Tools: `tools/sweet-passlog-summary.py LOG`, `tools/sweet-subs-per-swap.py LOG`.
+> State 2026-11-14:
+> - Phone: root `work1.raw` + payload 0001-0015 (library accfbc7a..., `RedwoodMetal` e7ba170e..., `metaltest` 142d6a49...). Snapshots: `work1-pre0015.raw` (0001-0014), `work1-pre0014.raw`, `work1-pre0013.raw`. Phone in fastboot after a black 60 Hz boot (0167h60, faults).
+> - Best result so far: 0015 on (0166uA) 18.7 command buffers per busy s (about 30 Hz display copy) against 11.1 with it off (0166uB). One boot each, `partially-working`.
+> - Open: about 110 uploads per 5 s still take the unbounded path (variable index, `fs_and` in `air_metal_test`, bound lost in `u2u64`/`u2u32`), carrying nearly all the 31 MB copied.
+> - `sweetfb_hz=60` crashes or blacks out the display at this workload (faults). Do not use it as a baseline until the faults are gone.
+> - Tools: `tools/sweet-passlog-summary.py`, `tools/sweet-subs-per-swap.py`, `tools/sweet-prof-symbols.py` (needs a profiler boot).
+> - Permissions: the user's flash/boot pre-authorisation covered 2026-11-13; ask again for flashes.
 
-# Phase: where the 40 ms before the wait goes (patch 0014, diagnostic only)
+# Phase: investigate every route to the frame rate (research first, then one change per boot)
 
-Read `CLAUDE.md`, `FRAME_RATE_RESEARCH.md` section 9 and the last three sections of `TEST_LOG.md`. State the plan in ten lines and wait for the go-ahead.
+Read `CLAUDE.md`, `docs/agent-progress/FRAME_RATE_RESEARCH.md` sections 6-9, `HAKIOS_SEARCH_DEEPSEEK.md` (treat its web items as unverified), and the last sections of `TEST_LOG.md`. State a ten-line plan and wait for the go-ahead before any device step.
 
-1. Finish 0014 if it is not on the phone: `reviewer` on the diff (the suspend window must take no lock and allocate nothing), `tools/metal-build.sh driver` and `payload` (library hash must stay a9e8c642...), snapshot `work1-pre0014.raw`, flash, one boot `0165fA` with `sweetmetal_passlog=1 sweetmetal_prof=1 sweetgpu_swipe=90`.
-2. Symbolise the `prof:` offsets on the host against `metal-build/ios/build/src/gallium/drivers/freedreno/libredwoodair.dylib` and `metal-build/obj/RedwoodMetal` (`atos -o FILE -l BASE ADDR`); shared-cache leaves come with the nearest exported name.
-3. Read: on a processor or blocked (cpu against wall in the passlog header, running against waiting in the prof header); the top ten of `ours` and `api`.
-4. One fix for the top entry, behind a boot-arg, its own patch and boot. Then repeat from 3.
+Investigate, in this order, and write findings to `docs/agent-progress/FPS_INVESTIGATION.md` (not the lead's chat):
+1. The unbounded uniform uploads: why `fs_and`'s bound fails (`u2u64`/`u2u32` round trip), whether `nir_opt_algebraic` before the bound fixes it, and what the 110 per 5 s are (which shaders, which slots). Host test first, then a library change only if it passes all host cases.
+2. The remaining replay-thread time: rerun the profiler (0014) on the 0015 payload; name the top `ours` and `api` entries; `drmCommandWrite` 28 % and `mach_msg2_trap` 37 % say the submit path and the wait are large. Compare with how upstream batches submissions (hakios-metal, `metal_defer`), read-only.
+3. The display ceiling: why 60 Hz faults (GPU address space, `table arena full`), and what the 30 Hz copy costs; read the present path, not guess.
+4. GPU clock: read-only check of the running frequency first (the shim's PLL and `gfx3d` readings); no register writes without a recovery path.
+5. Pixels: 750x1624 gave 42.7 ms against 57.5 ms; check whether the display scale can be lowered for the window server without wrong output.
+6. Anything else the profile or the logs point to. Rank every option by expected gain, risk and evidence.
 
-Not in this phase: GPU clock, `sweetfb_hz`, wallpaper, the GPU address-space exhaustion, widgets, glyphs, masks.
+Not in this phase: widgets, glyphs, masks, Control Centre.
