@@ -413,3 +413,19 @@ Reading: a small gain, inside what one boot can show. `experimental`. No thermal
 
 
 **Correction 2026-11-14 (user, photos of boot 0169pl):** at 750x1624 the screen shows only a strip at the top (part of the dock), glitching; touch works. The 750x1624 figures of 0168z60, 0168zM and 0164z2 are therefore NOT valid frame-rate evidence: a mostly empty frame is cheap. Which of the size, sysmem at that size, or kernel 0162 causes the strip is not established (0169pl changed the kernel as well). Do not boot `SWEET_SCALE=2` again until the picture is explained. Valid result of this phase: 0168s60 only (1125x2436, 26.1 ms, best second 29, 0 faults).
+
+## Kernel 0162 gpu_pagelist, 0169pf, 2026-11-14 (real device, RAM boot, one boot, synthetic swipes, full size 1125x2436)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0169pf.img` (ecdc6358...), kernel 0162 (CI 43588677901, sha256 a4ef071f...), payload 0001-0015, `gpu_pagelist=1`; nothing flashed | `tools/sweet-boot-test.sh shim/out/shim-boot-0169pf.img 0169pf 420` | `page lists kept` in the summary | gfsr, notfinish, arena empty; crashes MapKit 4, com.apple.mobile 3, assetsd 3, mediaserverd 1, no backboardd or SpringBoard. `cleared 40 ms after`; `page lists kept for the walk before a submission (gpu_pagelist)`. busy 146 s, 1892 cbs (12.9/s), 180389 draws (95.3/cb), flushes 2.0/cb, batches 17.7/cb (sysmem 17.26 + gm); **wall/cb 27.56 ms, cpu/cb 15.80 ms**; 1909 waits of 12076 us; 12292 submissions, flush 1251 us/sub, first cleans 2122 of 12712 MB; surface take 2068 us; panel copy 3835 us. 1781 swaps, best second 36, 82 active s (20.1/s); 237 seconds at 0-9, 39 at 10-19, 37 at 20-29, 6 at 30-39, none at 40 or more. Kept memory: 1000 reused, 12 made. Peak 55.6 C cpu and big, 52.1 gpu | `logs/xnu-0169pf.txt` |
+
+Reading (mechanical, 0168s60 baseline `wall/cb 26.1`, `cpu/cb 9.3`, `flush 986 us/sub`, faults 0): gfsr, notfinish and arena are empty and there is no `CRASH backboardd` or `CRASH SpringBoard`, but `wall/cb` is 27.56 ms, i.e. 1.46 ms higher, not lower by 0.5 ms. Condition failed: `wall/cb` lower. Not better. `experimental` (one boot).
+
+## Kernel 0162 gpu_pagelist + sweet_surfclear_ms=0, 0169sf, 2026-11-14 (real device, RAM boot, one boot, synthetic swipes, full size 1125x2436)
+
+| Date | Build | Procedure | Expected | Actual | Artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-14 | `shim-boot-0169sf.img` (e6c4fff9...), kernel 0162 (CI 43588677901, sha256 a4ef071f...), payload 0001-0015, `gpu_pagelist=1 sweet_surfclear_ms=0`; nothing flashed | `tools/sweet-boot-test.sh shim/out/shim-boot-0169sf.img 0169sf 420` | `cleared 0 ms after` in the summary | gfsr, notfinish, arena empty; crashes com.apple.mobile 2, assetsd 2, driverkitd 1, no backboardd or SpringBoard. `cleared 0 ms after`; `page lists kept for the walk before a submission (gpu_pagelist)`. busy 240 s, 4319 cbs (18.0/s), 392309 draws (90.8/cb), flushes 2.0/cb, batches 7.1/cb (sysmem 6.86 + gmem); **wall/cb 24.44 ms, cpu/cb 9.01 ms**; 4483 waits of 15544 us; 18149 submissions, flush 957 us/sub, first cleans 893 of 293 MB; surface take 2156 us; panel copy 3626 us. 4370 swaps, best second 42, 203 active s (20.9/s); 116 seconds at 0-9, 75 at 10-19, 125 at 20-29, 2 at 30-39, 1 at 40-49, none at 50 or more. Kept memory: 4000 reused, 19 made. Peak 55.6 C cpu and big, 51.4 gpu | `logs/xnu-0169sf.txt` |
+
+Reading (mechanical, 0168s60 baseline `wall/cb 26.1`, `cpu/cb 9.3`, `flush 986 us/sub`, faults 0): gfsr, notfinish and arena are empty and there is no `CRASH backboardd` or `CRASH SpringBoard`, and `wall/cb` is 24.44 ms, i.e. 1.66 ms lower. Better. `experimental` (one boot). Batches per command buffer differ between the two boots (17.7 vs 7.1), so the boots are not the same workload.

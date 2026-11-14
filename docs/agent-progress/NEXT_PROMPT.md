@@ -65,9 +65,10 @@ Compare with 0168s60: `wall/cb 26.1`, `cpu/cb 9.3`, `flush 986 us/sub`, faults 0
 
 ## Results (fill in)
 
-- CI:
-- 0169pl:
-- 0169sc:
+- CI: `43588677901` success (commit `16e1259`). Kernel `kernel.development.sweet` sha256 `a4ef071f...`, carries `gpu_pagelist` and `sweet_surfclear_ms`. Both images `RAMDISK MATCH`, every added boot-arg present in the image.
+- 0169pl: Run as `0169pf` (full size 1125x2436, as line 60 of the phase asks). Image `shim-boot-0169pf.img` `ecdc6358...`, args A + `gpu_pagelist=1`. Summary: gfsr empty, notfinish empty, arena empty, no backboardd or SpringBoard crash; `page lists kept for the walk before a submission (gpu_pagelist)`; `cleared 40 ms after`; **wall/cb 27.56 ms**, cpu/cb 15.80 ms, flush 1251 us/sub, waits 1909 of 12076 us, best second 36, 82 active s (20.1/s), peak 55.6 C. Not better: `wall/cb` is 1.46 ms higher than 0168s60's 26.1. `logs/xnu-0169pf.txt`.
+- 0169sc: Run as `0169sf`. Image `shim-boot-0169sf.img` `e6c4fff9...`, args A + `gpu_pagelist=1 sweet_surfclear_ms=0`. Summary: gfsr empty, notfinish empty, arena empty, no backboardd or SpringBoard crash; `cleared 0 ms after`; `page lists kept ... (gpu_pagelist)`; **wall/cb 24.44 ms**, cpu/cb 9.01 ms, flush 957 us/sub, waits 4483 of 15544 us, best second 42, 203 active s (20.9/s), peak 55.6 C. Better: `wall/cb` is 1.66 ms lower than 0168s60's 26.1. `logs/xnu-0169sf.txt`.
+- Note for the lead: batches per command buffer differ (0169pf 17.7, 0169sf 7.1), and `first cleans` differ (2122 of 12712 MB vs 893 of 293 MB), so the two boots are not the same workload. One boot each.
 
 # Phase B (lead model only: Fable or Opus)
 
